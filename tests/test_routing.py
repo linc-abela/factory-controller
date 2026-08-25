@@ -221,6 +221,12 @@ class VocabularyTests(unittest.TestCase):
     def test_provider_unavailable_is_not_a_bridge_envelope_status(self):
         self.assertNotIn(routing.PROVIDER_UNAVAILABLE, routing.BRIDGE_RESULT_STATUSES)
 
+    def test_the_store_holds_the_same_absence_vocabulary(self):
+        """Two copies in one repository is one fork waiting to happen."""
+
+        from factory_controller import store
+        self.assertEqual(store.CANONICAL_ABSENCE, routing.CANONICAL_ABSENCE)
+
     def test_expected_idempotency_key_matches_evidence_core(self):
         self.assertEqual(routing.expected_idempotency_key("SF-1", "a" * 64), "SF-1:" + "a" * 64)
 

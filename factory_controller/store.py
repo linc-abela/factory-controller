@@ -13,6 +13,9 @@ from typing import Any, Iterator
 
 
 CONTRACT_VERSION = "factory-controller/1.0"
+#: Reproduced from factory-evidence-core ``src/contracts/replay.py``; see
+#: ``routing.CANONICAL_ABSENCE``, which this must equal.
+CANONICAL_ABSENCE = frozenset({"unknown", "not_applicable", "not_run", "not_measurable"})
 TERMINAL = {"completed", "refused", "failed", "cancelled"}
 RUNNABLE = {"admitted"}
 RECOVERABLE = {"dispatched", "candidate_verified", "evaluated", "evidence_sealed"}
@@ -433,16 +436,16 @@ class MissionStore:
              "detail": event["detail"].get("detail")}
             for event in self.history(mission_id) if event["kind"] == "ROUTE_SWITCH_REFUSED"
         ]
-        selected_prof = None if side_effect is None else (side_effect.get("provider_profile") or side_effect.get("profile"))
+        # One name per concept. `provider_profile` is the bridge's own word for
+        # this, so a second spelling kept alive beside it would be the identity
+        # divergence the corpus already records, not a kindness to old readers.
         return {
             "mission_id": mission_id,
             "state": None if mission is None else mission["state"],
-            "selected_profile": selected_prof,
-            "selected_provider_profile": selected_prof,
+            "selected_provider_profile": None if side_effect is None else side_effect["provider_profile"],
             "legs": [
                 {"attempt": leg["attempt_number"], "leg": leg["leg"],
-                 "profile": leg.get("provider_profile") or leg.get("profile"),
-                 "provider_profile": leg.get("provider_profile") or leg.get("profile"),
+                 "provider_profile": leg["provider_profile"],
                  "selection_reason": leg["selection_reason"], "considered": leg["considered"],
                  "outcome": leg["outcome"], "process_started": leg["process_started"],
                  "idempotency_key": leg["idempotency_key"],
@@ -452,8 +455,7 @@ class MissionStore:
             "fallback_count": max(0, len(legs) - 1),
             "side_effect_boundary": None if side_effect is None else {
                 "attempt": side_effect["attempt_number"], "leg": side_effect["leg"],
-                "profile": side_effect.get("provider_profile") or side_effect.get("profile"),
-                "provider_profile": side_effect.get("provider_profile") or side_effect.get("profile"),
+                "provider_profile": side_effect["provider_profile"],
                 "process_started": side_effect["process_started"],
             },
             "switch_refusals": refusals,
@@ -524,7 +526,13 @@ def _sum_cost(usages: list[dict[str, Any]]) -> dict[str, Any]:
     priced = [usage for usage in usages if usage.get("cost_state") == "reported"]
     currencies = {usage.get("cost_currency") for usage in priced}
     if not priced:
-        return {"state": "unknown", "unpriced_legs": len(usages)}
+        # Keep the legs' own absence word when they agree on one. Flattening
+        # `not_applicable` into `unknown` throws away the only distinction the
+        # absence vocabulary exists to make.
+        declared = {usage.get("cost_state") for usage in usages}
+        state = declared.pop() if len(declared) == 1 and declared <= CANONICAL_ABSENCE \
+            else "unknown"
+        return {"state": state, "unpriced_legs": len(usages)}
     if len(currencies) > 1:
         return {"state": "unknown", "reason": "mixed_currencies",
                 "currencies": sorted(str(value) for value in currencies),

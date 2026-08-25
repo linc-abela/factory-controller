@@ -439,6 +439,19 @@ class RouteExplainabilityTests(RouteTestCase, unittest.TestCase):
             with self.assertRaises(Exception):
                 db.execute("DELETE FROM runs WHERE mission_id=?", (mission["id"],))
 
+    def test_the_route_names_a_profile_exactly_once(self):
+        """One key per concept: an alias beside it is a fork, not a courtesy."""
+
+        adapter = LayerAdapter()
+        controller, store, _ = self.build(adapter)
+        mission, _ = controller.submit(mission_payload(), "explain:5")
+        controller.work_once("w1")
+        route = store.route_history(mission["id"])
+        self.assertNotIn("selected_profile", route)
+        self.assertNotIn("profile", route["legs"][0])
+        self.assertNotIn("profile", route["side_effect_boundary"])
+        self.assertEqual(route["selected_provider_profile"], ALPHA)
+
     def test_a_mission_with_no_declared_candidates_still_records_one_leg(self):
         adapter = LayerAdapter()
         controller, store, _ = self.build(adapter)
@@ -489,6 +502,29 @@ class TelemetryTests(RouteTestCase, unittest.TestCase):
         self.assertEqual(telemetry["unmeasured_legs"], 1)
         self.assertEqual(telemetry["reported_input_tokens"], "unknown")
         self.assertEqual(telemetry["context_reference"]["context_manifest_hash"], "unknown")
+
+    def test_a_uniformly_declared_absence_keeps_its_own_word(self):
+        """`not_applicable` legs are not flattened into `unknown`."""
+
+        adapter = LayerAdapter(usage={"cost_state": "not_applicable"})
+        controller, store, _ = self.build(adapter)
+        mission, _ = controller.submit(mission_payload(), "telemetry:4")
+        controller.work_once("w1")
+        self.assertEqual(store.telemetry(mission["id"])["reported_cost"]["state"],
+                         "not_applicable")
+
+    def test_mixed_absence_words_across_legs_fall_back_to_unknown(self):
+        class Mixed(LayerAdapter):
+            def _dispatch(self, operation_key, value):
+                response = super()._dispatch(operation_key, value)
+                state = "not_applicable" if value["route"]["provider_profile"] == ALPHA else "not_run"
+                response["receipt"]["usage"] = {"cost_state": state}
+                return response
+
+        controller, store, _ = self.build(Mixed(proven_unavailable=[ALPHA]))
+        mission, _ = controller.submit(mission_payload(), "telemetry:5")
+        controller.work_once("w1")
+        self.assertEqual(store.telemetry(mission["id"])["reported_cost"]["state"], "unknown")
 
     def test_an_escalated_mission_is_marked_as_needing_the_owner(self):
         controller, store, _ = self.build(LayerAdapter(gates_pass=False))
