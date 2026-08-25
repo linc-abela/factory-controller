@@ -81,6 +81,12 @@ def execute(request: dict[str, Any]) -> dict[str, Any]:
         verification = result.get("candidate_commit_verification", {})
         verified = verification.get("verified") is True
         return {"verified": verified, "verification": verification, "diagnostic": None if verified else result.get("refusal_code", "CANDIDATE_VERIFICATION_FAILED")}
+    if step == "evaluate":
+        outcomes = result.get("gate_outcomes") or result.get("evaluation", {}).get("gate_outcomes")
+        if outcomes is None:
+            return {"passed": False, "gate_outcomes": [], "diagnostic": "ACCEPTANCE_GATE_UNEVALUATED"}
+        passed = bool(outcomes) and all(item.get("passed") is True for item in outcomes)
+        return {"passed": passed, "gate_outcomes": outcomes, "diagnostic": None if passed else "ACCEPTANCE_GATE_FAILED"}
     if step == "evidence":
         evidence = result.get("evidence_result", {})
         accepted = evidence.get("status") == "complete"
@@ -99,4 +105,3 @@ def main() -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
-

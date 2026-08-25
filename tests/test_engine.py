@@ -45,6 +45,8 @@ class MockAdapter:
             return {"status": "completed", "candidate_sha": "abc1234567890abcdef1234567890abcdef12345"}
         elif step == "verify":
             return {"verified": True, "evaluator": "test-eval"}
+        elif step == "evaluate":
+            return {"passed": True, "gate_outcomes": [{"gate_id": "TEST", "passed": True}]}
         elif step == "evidence":
             return {"accepted": True, "evidence_pointer": "evidence://bundle-1"}
         return {"status": "unknown"}
@@ -56,7 +58,7 @@ class ControllerEngineTests(unittest.TestCase):
         self.db_path = Path(self.temp_dir.name) / "engine.db"
         self.store = MissionStore(self.db_path)
         self.adapter = MockAdapter()
-        self.controller = Controller(self.store, self.adapter, retry_policy=RetryPolicy(max_attempts=3, base_delay_seconds=0.01))
+        self.controller = Controller(self.store, self.adapter, retry_policy=RetryPolicy(max_attempts=3, base_delay_seconds=0.001))
 
     def tearDown(self) -> None:
         self.temp_dir.cleanup()
@@ -64,13 +66,13 @@ class ControllerEngineTests(unittest.TestCase):
     def test_golden_path_execution(self) -> None:
         mission, created = self.controller.submit({"work_item_id": "M-1"}, "key-m1")
         self.assertTrue(created)
-        self.assertEqual(mission["state"], "READY")
+        self.assertEqual(mission["state"], "admitted")
 
         result = self.controller.work_once("worker-1")
         self.assertIsNotNone(result)
-        self.assertEqual(result["state"], "DONE")
-        self.assertEqual(len(self.adapter.calls), 3)
-        self.assertEqual([c[0] for c in self.adapter.calls], ["dispatch", "verify", "evidence"])
+        self.assertEqual(result["state"], "completed")
+        self.assertEqual(len(self.adapter.calls), 4)
+        self.assertEqual([c[0] for c in self.adapter.calls], ["dispatch", "verify", "evaluate", "evidence"])
         self.assertEqual(result["result"]["dispatch"]["status"], "completed")
         self.assertEqual(result["result"]["verification"]["verified"], True)
         self.assertEqual(result["result"]["evidence"]["accepted"], True)
@@ -79,39 +81,33 @@ class ControllerEngineTests(unittest.TestCase):
         # Submit mission
         mission, _ = self.controller.submit({"work_item_id": "M-CRASH"}, "key-crash")
 
-        # First run completes dispatch, then simulate crash during verify step
-        self.adapter.fail_step = "verify"
-        self.adapter.fail_mode = "raise_retryable"
+        # Worker 1 claims and executes dispatch, then process is killed
+        claimed = self.store.claim("worker-1", lease_seconds=0.02)
+        token = claimed["lease_token"]
+        self.store.transition(claimed["id"], token, "dispatched")
+        self.store.begin_step(claimed["id"], token, "dispatch", {"mission": claimed["payload"]})
+        self.store.complete_step(claimed["id"], token, "dispatch", {"status": "completed", "candidate_sha": "sha-dispatch-1"})
 
-        res1 = self.controller.work_once("worker-1")
-        self.assertIsNotNone(res1)
-        self.assertEqual(res1["state"], "READY")
-        self.assertEqual([c[0] for c in self.adapter.calls], ["dispatch", "verify"])
+        # Worker 1 dies; wait for lease expiry
+        time.sleep(0.04)
 
-        # Wait for retry delay to elapse
-        time.sleep(0.05)
-
-        # Clear failure mode so second run can succeed
-        self.adapter.fail_step = None
-        self.adapter.fail_mode = None
+        # Worker 2 calls work_once: stale lease recovered to admitted, claimed, and skips dispatch!
         self.adapter.calls.clear()
-
-        # Next run picks up the mission: dispatch MUST NOT be re-executed
         res2 = self.controller.work_once("worker-2")
         self.assertIsNotNone(res2)
-        self.assertEqual(res2["state"], "DONE")
-        self.assertEqual([c[0] for c in self.adapter.calls], ["verify", "evidence"])
+        self.assertEqual(res2["state"], "completed")
+        self.assertEqual([c[0] for c in self.adapter.calls], ["verify", "evaluate", "evidence"])
 
     def test_step_memoization_when_crash_occurs_after_verify(self) -> None:
         mission, _ = self.controller.submit({"work_item_id": "M-CRASH-2"}, "key-crash-2")
 
-        # Simulate crash during evidence step
+        # Simulate crash during evidence step -> retry after side effect escalates
         self.adapter.fail_step = "evidence"
         self.adapter.fail_mode = "raise_retryable"
 
         res1 = self.controller.work_once("worker-1")
-        self.assertEqual(res1["state"], "READY")
-        self.assertEqual([c[0] for c in self.adapter.calls], ["dispatch", "verify", "evidence"])
+        self.assertEqual(res1["state"], "escalated")
+        self.assertEqual([c[0] for c in self.adapter.calls], ["dispatch", "verify", "evaluate", "evidence"])
 
         time.sleep(0.05)
 
@@ -119,11 +115,10 @@ class ControllerEngineTests(unittest.TestCase):
         self.adapter.fail_mode = None
         self.adapter.calls.clear()
 
-        # Second run picks up the mission: neither dispatch NOR verify should re-execute
+        # Second run picks up the mission: escalated mission cannot be re-run
         res2 = self.controller.work_once("worker-2")
-        self.assertIsNotNone(res2)
-        self.assertEqual(res2["state"], "DONE")
-        self.assertEqual([c[0] for c in self.adapter.calls], ["evidence"])
+        self.assertIsNone(res2)
+        self.assertEqual(self.adapter.calls, [])
 
     def test_non_retryable_dispatch_failure(self) -> None:
         self.adapter.fail_step = "dispatch"
@@ -131,7 +126,7 @@ class ControllerEngineTests(unittest.TestCase):
         self.controller.submit({"work_item_id": "M-FATAL"}, "key-fatal")
 
         res = self.controller.work_once("worker-1")
-        self.assertEqual(res["state"], "FAILED")
+        self.assertEqual(res["state"], "refused")
         self.assertEqual(res["terminal_reason"], "unrecoverable corruption")
 
     def test_verification_failure_fails_non_retryably(self) -> None:
@@ -140,7 +135,7 @@ class ControllerEngineTests(unittest.TestCase):
         self.controller.submit({"work_item_id": "M-UNVERIFIED"}, "key-unverified")
 
         res = self.controller.work_once("worker-1")
-        self.assertEqual(res["state"], "FAILED")
+        self.assertEqual(res["state"], "failed")
         self.assertEqual(res["terminal_reason"], "ancestry check failed")
 
     def test_evidence_rejection_fails_non_retryably(self) -> None:
@@ -149,28 +144,17 @@ class ControllerEngineTests(unittest.TestCase):
         self.controller.submit({"work_item_id": "M-REJECT"}, "key-reject")
 
         res = self.controller.work_once("worker-1")
-        self.assertEqual(res["state"], "FAILED")
+        self.assertEqual(res["state"], "failed")
         self.assertEqual(res["terminal_reason"], "sha mismatch")
 
     def test_evidence_retryable_failure_retries_and_blocks_on_exhaustion(self) -> None:
         self.adapter.fail_step = "evidence"
         self.adapter.fail_mode = "evidence_retryable"
-        self.controller.submit({"work_item_id": "M-RETRY"}, "key-retry")
+        mission, _ = self.controller.submit({"work_item_id": "M-RETRY"}, "key-retry")
 
-        # Attempt 1
         res1 = self.controller.work_once("w1")
-        self.assertEqual(res1["state"], "READY")
-
-        # Attempt 2
-        time.sleep(0.05)
-        res2 = self.controller.work_once("w2")
-        self.assertEqual(res2["state"], "READY")
-
-        # Attempt 3 (max_attempts = 3)
-        time.sleep(0.05)
-        res3 = self.controller.work_once("w3")
-        self.assertEqual(res3["state"], "BLOCKED")
-        self.assertTrue("RETRIES_EXHAUSTED" in res3["terminal_reason"])
+        self.assertEqual(res1["state"], "escalated")
+        self.assertIn("RETRY_AFTER_SIDE_EFFECT", self.store.get(mission["id"])["terminal_reason"])
 
 
 if __name__ == "__main__":

@@ -15,6 +15,8 @@ def main() -> int:
         result = {"status": "completed", "candidate_sha": hashlib.sha1(operation_key.encode(), usedforsecurity=False).hexdigest(), "execution_id": operation_key}
     elif step == "verify":
         result = {"verified": True, "evaluator": "local-safe-provider", "candidate_sha": request["input"]["dispatch"]["candidate_sha"]}
+    elif step == "evaluate":
+        result = {"passed": True, "gate_outcomes": [{"gate_id": "LOCAL-SAFE", "passed": True, "detail": "deterministic local harness"}]}
     elif step == "evidence":
         result = {"accepted": True, "evidence_pointer": "local://" + operation_key, "evidence_class": "rederived"}
     else:
@@ -25,4 +27,3 @@ def main() -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
-

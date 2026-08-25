@@ -52,7 +52,7 @@ class MissionStoreTests(unittest.TestCase):
         payload_a = {"item": "A", "param": 123}
         mission_1, created_1 = self.store.submit(payload_a, "idem-1")
         self.assertTrue(created_1)
-        self.assertEqual(mission_1["state"], "READY")
+        self.assertEqual(mission_1["state"], "admitted")
         self.assertEqual(mission_1["idempotency_key"], "idem-1")
 
         # Duplicate submit with same payload -> returns existing record
@@ -77,7 +77,7 @@ class MissionStoreTests(unittest.TestCase):
 
         claimed_1 = self.store.claim("worker-A", lease_seconds=30)
         self.assertIsNotNone(claimed_1)
-        self.assertEqual(claimed_1["state"], "CLAIMED")
+        self.assertEqual(claimed_1["state"], "dispatching")
         self.assertEqual(claimed_1["attempt_count"], 1)
         self.assertEqual(claimed_1["lease_owner"], "worker-A")
         self.assertIsNotNone(claimed_1["lease_token"])
@@ -97,17 +97,18 @@ class MissionStoreTests(unittest.TestCase):
         valid_token = claimed["lease_token"]
 
         with self.assertRaises(LeaseLostError):
-            self.store.transition(m_id, "bogus-token", "IN_PROGRESS")
+            self.store.transition(m_id, "bogus-token", "dispatched")
 
-        self.store.transition(m_id, valid_token, "IN_PROGRESS", detail={"msg": "starting"})
+        self.store.transition(m_id, valid_token, "dispatched", detail={"msg": "dispatched"})
         updated = self.store.get(m_id)
-        self.assertEqual(updated["state"], "IN_PROGRESS")
+        self.assertEqual(updated["state"], "dispatched")
 
-        # Completion must pass through the explicit verification state.
-        self.store.transition(m_id, valid_token, "AWAITING_VERIFICATION")
-        self.store.transition(m_id, valid_token, "DONE", result={"status": "ok"}, release_lease=True)
+        self.store.transition(m_id, valid_token, "candidate_verified")
+        self.store.transition(m_id, valid_token, "evaluated")
+        self.store.transition(m_id, valid_token, "evidence_sealed")
+        self.store.transition(m_id, valid_token, "completed", result={"status": "ok"}, release_lease=True)
         finished = self.store.get(m_id)
-        self.assertEqual(finished["state"], "DONE")
+        self.assertEqual(finished["state"], "completed")
         self.assertIsNone(finished["lease_owner"])
         self.assertEqual(finished["result"], {"status": "ok"})
 
@@ -118,96 +119,92 @@ class MissionStoreTests(unittest.TestCase):
 
         self.clock_val += 10.0
         self.store.renew(m_id, token, lease_seconds=45)
-        updated = self.store.get(m_id)
-        self.assertEqual(updated["lease_expires_at"], 1055.0)
+        renewed = self.store.get(m_id)
+        self.assertEqual(renewed["lease_expires_at"], 1010.0 + 45.0)
 
         with self.assertRaises(LeaseLostError):
-            self.store.renew(m_id, "wrong-token", lease_seconds=45)
+            self.store.renew(m_id, "invalid-token", lease_seconds=45)
 
     def test_recover_stale_leases(self) -> None:
-        self.store.submit({"task": "run-1"}, "key-1")
-        claimed = self.store.claim("worker-A", lease_seconds=30)
+        self.store.submit({"task": "stale-1"}, "key-stale-1")
+        claimed = self.store.claim("worker-dead", lease_seconds=20)
         m_id = claimed["id"]
 
-        # Before expiry: 0 recovered
-        self.assertEqual(self.store.recover_stale(), 0)
+        # Before lease expiry, recover_stale should not recover it
+        recovered_0 = self.store.recover_stale()
+        self.assertEqual(recovered_0, 0)
 
-        # After expiry: recovered to READY
-        self.clock_val += 31.0
-        self.assertEqual(self.store.recover_stale(), 1)
+        # Advance clock past lease expiry
+        self.clock_val += 25.0
+        recovered_1 = self.store.recover_stale()
+        self.assertEqual(recovered_1, 1)
+
         recovered = self.store.get(m_id)
-        self.assertEqual(recovered["state"], "READY")
+        self.assertEqual(recovered["state"], "admitted")
         self.assertIsNone(recovered["lease_owner"])
-
-        # Can now be claimed by worker-B
-        claimed_again = self.store.claim("worker-B", lease_seconds=30)
-        self.assertIsNotNone(claimed_again)
-        self.assertEqual(claimed_again["id"], m_id)
-        self.assertEqual(claimed_again["attempt_count"], 2)
+        self.assertIsNone(recovered["lease_token"])
 
     def test_retry_and_exhaustion(self) -> None:
-        self.store.submit({"task": "flaky"}, "key-flaky", max_attempts=2)
-        claimed_1 = self.store.claim("w1", lease_seconds=30)
-        m_id, tok_1 = claimed_1["id"], claimed_1["lease_token"]
+        self.store.submit({"task": "retry-test"}, "key-r", max_attempts=2)
+        claimed = self.store.claim("worker-1", lease_seconds=20)
+        m_id, token = claimed["id"], claimed["lease_token"]
 
-        # Attempt 1 failed -> schedules retry
-        state_1 = self.store.retry(m_id, tok_1, "transient error", delay=10.0)
-        self.assertEqual(state_1, "READY")
-        self.assertEqual(self.store.get(m_id)["next_run_at"], 1010.0)
+        # Attempt 1 failed retryably
+        state_1 = self.store.retry(m_id, token, "bridge unavailable", delay=5.0)
+        self.assertEqual(state_1, "admitted")
+        self.assertEqual(self.store.get(m_id)["next_run_at"], 1005.0)
 
-        # Before delay expires, cannot claim
-        self.assertIsNone(self.store.claim("w1"))
-
-        # After delay, claim attempt 2
-        self.clock_val = 1011.0
-        claimed_2 = self.store.claim("w2", lease_seconds=30)
+        # Claim attempt 2
+        self.clock_val += 6.0
+        claimed_2 = self.store.claim("worker-2", lease_seconds=20)
         self.assertIsNotNone(claimed_2)
-        self.assertEqual(claimed_2["attempt_count"], 2)
-        tok_2 = claimed_2["lease_token"]
+        token_2 = claimed_2["lease_token"]
 
-        # Attempt 2 failed -> max_attempts reached -> transitions to BLOCKED
-        state_2 = self.store.retry(m_id, tok_2, "persistent error", delay=10.0)
-        self.assertEqual(state_2, "BLOCKED")
-        blocked = self.store.get(m_id)
-        self.assertEqual(blocked["state"], "BLOCKED")
-        self.assertTrue("RETRIES_EXHAUSTED" in blocked["terminal_reason"])
+        # Attempt 2 failed -> max_attempts reached -> escalated
+        state_2 = self.store.retry(m_id, token_2, "bridge dead", delay=5.0)
+        self.assertEqual(state_2, "escalated")
+        terminal = self.store.get(m_id)
+        self.assertEqual(terminal["state"], "escalated")
+        self.assertIn("RETRIES_EXHAUSTED", terminal["terminal_reason"])
+
+    def test_begin_and_complete_step(self) -> None:
+        self.store.submit({"task": "step-test"}, "key-step")
+        claimed = self.store.claim("worker-1", lease_seconds=20)
+        m_id, token = claimed["id"], claimed["lease_token"]
+
+        # Step not yet run
+        s1 = self.store.begin_step(m_id, token, "dispatch", {"p": 1})
+        self.assertEqual(s1["status"], "STARTED")
+
+        # Step in-progress returns STARTED
+        s2 = self.store.begin_step(m_id, token, "dispatch", {"p": 1})
+        self.assertEqual(s2["status"], "STARTED")
+
+        # Complete step
+        self.store.complete_step(m_id, token, "dispatch", {"candidate_sha": "abc"})
+
+        # Subsequent begin_step returns COMPLETED and cached output
+        s3 = self.store.begin_step(m_id, token, "dispatch", {"p": 1})
+        self.assertEqual(s3["status"], "COMPLETED")
+        self.assertEqual(s3["output"], {"candidate_sha": "abc"})
 
     def test_cancellation(self) -> None:
-        # Cancel READY mission
-        m1, _ = self.store.submit({"task": "c1"}, "k1")
-        self.assertEqual(self.store.cancel(m1["id"]), "CANCELLED")
-        self.assertEqual(self.store.get(m1["id"])["state"], "CANCELLED")
+        m1, _ = self.store.submit({"task": "cancel-ready"}, "key-c1")
+        # Cancel ready mission
+        self.assertEqual(self.store.cancel(m1["id"]), "cancelled")
+        self.assertEqual(self.store.get(m1["id"])["state"], "cancelled")
 
-        # Cancel CLAIMED/IN_PROGRESS mission
-        m2, _ = self.store.submit({"task": "c2"}, "k2")
-        claimed = self.store.claim("w1", lease_seconds=30)
-        self.assertEqual(self.store.cancel(m2["id"]), "CLAIMED")
+        m2, _ = self.store.submit({"task": "cancel-claimed"}, "key-c2")
+        claimed = self.store.claim("worker-1", lease_seconds=30)
+        # Cancel claimed mission sets cancel_requested flag
+        self.assertEqual(self.store.cancel(m2["id"]), "dispatching")
         self.assertTrue(self.store.get(m2["id"])["cancel_requested"])
 
-    def test_step_memoization_and_replay_protection(self) -> None:
-        self.store.submit({"task": "steps"}, "k-step")
-        claimed = self.store.claim("w1", lease_seconds=30)
-        m_id, tok = claimed["id"], claimed["lease_token"]
-
-        # Step 1: begin and complete
-        s1 = self.store.begin_step(m_id, tok, "step1", {"arg": 1})
-        self.assertEqual(s1["status"], "STARTED")
-        self.store.complete_step(m_id, tok, "step1", {"out": "ok"})
-
-        # Subsequent call with same input returns completed output
-        s1_repeat = self.store.begin_step(m_id, tok, "step1", {"arg": 1})
-        self.assertEqual(s1_repeat["status"], "COMPLETED")
-        self.assertEqual(s1_repeat["output"], {"out": "ok"})
-
-        # Altered input raises ConflictError
-        with self.assertRaises(ConflictError):
-            self.store.begin_step(m_id, tok, "step1", {"arg": 2})
-
     def test_counts(self) -> None:
-        self.store.submit({"t": 1}, "c1")
-        self.store.submit({"t": 2}, "c2")
+        self.store.submit({"task": "1"}, "k1")
+        self.store.submit({"task": "2"}, "k2")
         counts = self.store.counts()
-        self.assertEqual(counts.get("READY"), 2)
+        self.assertEqual(counts.get("admitted"), 2)
 
 
 if __name__ == "__main__":

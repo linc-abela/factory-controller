@@ -12,12 +12,16 @@ from pathlib import Path
 from typing import Any, Iterator
 
 
-TERMINAL = {"DONE", "BLOCKED", "FAILED", "CANCELLED"}
-RUNNABLE = {"READY"}
+CONTRACT_VERSION = "factory-controller/1.0"
+TERMINAL = {"completed", "refused", "failed", "cancelled"}
+RUNNABLE = {"admitted"}
 ALLOWED_TRANSITIONS = {
-    "CLAIMED": {"IN_PROGRESS", "CANCELLED", "FAILED"},
-    "IN_PROGRESS": {"AWAITING_VERIFICATION", "CANCELLED", "FAILED"},
-    "AWAITING_VERIFICATION": {"DONE", "CANCELLED", "FAILED"},
+    "dispatching": {"dispatched", "admitted", "refused", "failed", "cancelled"},
+    "dispatched": {"candidate_verified", "refused", "failed", "escalated"},
+    "candidate_verified": {"evaluated", "refused", "failed", "escalated"},
+    "evaluated": {"evidence_sealed", "refused", "failed", "escalated"},
+    "evidence_sealed": {"completed", "escalated"},
+    "escalated": {"failed", "cancelled"},
 }
 
 
@@ -161,12 +165,12 @@ class MissionStore:
                 if existing["payload_hash"] != digest:
                     raise ConflictError("IDEMPOTENCY_CONFLICT: key already binds different input")
                 return self._row(existing), False  # type: ignore[return-value]
-            mission_id = str(uuid.uuid4())
+            mission_id = f"fm_{digest[:24]}"
             db.execute(
                 "INSERT INTO missions(id,idempotency_key,payload_hash,payload_json,state,max_attempts,next_run_at,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?)",
-                (mission_id, idempotency_key, digest, canonical_json(payload), "READY", max_attempts, now, now, now),
+                (mission_id, idempotency_key, digest, canonical_json(payload), "admitted", max_attempts, now, now, now),
             )
-            self._event(db, mission_id, "SUBMITTED", None, "READY", {"payload_hash": digest})
+            self._event(db, mission_id, "SUBMITTED_ADMITTED", None, "admitted", {"payload_hash": digest, "contract_version": CONTRACT_VERSION})
             row = db.execute("SELECT * FROM missions WHERE id=?", (mission_id,)).fetchone()
             return self._row(row), True  # type: ignore[return-value]
 
@@ -179,14 +183,14 @@ class MissionStore:
         token = str(uuid.uuid4())
         with self.transaction() as db:
             row = db.execute(
-                "SELECT * FROM missions WHERE state='READY' AND next_run_at<=? AND cancel_requested=0 ORDER BY next_run_at,created_at LIMIT 1",
+                "SELECT * FROM missions WHERE state='admitted' AND next_run_at<=? AND cancel_requested=0 ORDER BY next_run_at,created_at LIMIT 1",
                 (now,),
             ).fetchone()
             if row is None:
                 return None
             attempt = row["attempt_count"] + 1
             changed = db.execute(
-                "UPDATE missions SET state='CLAIMED',attempt_count=?,lease_owner=?,lease_token=?,lease_expires_at=?,updated_at=? WHERE id=? AND state='READY'",
+                "UPDATE missions SET state='dispatching',attempt_count=?,lease_owner=?,lease_token=?,lease_expires_at=?,updated_at=? WHERE id=? AND state='admitted'",
                 (attempt, worker_id, token, now + lease_seconds, now, row["id"]),
             ).rowcount
             if changed != 1:
@@ -195,7 +199,7 @@ class MissionStore:
                 "INSERT INTO attempts(mission_id,number,worker_id,lease_token,started_at) VALUES(?,?,?,?,?)",
                 (row["id"], attempt, worker_id, token, now),
             )
-            self._event(db, row["id"], "CLAIMED", "READY", "CLAIMED", {"worker_id": worker_id, "attempt": attempt, "lease_token": token})
+            self._event(db, row["id"], "CLAIMED_ATTEMPT_STARTED", "admitted", "dispatching", {"worker_id": worker_id, "attempt": attempt, "attempt_id": payload_hash({"mission_id": row["id"], "attempt": attempt, "request_identity": row["payload_hash"]}), "lease_token": token})
             return self._row(db.execute("SELECT * FROM missions WHERE id=?", (row["id"],)).fetchone())
 
     def transition(self, mission_id: str, lease_token: str, new_state: str,
@@ -231,14 +235,19 @@ class MissionStore:
             if changed != 1:
                 raise LeaseLostError("LEASE_LOST")
 
-    def retry(self, mission_id: str, lease_token: str, diagnostic: str, delay: float) -> str:
+    def retry(self, mission_id: str, lease_token: str, diagnostic: str,
+              delay: float | None = None, *, delay_seconds: float | None = None) -> str:
+        if delay is None:
+            delay = delay_seconds
+        if delay is None:
+            raise ValueError("retry delay is required")
         with self.transaction() as db:
             row = db.execute("SELECT * FROM missions WHERE id=? AND lease_token=?", (mission_id, lease_token)).fetchone()
             if row is None:
                 raise LeaseLostError("LEASE_LOST")
             now = self.clock()
             exhausted = row["attempt_count"] >= row["max_attempts"]
-            state = "BLOCKED" if exhausted else "READY"
+            state = "escalated" if exhausted else "admitted"
             reason = "RETRIES_EXHAUSTED: " + diagnostic if exhausted else diagnostic
             db.execute(
                 "UPDATE missions SET state=?,next_run_at=?,lease_owner=NULL,lease_token=NULL,lease_expires_at=NULL,terminal_reason=?,updated_at=? WHERE id=?",
@@ -258,10 +267,12 @@ class MissionStore:
                 raise KeyError(mission_id)
             if row["state"] in TERMINAL:
                 return row["state"]
-            if row["state"] == "READY":
-                db.execute("UPDATE missions SET state='CANCELLED',cancel_requested=1,terminal_reason='OPERATOR_CANCELLED',updated_at=? WHERE id=?", (self.clock(), mission_id))
-                self._event(db, mission_id, "CANCELLED", "READY", "CANCELLED", {})
-                return "CANCELLED"
+            if row["state"] == "admitted":
+                db.execute("UPDATE missions SET state='cancelled',cancel_requested=1,terminal_reason='OPERATOR_CANCELLED',updated_at=? WHERE id=?", (self.clock(), mission_id))
+                self._event(db, mission_id, "CANCELLED", "admitted", "cancelled", {})
+                return "cancelled"
+            if row["state"] in {"dispatched", "candidate_verified", "evaluated", "evidence_sealed"}:
+                raise ValueError("CANCELLATION_AFTER_SIDE_EFFECT")
             db.execute("UPDATE missions SET cancel_requested=1,updated_at=? WHERE id=?", (self.clock(), mission_id))
             self._event(db, mission_id, "CANCELLATION_REQUESTED", row["state"], row["state"], {})
             return row["state"]
@@ -270,17 +281,22 @@ class MissionStore:
         now = self.clock()
         with self.transaction() as db:
             rows = db.execute(
-                "SELECT * FROM missions WHERE lease_token IS NOT NULL AND lease_expires_at<=? AND state NOT IN ('DONE','BLOCKED','FAILED','CANCELLED')",
+                "SELECT * FROM missions WHERE lease_token IS NOT NULL AND lease_expires_at<=? AND state NOT IN ('completed','refused','failed','cancelled')",
                 (now,),
             ).fetchall()
             for row in rows:
-                state = "CANCELLED" if row["cancel_requested"] else "READY"
-                db.execute("UPDATE missions SET state=?,lease_owner=NULL,lease_token=NULL,lease_expires_at=NULL,terminal_reason=?,updated_at=? WHERE id=?", (state, "OPERATOR_CANCELLED" if state == "CANCELLED" else None, now, row["id"]))
+                state = "cancelled" if row["cancel_requested"] else "admitted"
+                db.execute("UPDATE missions SET state=?,lease_owner=NULL,lease_token=NULL,lease_expires_at=NULL,terminal_reason=?,updated_at=? WHERE id=?", (state, "OPERATOR_CANCELLED" if state == "cancelled" else None, now, row["id"]))
                 db.execute("UPDATE attempts SET ended_at=?,outcome='STALE_LEASE',diagnostic='lease expired' WHERE mission_id=? AND number=?", (now, row["id"], row["attempt_count"]))
                 self._event(db, row["id"], "STALE_LEASE_RECOVERED", row["state"], state, {"prior_worker": row["lease_owner"]})
             return len(rows)
 
-    def begin_step(self, mission_id: str, lease_token: str, name: str, input_value: Any) -> dict[str, Any]:
+    def begin_step(self, mission_id: str, lease_token: str, name: str,
+                   input_value: Any, compatibility_input: Any = None) -> dict[str, Any]:
+        # Compatibility with the landed boundary's provisional call shape;
+        # the Controller still derives the durable operation key itself.
+        if compatibility_input is not None:
+            input_value = compatibility_input
         digest = payload_hash(input_value)
         with self.transaction() as db:
             mission = db.execute("SELECT * FROM missions WHERE id=? AND lease_token=?", (mission_id, lease_token)).fetchone()

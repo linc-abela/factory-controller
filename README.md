@@ -25,8 +25,10 @@ directory, output, admission fixture, and target repository. `mode: real`
 refuses unless `operator_opt_in: true`; the Controller itself never selects a
 provider or invents verification/evidence results.
 
-Lifecycle: `READY -> CLAIMED -> IN_PROGRESS -> AWAITING_VERIFICATION -> DONE`,
-with terminal `FAILED`, `BLOCKED` (retry exhaustion), and `CANCELLED` outcomes.
+Lifecycle follows the landed `factory-controller/1.0` seam: `admitted ->
+dispatching -> dispatched -> candidate_verified -> evaluated -> evidence_sealed
+-> completed`, with `refused`, `failed`, `cancelled`, and human `escalated`
+outcomes. Retry exhaustion becomes an explicit escalation.
 The append-only event ledger is the history; the mission row is its operational
 projection. Claims use `BEGIN IMMEDIATE`, expiring leases, and fencing tokens.
 Started external steps survive restart and reuse the same operation key.

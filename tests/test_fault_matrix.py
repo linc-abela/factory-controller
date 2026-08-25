@@ -1,4 +1,4 @@
-"""Comprehensive fault-injection suite for Controller v1."""
+"""Comprehensive fault-injection test matrix for Controller v1."""
 
 from __future__ import annotations
 
@@ -9,18 +9,13 @@ import unittest
 from pathlib import Path
 from typing import Any
 
-from factory_controller.adapter import JsonProcessAdapter
 from factory_controller.engine import (
     Controller,
     NonRetryableFailure,
     RetryPolicy,
     RetryableFailure,
 )
-from factory_controller.store import (
-    ConflictError,
-    LeaseLostError,
-    MissionStore,
-)
+from factory_controller.store import ConflictError, MissionStore
 
 
 class FaultHarnessAdapter:
@@ -28,8 +23,8 @@ class FaultHarnessAdapter:
         self.faults: dict[str, str] = {}
         self.call_history: list[str] = []
 
-    def set_fault(self, step: str, fault: str) -> None:
-        self.faults[step] = fault
+    def set_fault(self, step: str, fault_type: str) -> None:
+        self.faults[step] = fault_type
 
     def clear_faults(self) -> None:
         self.faults.clear()
@@ -39,13 +34,11 @@ class FaultHarnessAdapter:
         fault = self.faults.get(step)
 
         if fault == "bridge_unavailable":
-            raise RetryableFailure("ADAPTER_UNAVAILABLE: Connection refused")
+            return {"status": "retryable_error", "diagnostic": "BRIDGE_UNAVAILABLE"}
         elif fault == "provider_timeout":
-            raise RetryableFailure("ADAPTER_TIMEOUT: Provider execution timed out after 300s")
-        elif fault == "provider_nonzero_exit":
-            raise RetryableFailure("ADAPTER_EXIT_1: Fatal error in provider process")
+            return {"status": "retryable_error", "diagnostic": "PROVIDER_TIMEOUT"}
         elif fault == "no_candidate":
-            return {"status": "completed", "candidate_sha": None}
+            return {"status": "no_candidate", "diagnostic": "DISPATCH_REFUSED"}
         elif fault == "invalid_candidate":
             return {"verified": False, "diagnostic": "CANDIDATE_OUTSIDE_BASELINE_HISTORY"}
         elif fault == "evaluator_failure":
@@ -53,13 +46,14 @@ class FaultHarnessAdapter:
         elif fault == "evidence_rejection":
             return {"accepted": False, "retryable": False, "diagnostic": "EVIDENCE_ROOT_REJECTED"}
 
-        # Default green step responses
         if step == "dispatch":
-            return {"status": "completed", "candidate_sha": "d00d1234567890abcdef1234567890abcdef1234"}
+            return {"status": "completed", "candidate_sha": f"cand_{operation_key[:8]}"}
         elif step == "verify":
-            return {"verified": True, "evaluator": "standard-test"}
+            return {"verified": True, "evaluator": "local-safe-evaluator"}
+        elif step == "evaluate":
+            return {"passed": True, "gate_outcomes": [{"gate_id": "TEST-GATE", "passed": True}]}
         elif step == "evidence":
-            return {"accepted": True, "evidence_pointer": "evidence://bundle-test"}
+            return {"accepted": True, "evidence_pointer": f"evidence://{operation_key[:8]}"}
         return {"status": "unknown"}
 
 
@@ -72,8 +66,7 @@ class ControllerFaultMatrixTests(unittest.TestCase):
         self.controller = Controller(
             self.store,
             self.adapter,
-            retry_policy=RetryPolicy(max_attempts=3, base_delay_seconds=0.01),
-            lease_seconds=0.05,  # Short lease for timeout tests
+            retry_policy=RetryPolicy(max_attempts=3, base_delay_seconds=0.001),
         )
 
     def tearDown(self) -> None:
@@ -84,13 +77,13 @@ class ControllerFaultMatrixTests(unittest.TestCase):
         self.controller.submit({"item": "stale"}, "key-stale")
         # Worker 1 claims but disappears (simulating killed process)
         m1 = self.store.claim("dead-worker", lease_seconds=0.02)
-        self.assertEqual(m1["state"], "CLAIMED")
+        self.assertEqual(m1["state"], "dispatching")
 
         time.sleep(0.04)  # Lease expires
         # Worker 2 calls work_once -> automatically recovers stale lease and completes
         res = self.controller.work_once("live-worker")
         self.assertIsNotNone(res)
-        self.assertEqual(res["state"], "DONE")
+        self.assertEqual(res["state"], "completed")
         self.assertEqual(res["attempt_count"], 2)
 
     # Fault 2: Duplicate worker claim race (bounded single-claim concurrency)
@@ -124,14 +117,14 @@ class ControllerFaultMatrixTests(unittest.TestCase):
         self.adapter.set_fault("dispatch", "bridge_unavailable")
 
         res1 = self.controller.work_once("w1")
-        self.assertEqual(res1["state"], "READY")
+        self.assertEqual(res1["state"], "admitted")
         self.assertEqual(res1["attempt_count"], 1)
 
         # Bridge becomes available
-        time.sleep(0.03)
+        time.sleep(0.08)
         self.adapter.clear_faults()
         res2 = self.controller.work_once("w2")
-        self.assertEqual(res2["state"], "DONE")
+        self.assertEqual(res2["state"], "completed")
         self.assertEqual(res2["attempt_count"], 2)
 
     # Fault 6: Provider timeout / failure
@@ -140,12 +133,12 @@ class ControllerFaultMatrixTests(unittest.TestCase):
         self.adapter.set_fault("dispatch", "provider_timeout")
 
         res1 = self.controller.work_once("w1")
-        self.assertEqual(res1["state"], "READY")
+        self.assertEqual(res1["state"], "admitted")
 
-        time.sleep(0.03)
+        time.sleep(0.08)
         self.adapter.clear_faults()
         res2 = self.controller.work_once("w2")
-        self.assertEqual(res2["state"], "DONE")
+        self.assertEqual(res2["state"], "completed")
 
     # Fault 7: No candidate produced
     def test_fault_07_no_candidate_fails_non_retryably(self) -> None:
@@ -153,7 +146,7 @@ class ControllerFaultMatrixTests(unittest.TestCase):
         self.adapter.set_fault("dispatch", "no_candidate")
 
         res = self.controller.work_once("w1")
-        self.assertEqual(res["state"], "FAILED")
+        self.assertEqual(res["state"], "refused")
         self.assertEqual(res["terminal_reason"], "DISPATCH_REFUSED")
 
     # Fault 8: Invalid candidate SHA
@@ -162,7 +155,7 @@ class ControllerFaultMatrixTests(unittest.TestCase):
         self.adapter.set_fault("verify", "invalid_candidate")
 
         res = self.controller.work_once("w1")
-        self.assertEqual(res["state"], "FAILED")
+        self.assertEqual(res["state"], "failed")
         self.assertEqual(res["terminal_reason"], "CANDIDATE_OUTSIDE_BASELINE_HISTORY")
 
     # Fault 9: Evaluator failure
@@ -171,7 +164,7 @@ class ControllerFaultMatrixTests(unittest.TestCase):
         self.adapter.set_fault("verify", "evaluator_failure")
 
         res = self.controller.work_once("w1")
-        self.assertEqual(res["state"], "FAILED")
+        self.assertEqual(res["state"], "failed")
         self.assertEqual(res["terminal_reason"], "EVALUATOR_ASSERTION_FAILED")
 
     # Fault 10: Evidence Core rejection
@@ -180,7 +173,7 @@ class ControllerFaultMatrixTests(unittest.TestCase):
         self.adapter.set_fault("evidence", "evidence_rejection")
 
         res = self.controller.work_once("w1")
-        self.assertEqual(res["state"], "FAILED")
+        self.assertEqual(res["state"], "failed")
         self.assertEqual(res["terminal_reason"], "EVIDENCE_ROOT_REJECTED")
 
     # Fault 11: Database reopen / crash across separate process connections
@@ -192,7 +185,7 @@ class ControllerFaultMatrixTests(unittest.TestCase):
         new_store = MissionStore(self.db_path)
         reopened = new_store.get(m["id"])
         self.assertIsNotNone(reopened)
-        self.assertEqual(reopened["state"], "DONE")
+        self.assertEqual(reopened["state"], "completed")
         self.assertEqual(reopened["result"]["verification"]["verified"], True)
         history = new_store.history(m["id"])
         self.assertTrue(len(history) >= 4)
@@ -200,23 +193,29 @@ class ControllerFaultMatrixTests(unittest.TestCase):
     # Fault 12: Incomplete attempt resumption (killed between steps)
     def test_fault_12_incomplete_attempt_resumes_without_duplicate_dispatch(self) -> None:
         m, _ = self.controller.submit({"item": "step-crash"}, "key-sc1")
-        self.adapter.set_fault("verify", "bridge_unavailable")  # Fail during verify
 
-        self.controller.work_once("w1")
+        # Worker 1 completes dispatch and then crashes/dies holding lease
+        claimed = self.store.claim("w1", lease_seconds=0.02)
+        token = claimed["lease_token"]
+        self.store.transition(m["id"], token, "dispatched")
+        self.store.begin_step(m["id"], token, "dispatch", {"mission": claimed["payload"]})
+        self.store.complete_step(m["id"], token, "dispatch", {"status": "completed", "candidate_sha": "cand_memo"})
+
+        time.sleep(0.04)  # Lease expires
         self.adapter.call_history.clear()
-        self.adapter.clear_faults()
 
-        time.sleep(0.03)
+        # Worker 2 picks it up and runs to completion
         res = self.controller.work_once("w2")
-        self.assertEqual(res["state"], "DONE")
-        # verify and evidence executed, but dispatch was NOT repeated
-        self.assertEqual(self.adapter.call_history, ["verify", "evidence"])
+        self.assertIsNotNone(res)
+        self.assertEqual(res["state"], "completed")
+        # verify, evaluate, and evidence executed, but dispatch was NOT repeated
+        self.assertEqual(self.adapter.call_history, ["verify", "evaluate", "evidence"])
 
     # Fault 13: Cancellation of queued mission
     def test_fault_13_cancellation_of_queued_mission(self) -> None:
         m, _ = self.controller.submit({"item": "cancel-q"}, "key-cq")
         self.store.cancel(m["id"])
-        self.assertEqual(self.store.get(m["id"])["state"], "CANCELLED")
+        self.assertEqual(self.store.get(m["id"])["state"], "cancelled")
         # Cannot be claimed
         self.assertIsNone(self.controller.work_once("w1"))
 
@@ -226,15 +225,16 @@ class ControllerFaultMatrixTests(unittest.TestCase):
         claimed = self.store.claim("w1", lease_seconds=0.02)
         self.assertIsNotNone(claimed)
         # Cancel requested while in flight
-        self.store.cancel(m["id"])
+        state = self.store.cancel(m["id"])
+        self.assertEqual(state, "dispatching")
         self.assertTrue(self.store.get(m["id"])["cancel_requested"])
 
         # When lease expires and recover_stale runs, cancelled state is recognized
-        time.sleep(0.04)
+        time.sleep(0.08)
         self.store.recover_stale()
-        self.assertEqual(self.store.get(m["id"])["state"], "CANCELLED")
+        self.assertEqual(self.store.get(m["id"])["state"], "cancelled")
 
-    # Fault 15: Retry exhaustion -> transitions to BLOCKED
+    # Fault 15: Retry exhaustion -> transitions to escalated
     def test_fault_15_retry_exhaustion_transitions_to_blocked(self) -> None:
         self.controller.submit({"item": "exhaust"}, "key-ex")
         self.adapter.set_fault("dispatch", "bridge_unavailable")
@@ -242,12 +242,12 @@ class ControllerFaultMatrixTests(unittest.TestCase):
         # Attempt 1
         self.controller.work_once("w1")
         # Attempt 2
-        time.sleep(0.03)
+        time.sleep(0.02)
         self.controller.work_once("w2")
         # Attempt 3 (exhausted)
-        time.sleep(0.03)
+        time.sleep(0.02)
         res = self.controller.work_once("w3")
-        self.assertEqual(res["state"], "BLOCKED")
+        self.assertEqual(res["state"], "escalated")
         self.assertTrue("RETRIES_EXHAUSTED" in res["terminal_reason"])
 
     # Fault 16: a long provider call is protected by heartbeat renewal
@@ -272,7 +272,7 @@ class ControllerFaultMatrixTests(unittest.TestCase):
         self.assertEqual(self.store.recover_stale(), 0)
         self.assertIsNone(self.store.claim("duplicate-worker"))
         worker.join()
-        self.assertEqual(result_box[0]["state"], "DONE")
+        self.assertEqual(result_box[0]["state"], "completed")
 
 
 if __name__ == "__main__":

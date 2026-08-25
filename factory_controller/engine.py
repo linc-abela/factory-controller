@@ -69,13 +69,16 @@ class Controller:
                 thread.join(timeout=min(1.0, self.lease_seconds))
         if heartbeat_error:
             raise heartbeat_error[0]
-        self.store.complete_step(mission["id"], mission["lease_token"], name, output)
+        if not (isinstance(output, dict) and output.get("status") in {"retryable_error"}):
+            self.store.complete_step(mission["id"], mission["lease_token"], name, output)
         return output
 
     def _cancelled(self, mission_id: str, lease_token: str) -> bool:
         current = self.store.get(mission_id)
         if current and current["cancel_requested"]:
-            self.store.transition(mission_id, lease_token, "CANCELLED", reason="OPERATOR_CANCELLED", release_lease=True)
+            target = "cancelled" if current["state"] == "dispatching" else "escalated"
+            reason = "OPERATOR_CANCELLED" if target == "cancelled" else "CANCELLATION_AFTER_SIDE_EFFECT"
+            self.store.transition(mission_id, lease_token, target, reason=reason, release_lease=True)
             return True
         return False
 
@@ -88,32 +91,47 @@ class Controller:
         try:
             current = self.store.get(mission_id)
             if current and current["cancel_requested"]:
-                self.store.transition(mission_id, token, "CANCELLED", reason="OPERATOR_CANCELLED", release_lease=True)
+                self.store.transition(mission_id, token, "cancelled", reason="OPERATOR_CANCELLED", release_lease=True)
                 return self.store.get(mission_id)
-            self.store.transition(mission_id, token, "IN_PROGRESS")
             dispatch = self._step(mission, "dispatch", {"mission": mission["payload"]})
             if self._cancelled(mission_id, token):
                 return self.store.get(mission_id)
             status = dispatch.get("status")
-            if status in {"blocked", "retryable_error"}:
+            if status == "retryable_error":
                 raise RetryableFailure(dispatch.get("diagnostic", status))
+            if status == "blocked":
+                self.store.transition(mission_id, token, "escalated", reason=dispatch.get("diagnostic", status), release_lease=True)
+                return self.store.get(mission_id)
             if status != "completed" or not dispatch.get("candidate_sha"):
                 raise NonRetryableFailure(dispatch.get("diagnostic", "DISPATCH_REFUSED"))
-            self.store.transition(mission_id, token, "AWAITING_VERIFICATION", detail={"candidate_sha": dispatch["candidate_sha"]})
+            self.store.transition(mission_id, token, "dispatched", detail={"candidate_sha": dispatch["candidate_sha"], "execution_id": dispatch.get("execution_id")})
             verification = self._step(mission, "verify", {"mission": mission["payload"], "dispatch": dispatch})
             if self._cancelled(mission_id, token):
                 return self.store.get(mission_id)
             if not verification.get("verified"):
                 raise NonRetryableFailure(verification.get("diagnostic", "CANDIDATE_VERIFICATION_FAILED"))
-            evidence = self._step(mission, "evidence", {"mission": mission["payload"], "dispatch": dispatch, "verification": verification})
+            self.store.transition(mission_id, token, "candidate_verified", detail={"candidate_sha": dispatch["candidate_sha"]})
+            evaluation = self._step(mission, "evaluate", {"mission": mission["payload"], "dispatch": dispatch, "verification": verification})
+            if not evaluation.get("passed"):
+                self.store.transition(mission_id, token, "escalated", reason=evaluation.get("diagnostic", "ACCEPTANCE_GATE_FAILED"), release_lease=True)
+                return self.store.get(mission_id)
+            self.store.transition(mission_id, token, "evaluated", detail={"gate_outcomes": evaluation.get("gate_outcomes", [])})
+            evidence = self._step(mission, "evidence", {"mission": mission["payload"], "dispatch": dispatch, "verification": verification, "evaluation": evaluation})
             if not evidence.get("accepted"):
                 if evidence.get("retryable"):
                     raise RetryableFailure(evidence.get("diagnostic", "EVIDENCE_BINDING_FAILED"))
                 raise NonRetryableFailure(evidence.get("diagnostic", "EVIDENCE_REJECTED"))
-            result = {"dispatch": dispatch, "verification": verification, "evidence": evidence}
-            self.store.transition(mission_id, token, "DONE", result=result, release_lease=True)
+            self.store.transition(mission_id, token, "evidence_sealed", detail={"evidence_pointer": evidence.get("evidence_pointer")})
+            result = {"dispatch": dispatch, "verification": verification, "evaluation": evaluation, "evidence": evidence}
+            self.store.transition(mission_id, token, "completed", result=result, release_lease=True)
         except RetryableFailure as exc:
-            self.store.retry(mission_id, token, str(exc), self.retry_policy.delay(mission["attempt_count"]))
+            current = self.store.get(mission_id)
+            if current and current["state"] == "dispatching":
+                self.store.retry(mission_id, token, str(exc), self.retry_policy.delay(mission["attempt_count"]))
+            else:
+                self.store.transition(mission_id, token, "escalated", reason=f"RETRY_AFTER_SIDE_EFFECT: {exc}", release_lease=True)
         except NonRetryableFailure as exc:
-            self.store.transition(mission_id, token, "FAILED", reason=str(exc), release_lease=True)
+            current = self.store.get(mission_id)
+            target = "refused" if current and current["state"] == "dispatching" else "failed"
+            self.store.transition(mission_id, token, target, reason=str(exc), release_lease=True)
         return self.store.get(mission_id)

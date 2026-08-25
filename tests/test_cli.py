@@ -24,7 +24,7 @@ class ControllerCLITests(unittest.TestCase):
         self.assertEqual(rc, 0)
         store = MissionStore(self.db_path)
         counts = store.counts()
-        self.assertEqual(counts.get("DONE"), 5)
+        self.assertEqual(counts.get("completed"), 5)
 
     def test_submit_and_work_once_lifecycle(self) -> None:
         # 1. Submit via JSON file
@@ -35,12 +35,12 @@ class ControllerCLITests(unittest.TestCase):
 
         # 2. Status counts
         store = MissionStore(self.db_path)
-        self.assertEqual(store.counts().get("READY"), 1)
+        self.assertEqual(store.counts().get("admitted"), 1)
 
         # 3. Work once
         rc_work = main(["--db", self.db_path, "work-once", "--worker", "cli-worker"])
         self.assertEqual(rc_work, 0)
-        self.assertEqual(store.counts().get("DONE"), 1)
+        self.assertEqual(store.counts().get("completed"), 1)
 
 
 if __name__ == "__main__":

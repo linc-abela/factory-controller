@@ -75,10 +75,9 @@ def main(argv: list[str] | None = None) -> int:
             pass
         states = {mission_id: store.get(mission_id)["state"] for mission_id in ids}  # type: ignore[index]
         print(json.dumps({"missions": len(ids), "states": states, "counts": store.counts()}, sort_keys=True))
-        return 0 if set(states.values()) == {"DONE"} else 1
+        return 0 if set(states.values()) == {"completed"} else 1
     return 0
 
 
 if __name__ == "__main__":
     raise SystemExit(main())
-
