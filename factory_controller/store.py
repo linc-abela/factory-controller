@@ -15,6 +15,7 @@ from typing import Any, Iterator
 CONTRACT_VERSION = "factory-controller/1.0"
 TERMINAL = {"completed", "refused", "failed", "cancelled"}
 RUNNABLE = {"admitted"}
+RECOVERABLE = {"dispatched", "candidate_verified", "evaluated", "evidence_sealed"}
 ALLOWED_TRANSITIONS = {
     "dispatching": {"dispatched", "admitted", "refused", "failed", "cancelled"},
     "dispatched": {"candidate_verified", "refused", "failed", "escalated"},
@@ -183,23 +184,26 @@ class MissionStore:
         token = str(uuid.uuid4())
         with self.transaction() as db:
             row = db.execute(
-                "SELECT * FROM missions WHERE state='admitted' AND next_run_at<=? AND cancel_requested=0 ORDER BY next_run_at,created_at LIMIT 1",
+                "SELECT * FROM missions WHERE state IN ('admitted','dispatched','candidate_verified','evaluated','evidence_sealed') AND lease_token IS NULL AND next_run_at<=? AND cancel_requested=0 ORDER BY next_run_at,created_at LIMIT 1",
                 (now,),
             ).fetchone()
             if row is None:
                 return None
-            attempt = row["attempt_count"] + 1
+            fresh_attempt = row["state"] == "admitted"
+            attempt = row["attempt_count"] + 1 if fresh_attempt else row["attempt_count"]
+            next_state = "dispatching" if fresh_attempt else row["state"]
             changed = db.execute(
-                "UPDATE missions SET state='dispatching',attempt_count=?,lease_owner=?,lease_token=?,lease_expires_at=?,updated_at=? WHERE id=? AND state='admitted'",
-                (attempt, worker_id, token, now + lease_seconds, now, row["id"]),
+                "UPDATE missions SET state=?,attempt_count=?,lease_owner=?,lease_token=?,lease_expires_at=?,updated_at=? WHERE id=? AND state=? AND lease_token IS NULL",
+                (next_state, attempt, worker_id, token, now + lease_seconds, now, row["id"], row["state"]),
             ).rowcount
             if changed != 1:
                 return None
-            db.execute(
-                "INSERT INTO attempts(mission_id,number,worker_id,lease_token,started_at) VALUES(?,?,?,?,?)",
-                (row["id"], attempt, worker_id, token, now),
-            )
-            self._event(db, row["id"], "CLAIMED_ATTEMPT_STARTED", "admitted", "dispatching", {"worker_id": worker_id, "attempt": attempt, "attempt_id": payload_hash({"mission_id": row["id"], "attempt": attempt, "request_identity": row["payload_hash"]}), "lease_token": token})
+            if fresh_attempt:
+                db.execute(
+                    "INSERT INTO attempts(mission_id,number,worker_id,lease_token,started_at) VALUES(?,?,?,?,?)",
+                    (row["id"], attempt, worker_id, token, now),
+                )
+            self._event(db, row["id"], "CLAIMED_ATTEMPT_STARTED" if fresh_attempt else "CLAIMED_RESUME", row["state"], next_state, {"worker_id": worker_id, "attempt": attempt, "attempt_id": payload_hash({"mission_id": row["id"], "attempt": attempt, "request_identity": row["payload_hash"]}), "lease_token": token})
             return self._row(db.execute("SELECT * FROM missions WHERE id=?", (row["id"],)).fetchone())
 
     def transition(self, mission_id: str, lease_token: str, new_state: str,
@@ -285,7 +289,7 @@ class MissionStore:
                 (now,),
             ).fetchall()
             for row in rows:
-                state = "cancelled" if row["cancel_requested"] else "admitted"
+                state = "cancelled" if row["cancel_requested"] else (row["state"] if row["state"] in RECOVERABLE else "admitted")
                 db.execute("UPDATE missions SET state=?,lease_owner=NULL,lease_token=NULL,lease_expires_at=NULL,terminal_reason=?,updated_at=? WHERE id=?", (state, "OPERATOR_CANCELLED" if state == "cancelled" else None, now, row["id"]))
                 db.execute("UPDATE attempts SET ended_at=?,outcome='STALE_LEASE',diagnostic='lease expired' WHERE mission_id=? AND number=?", (now, row["id"], row["attempt_count"]))
                 self._event(db, row["id"], "STALE_LEASE_RECOVERED", row["state"], state, {"prior_worker": row["lease_owner"]})

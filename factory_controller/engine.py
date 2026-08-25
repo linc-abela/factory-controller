@@ -89,6 +89,7 @@ class Controller:
             return None
         mission_id, token = mission["id"], mission["lease_token"]
         try:
+            resume_state = mission["state"]
             current = self.store.get(mission_id)
             if current and current["cancel_requested"]:
                 self.store.transition(mission_id, token, "cancelled", reason="OPERATOR_CANCELLED", release_lease=True)
@@ -104,24 +105,28 @@ class Controller:
                 return self.store.get(mission_id)
             if status != "completed" or not dispatch.get("candidate_sha"):
                 raise NonRetryableFailure(dispatch.get("diagnostic", "DISPATCH_REFUSED"))
-            self.store.transition(mission_id, token, "dispatched", detail={"candidate_sha": dispatch["candidate_sha"], "execution_id": dispatch.get("execution_id")})
+            if resume_state == "dispatching":
+                self.store.transition(mission_id, token, "dispatched", detail={"candidate_sha": dispatch["candidate_sha"], "execution_id": dispatch.get("execution_id")})
             verification = self._step(mission, "verify", {"mission": mission["payload"], "dispatch": dispatch})
             if self._cancelled(mission_id, token):
                 return self.store.get(mission_id)
             if not verification.get("verified"):
                 raise NonRetryableFailure(verification.get("diagnostic", "CANDIDATE_VERIFICATION_FAILED"))
-            self.store.transition(mission_id, token, "candidate_verified", detail={"candidate_sha": dispatch["candidate_sha"]})
+            if resume_state in {"dispatching", "dispatched"}:
+                self.store.transition(mission_id, token, "candidate_verified", detail={"candidate_sha": dispatch["candidate_sha"]})
             evaluation = self._step(mission, "evaluate", {"mission": mission["payload"], "dispatch": dispatch, "verification": verification})
             if not evaluation.get("passed"):
                 self.store.transition(mission_id, token, "escalated", reason=evaluation.get("diagnostic", "ACCEPTANCE_GATE_FAILED"), release_lease=True)
                 return self.store.get(mission_id)
-            self.store.transition(mission_id, token, "evaluated", detail={"gate_outcomes": evaluation.get("gate_outcomes", [])})
+            if resume_state in {"dispatching", "dispatched", "candidate_verified"}:
+                self.store.transition(mission_id, token, "evaluated", detail={"gate_outcomes": evaluation.get("gate_outcomes", [])})
             evidence = self._step(mission, "evidence", {"mission": mission["payload"], "dispatch": dispatch, "verification": verification, "evaluation": evaluation})
             if not evidence.get("accepted"):
                 if evidence.get("retryable"):
                     raise RetryableFailure(evidence.get("diagnostic", "EVIDENCE_BINDING_FAILED"))
                 raise NonRetryableFailure(evidence.get("diagnostic", "EVIDENCE_REJECTED"))
-            self.store.transition(mission_id, token, "evidence_sealed", detail={"evidence_pointer": evidence.get("evidence_pointer")})
+            if resume_state != "evidence_sealed":
+                self.store.transition(mission_id, token, "evidence_sealed", detail={"evidence_pointer": evidence.get("evidence_pointer")})
             result = {"dispatch": dispatch, "verification": verification, "evaluation": evaluation, "evidence": evidence}
             self.store.transition(mission_id, token, "completed", result=result, release_lease=True)
         except RetryableFailure as exc:
