@@ -64,11 +64,11 @@ class LayerAdapter:
 
     def _dispatch(self, operation_key: str, value: dict[str, Any]) -> dict[str, Any]:
         route = value["route"]
-        profile = route["profile"]
+        profile = route["provider_profile"]
         self.dispatches.append(dict(route))
         receipt: dict[str, Any] = {
-            "profile": profile,
-            "provider_identity": None if profile is None else profile + "/v1",
+            "provider_profile": profile,
+            "provider": None if profile is None else profile + "/v1",
             "execution_mode": self.mode,
             "duration_ms": 12,
             "usage": self.usage,

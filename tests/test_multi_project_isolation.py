@@ -81,8 +81,8 @@ class MultiProjectIsolationTests(RouteTestCase, unittest.TestCase):
         self._run_both()
         alpha_route = self.store.route_history(self.alpha["id"])
         beta_route = self.store.route_history(self.beta["id"])
-        self.assertEqual(alpha_route["selected_profile"], ALPHA)
-        self.assertEqual(beta_route["selected_profile"], BETA)
+        self.assertEqual(alpha_route["selected_provider_profile"], ALPHA)
+        self.assertEqual(beta_route["selected_provider_profile"], BETA)
         self.assertEqual({leg["idempotency_key"] for leg in alpha_route["legs"]},
                          {"project-alpha:1"})
         self.assertEqual({leg["idempotency_key"] for leg in beta_route["legs"]},
@@ -125,7 +125,7 @@ class MultiProjectIsolationTests(RouteTestCase, unittest.TestCase):
         self.store.record_run(
             exhausted["id"], 0, {"reason": "seed", "considered": []},
             {"profile": BETA, "classification": "provider_unavailable", "process_started": False,
-             "provider_identity": None, "selection_reason": "seed", "fallback_chain": [],
+             "provider": None, "selection_reason": "seed", "fallback_chain": [],
              "duration_ms": None, "refusal_code": None, "execution_mode": "fixture",
              "idempotency_key": "project-beta:2", "evidence_class": "reported_claim",
              "usage": {"input_tokens": None, "output_tokens": None, "cost_amount": 9.0,

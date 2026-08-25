@@ -166,16 +166,16 @@ class BudgetTests(unittest.TestCase):
     @staticmethod
     def _priced(amount, currency="USD"):
         return routing.Receipt(
-            profile="p", provider_identity=None, selection_reason="r", fallback_chain=(),
-            process_started=True, duration_ms=None, classification="completed",
+            provider_profile="p", provider=None, selection_reason="r", fallback_chain=(),
+            selection_trace=(), process_started=True, duration_ms=None, classification="completed",
             refusal_code=None, execution_mode="real", idempotency_key="k",
             usage=Usage(cost_amount=amount, cost_currency=currency, cost_state="reported"))
 
     @staticmethod
     def _unpriced():
         return routing.Receipt(
-            profile="p", provider_identity=None, selection_reason="r", fallback_chain=(),
-            process_started=True, duration_ms=None, classification="completed",
+            provider_profile="p", provider=None, selection_reason="r", fallback_chain=(),
+            selection_trace=(), process_started=True, duration_ms=None, classification="completed",
             refusal_code=None, execution_mode="real", idempotency_key="k")
 
     def test_no_ceiling_is_not_applicable_rather_than_unlimited(self):

@@ -178,7 +178,7 @@ class Controller:
                        detail: str) -> None:
         self.store.log(mission["id"], "ROUTE_SWITCH_REFUSED", {
             "attempt": mission["attempt_count"], "code": code,
-            "profile": profile, "detail": detail})
+            "provider_profile": profile, "detail": detail})
 
     def _dispatch(self, mission: dict[str, Any], resume_state: str) -> dict[str, Any]:
         """Produce this mission's dispatch result, routing only where it is safe."""
@@ -225,10 +225,10 @@ class Controller:
                 # An unproven negative is not a proof, so this mission stops here
                 # rather than handing the same work to a second provider.
                 self._refuse_switch(mission, "PROVIDER_SWITCH_AFTER_SIDE_EFFECT",
-                                    receipt.profile, "process_started=%r" % (receipt.process_started,))
+                                    receipt.provider_profile, "process_started=%r" % (receipt.process_started,))
                 raise NonRetryableFailure(
                     "PROVIDER_SWITCH_AFTER_SIDE_EFFECT: %s did not prove no process started"
-                    % (receipt.profile or LAYER_DEFAULT))
+                    % (receipt.provider_profile or LAYER_DEFAULT))
             attempted.append(selection.profile or LAYER_DEFAULT)
 
     def _recover(self, mission: dict[str, Any], committed: list[dict[str, Any]],
@@ -240,20 +240,20 @@ class Controller:
         return the result bound to this idempotency key, on the same profile.
         """
 
-        profile = committed[-1]["profile"] if committed else None
+        profile = committed[-1]["provider_profile"] if committed else None
         selection = Selection(profile, "recover_existing_result", ())
         response = self._step(
             mission, "dispatch",
             {"mission": mission["payload"], "route": _route(selection, (), mission, True)},
             memo_value={"mission": mission["payload"]})
         receipt = routing.receipt_from_response(response, selection, ())
-        if committed and receipt.profile not in (None, profile):
-            self._refuse_switch(mission, "PROVIDER_SWITCH_AFTER_SIDE_EFFECT", receipt.profile,
+        if committed and receipt.provider_profile not in (None, profile):
+            self._refuse_switch(mission, "PROVIDER_SWITCH_AFTER_SIDE_EFFECT", receipt.provider_profile,
                                 "recovery returned %r for a mission dispatched on %r"
-                                % (receipt.profile, profile))
+                                % (receipt.provider_profile, profile))
             raise NonRetryableFailure(
                 "PROVIDER_SWITCH_AFTER_SIDE_EFFECT: recovery changed provider %r -> %r"
-                % (profile, receipt.profile))
+                % (profile, receipt.provider_profile))
         if len(prior) == len(self.store.runs(mission["id"])):
             self._record(mission, selection, receipt)
         if response.get("status") == routing.PROVIDER_UNAVAILABLE:
@@ -264,13 +264,28 @@ class Controller:
 
     def _verify_receipt(self, mission: dict[str, Any], receipt: routing.Receipt,
                         response: dict[str, Any]) -> None:
-        """The two SF-134 dispatch guards, applied to every served leg.
+        """The dispatch guards, applied to every served leg.
 
-        Both are equality checks, so neither default direction can launder a
-        run: a fixture receipt fails a real mission and a real receipt fails a
-        fixture one.
+        The mode and key checks are equalities, so neither default direction can
+        launder a run: a fixture receipt fails a real mission and a real receipt
+        fails a fixture one.
+
+        The policy check is here rather than only at selection because the
+        execution layer does its own selecting.  ``factory-bridge`` c9787d5
+        picks from its own priority-ordered registry and the Controller has no
+        wire field to name a profile, so an Owner allow/deny list would be
+        advice unless it is also enforced against the profile that actually ran.
         """
 
+        policy = ExecutionPolicy.from_payload(mission["payload"])
+        served = receipt.provider_profile
+        if served is not None:
+            if served in policy.denied_profiles:
+                raise NonRetryableFailure(
+                    "PROVIDER_POLICY_VIOLATION: %s is denied by this mission" % served)
+            if policy.allowed_profiles and served not in policy.allowed_profiles:
+                raise NonRetryableFailure(
+                    "PROVIDER_POLICY_VIOLATION: %s is outside the allowed set" % served)
         declared = mission["payload"].get("execution_mode", "fixture")
         reported = receipt.execution_mode
         if reported in routing.EXECUTION_MODES and reported != declared:
@@ -396,7 +411,7 @@ def _route(selection: Selection, attempted: tuple | list, mission: dict[str, Any
     """What the execution layer is told about this leg.  No vendor detail here."""
 
     return {
-        "profile": selection.profile,
+        "provider_profile": selection.profile,
         "selection_reason": selection.reason,
         "attempted_profiles": list(attempted),
         "recover_only": recover_only,
@@ -416,6 +431,11 @@ def _receipt_value(row: dict[str, Any]) -> routing.Receipt:
     """Rebuild a receipt from its durable row so budgets survive a restart."""
 
     raw = dict(row)
+    if "profile" in raw and "provider_profile" not in raw:
+        raw["provider_profile"] = raw.pop("profile")
+    if "provider_identity" in raw and "provider" not in raw:
+        raw["provider"] = raw.pop("provider_identity")
     raw["fallback_chain"] = tuple(raw.get("fallback_chain") or ())
+    raw["selection_trace"] = tuple(raw.get("selection_trace") or ())
     raw["usage"] = routing.Usage(**(raw.get("usage") or {}))
     return routing.Receipt(**raw)

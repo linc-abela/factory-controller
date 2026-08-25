@@ -22,7 +22,7 @@ class PreDispatchFallbackTests(RouteTestCase, unittest.TestCase):
         result = controller.work_once("w1")
         self.assertEqual(result["state"], "completed")
         route = store.route_history(mission["id"])
-        self.assertEqual(route["selected_profile"], ALPHA)
+        self.assertEqual(route["selected_provider_profile"], ALPHA)
         self.assertEqual(route["fallback_count"], 0)
 
     def test_a_proven_unavailable_provider_falls_back_before_any_side_effect(self):
@@ -32,8 +32,8 @@ class PreDispatchFallbackTests(RouteTestCase, unittest.TestCase):
         result = controller.work_once("w1")
         self.assertEqual(result["state"], "completed")
         route = store.route_history(mission["id"])
-        self.assertEqual([leg["profile"] for leg in route["legs"]], [ALPHA, BETA])
-        self.assertEqual(route["selected_profile"], BETA)
+        self.assertEqual([leg["provider_profile"] for leg in route["legs"]], [ALPHA, BETA])
+        self.assertEqual(route["selected_provider_profile"], BETA)
         self.assertEqual(route["fallback_count"], 1)
         self.assertEqual(route["legs"][1]["selection_reason"], "fallback_after:" + ALPHA)
 
@@ -61,7 +61,7 @@ class PreDispatchFallbackTests(RouteTestCase, unittest.TestCase):
         result = controller.work_once("w1")
         self.assertEqual(result["state"], "refused")
         self.assertIn("PROVIDER_FALLBACK_FORBIDDEN", result["terminal_reason"])
-        self.assertEqual([call["profile"] for call in adapter.dispatches], [ALPHA])
+        self.assertEqual([call["provider_profile"] for call in adapter.dispatches], [ALPHA])
 
     def test_a_denied_profile_is_never_dispatched_to(self):
         adapter = LayerAdapter()
@@ -69,7 +69,7 @@ class PreDispatchFallbackTests(RouteTestCase, unittest.TestCase):
         payload = mission_payload(execution_policy={"denied_profiles": [ALPHA]})
         controller.submit(payload, "route:6")
         controller.work_once("w1")
-        self.assertEqual([call["profile"] for call in adapter.dispatches], [BETA])
+        self.assertEqual([call["provider_profile"] for call in adapter.dispatches], [BETA])
 
     def test_route_leg_limit_bounds_the_fallback_chain(self):
         adapter = LayerAdapter(proven_unavailable=[ALPHA, BETA])
@@ -89,7 +89,7 @@ class SideEffectBoundaryTests(RouteTestCase, unittest.TestCase):
         result = controller.work_once("w1")
         self.assertEqual(result["state"], "refused")
         self.assertIn("PROVIDER_SWITCH_AFTER_SIDE_EFFECT", result["terminal_reason"])
-        self.assertEqual([call["profile"] for call in adapter.dispatches], [ALPHA])
+        self.assertEqual([call["provider_profile"] for call in adapter.dispatches], [ALPHA])
         route = store.route_history(mission["id"])
         self.assertEqual(route["switch_refusals"][0]["code"], "PROVIDER_SWITCH_AFTER_SIDE_EFFECT")
 
@@ -99,7 +99,7 @@ class SideEffectBoundaryTests(RouteTestCase, unittest.TestCase):
         mission, _ = controller.submit(mission_payload(), "boundary:2")
         controller.work_once("w1")
         boundary = store.route_history(mission["id"])["side_effect_boundary"]
-        self.assertEqual(boundary["profile"], BETA)
+        self.assertEqual(boundary["provider_profile"], BETA)
         self.assertEqual(boundary["leg"], 2)
         self.assertTrue(boundary["process_started"])
 
@@ -121,8 +121,8 @@ class SideEffectBoundaryTests(RouteTestCase, unittest.TestCase):
         result = resumed.work_once("replacement")
         self.assertEqual(result["state"], "completed")
         route = resumed.store.route_history(mission["id"])
-        self.assertEqual(route["selected_profile"], ALPHA)
-        self.assertEqual([call["profile"] for call in adapter.dispatches], [ALPHA])
+        self.assertEqual(route["selected_provider_profile"], ALPHA)
+        self.assertEqual([call["provider_profile"] for call in adapter.dispatches], [ALPHA])
 
     def test_a_crash_before_the_step_output_lands_recovers_on_the_same_profile(self):
         adapter = LayerAdapter()
@@ -134,7 +134,7 @@ class SideEffectBoundaryTests(RouteTestCase, unittest.TestCase):
         store.begin_step(claimed["id"], token, "dispatch", {"mission": claimed["payload"]})
         store.record_run(claimed["id"], 1,
                          {"reason": "first_admissible", "considered": []},
-                         {"profile": ALPHA, "classification": "completed", "process_started": True},
+                         {"provider_profile": ALPHA, "classification": "completed", "process_started": True},
                          "boundary:4")
         store.transition(claimed["id"], token, "dispatched")
         time.sleep(0.05)
@@ -142,7 +142,7 @@ class SideEffectBoundaryTests(RouteTestCase, unittest.TestCase):
         adapter.proven_unavailable.add(ALPHA)
         resumed = self.reopen(path, adapter)
         result = resumed.work_once("replacement")
-        self.assertEqual([call["profile"] for call in adapter.dispatches], [ALPHA])
+        self.assertEqual([call["provider_profile"] for call in adapter.dispatches], [ALPHA])
         self.assertTrue(adapter.dispatches[0]["recover_only"])
         # Past the boundary a non-retryable failure is `failed`, never `refused`:
         # `refused` is reserved for missions that never left `dispatching`.
@@ -158,7 +158,7 @@ class SideEffectBoundaryTests(RouteTestCase, unittest.TestCase):
         store.begin_step(claimed["id"], token, "dispatch", {"mission": claimed["payload"]})
         store.record_run(claimed["id"], 1,
                          {"reason": "first_admissible", "considered": []},
-                         {"profile": ALPHA, "classification": "completed", "process_started": True},
+                         {"provider_profile": ALPHA, "classification": "completed", "process_started": True},
                          "boundary:5")
         store.transition(claimed["id"], token, "dispatched")
         time.sleep(0.05)
@@ -166,7 +166,7 @@ class SideEffectBoundaryTests(RouteTestCase, unittest.TestCase):
         class Swapper(LayerAdapter):
             def _dispatch(self, operation_key, value):
                 response = super()._dispatch(operation_key, value)
-                response["receipt"]["profile"] = BETA
+                response["receipt"]["provider_profile"] = BETA
                 return response
 
         resumed = self.reopen(path, Swapper())
@@ -270,7 +270,7 @@ class EvaluatorAndEvidenceTests(RouteTestCase, unittest.TestCase):
         result = controller.work_once("w1")
         self.assertEqual(result["state"], "escalated")
         self.assertIn("ACCEPTANCE_GATE_FAILED", result["terminal_reason"])
-        self.assertEqual(store.route_history(mission["id"])["selected_profile"], ALPHA)
+        self.assertEqual(store.route_history(mission["id"])["selected_provider_profile"], ALPHA)
 
     def test_an_evaluator_that_skips_a_declared_gate_never_passes(self):
         class Partial(LayerAdapter):
@@ -412,12 +412,12 @@ class RouteExplainabilityTests(RouteTestCase, unittest.TestCase):
         mission, _ = controller.submit(mission_payload(), "explain:1")
         controller.work_once("w1")
         route = store.route_history(mission["id"])
-        self.assertEqual(route["selected_profile"], BETA)
+        self.assertEqual(route["selected_provider_profile"], BETA)
         self.assertEqual(route["legs"][0]["outcome"], "provider_unavailable")
         self.assertEqual(route["legs"][1]["selection_reason"], "fallback_after:" + ALPHA)
         self.assertEqual([item["profile"] for item in route["legs"][0]["considered"]],
                          [ALPHA, BETA])
-        self.assertEqual(route["side_effect_boundary"]["profile"], BETA)
+        self.assertEqual(route["side_effect_boundary"]["provider_profile"], BETA)
         self.assertEqual(route["switch_refusals"], [])
 
     def test_the_history_survives_a_restart_because_it_is_durable(self):
@@ -435,7 +435,7 @@ class RouteExplainabilityTests(RouteTestCase, unittest.TestCase):
         controller.work_once("w1")
         with store.connect() as db:
             with self.assertRaises(Exception):
-                db.execute("UPDATE runs SET profile='rewritten' WHERE mission_id=?", (mission["id"],))
+                db.execute("UPDATE runs SET provider_profile='rewritten' WHERE mission_id=?", (mission["id"],))
             with self.assertRaises(Exception):
                 db.execute("DELETE FROM runs WHERE mission_id=?", (mission["id"],))
 

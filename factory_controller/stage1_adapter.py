@@ -76,8 +76,8 @@ def _dispatch(request: dict[str, Any], config: dict[str, Any]) -> dict[str, Any]
         raise ValueError("stage1.mode must be dry_run or real")
     route = request.get("input", {}).get("route") or {}
     receipt: dict[str, Any] = {
-        "profile": route.get("profile"),
-        "provider_identity": "factory-evidence-core/first-live",
+        "provider_profile": route.get("provider_profile"),
+        "provider": "factory-evidence-core/first-live",
         "usage": {"cost_state": "unknown"},
     }
     if mode == "real" and config.get("operator_opt_in") is not True:

@@ -245,12 +245,19 @@ class Receipt:
     Everything here is a *reported* fact.  Candidate validity is not decided by
     any of it: that is Git's and Evidence Core's, and the Controller keeps the
     two classes in separate fields precisely so they cannot be confused later.
+
+    The field names are ``factory-bridge``'s, taken from the receipt SF-135A
+    writes in ``adapter.py``: ``provider_profile`` is the registry key that
+    served the run, ``provider`` is that profile's provider name, and
+    ``selection_trace`` is the layer's own route explanation.  One dialect
+    across the seam is worth more than a tidier local name.
     """
 
-    profile: str | None
-    provider_identity: str | None
+    provider_profile: str | None
+    provider: str | None
     selection_reason: str
     fallback_chain: tuple[str, ...]
+    selection_trace: tuple[str, ...]
     process_started: bool | None
     duration_ms: int | None
     classification: str
@@ -283,11 +290,14 @@ def receipt_from_response(response: dict[str, Any], selection: Selection,
     status = response.get("status")
     started = raw.get("process_started")
     mode = raw.get("execution_mode", response.get("execution_mode"))
+    trace = raw.get("selection_trace")
     return Receipt(
-        profile=raw.get("profile") or selection.profile,
-        provider_identity=_optional_string(raw.get("provider_identity")),
+        provider_profile=_optional_string(raw.get("provider_profile")) or selection.profile,
+        provider=_optional_string(raw.get("provider")),
         selection_reason=selection.reason,
         fallback_chain=tuple(fallback_chain),
+        selection_trace=tuple(item for item in trace if isinstance(item, str))
+        if isinstance(trace, (list, tuple)) else (),
         process_started=started if isinstance(started, bool) else None,
         duration_ms=_non_negative_int(raw.get("duration_ms")),
         classification=status if isinstance(status, str) and status else "unknown",
@@ -308,10 +318,11 @@ def unserved_receipt(selection: Selection, fallback_chain: Sequence[str],
     """
 
     return Receipt(
-        profile=selection.profile,
-        provider_identity=None,
+        provider_profile=selection.profile,
+        provider=None,
         selection_reason=selection.reason,
         fallback_chain=tuple(fallback_chain),
+        selection_trace=(),
         process_started=False,
         duration_ms=None,
         classification=PROVIDER_UNAVAILABLE,

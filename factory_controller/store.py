@@ -137,7 +137,7 @@ class MissionStore:
                   mission_id TEXT NOT NULL REFERENCES missions(id),
                   attempt_number INTEGER NOT NULL,
                   leg INTEGER NOT NULL,
-                  profile TEXT,
+                  provider_profile TEXT,
                   selection_reason TEXT NOT NULL,
                   considered_json TEXT NOT NULL,
                   outcome TEXT NOT NULL,
@@ -382,20 +382,21 @@ class MissionStore:
         the caller, so two writers cannot mint the same one.
         """
 
+        prof = receipt.get("provider_profile") if "provider_profile" in receipt else receipt.get("profile")
         with self.transaction() as db:
             leg = db.execute(
                 "SELECT COALESCE(MAX(leg),0)+1 n FROM runs WHERE mission_id=? AND attempt_number=?",
                 (mission_id, attempt_number),
             ).fetchone()["n"]
             db.execute(
-                "INSERT INTO runs(mission_id,attempt_number,leg,profile,selection_reason,considered_json,outcome,process_started,idempotency_key,receipt_json,created_at) VALUES(?,?,?,?,?,?,?,?,?,?,?)",
-                (mission_id, attempt_number, leg, receipt["profile"], selection["reason"],
+                "INSERT INTO runs(mission_id,attempt_number,leg,provider_profile,selection_reason,considered_json,outcome,process_started,idempotency_key,receipt_json,created_at) VALUES(?,?,?,?,?,?,?,?,?,?,?)",
+                (mission_id, attempt_number, leg, prof, selection["reason"],
                  canonical_json(selection["considered"]), receipt["classification"],
                  None if receipt["process_started"] is None else int(receipt["process_started"]),
                  idempotency_key, canonical_json(receipt), self.clock()),
             )
             self._event(db, mission_id, "ROUTE_LEG", None, None, {
-                "attempt": attempt_number, "leg": leg, "profile": receipt["profile"],
+                "attempt": attempt_number, "leg": leg, "provider_profile": prof,
                 "selection_reason": selection["reason"], "outcome": receipt["classification"],
                 "process_started": receipt["process_started"],
             })
@@ -407,7 +408,7 @@ class MissionStore:
         with self.connect() as db:
             rows = db.execute("SELECT * FROM runs WHERE mission_id=? ORDER BY id", (mission_id,)).fetchall()
             return [
-                {**dict(row), "considered": json.loads(row["considered_json"]),
+                {**dict(row), "profile": row["provider_profile"], "considered": json.loads(row["considered_json"]),
                  "receipt": json.loads(row["receipt_json"]),
                  "process_started": None if row["process_started"] is None else bool(row["process_started"])}
                 for row in rows
@@ -428,24 +429,31 @@ class MissionStore:
         )
         refusals = [
             {"attempt": event["detail"].get("attempt"), "code": event["detail"].get("code"),
-             "profile": event["detail"].get("profile"), "detail": event["detail"].get("detail")}
+             "provider_profile": event["detail"].get("provider_profile"),
+             "detail": event["detail"].get("detail")}
             for event in self.history(mission_id) if event["kind"] == "ROUTE_SWITCH_REFUSED"
         ]
+        selected_prof = None if side_effect is None else (side_effect.get("provider_profile") or side_effect.get("profile"))
         return {
             "mission_id": mission_id,
             "state": None if mission is None else mission["state"],
-            "selected_profile": None if side_effect is None else side_effect["profile"],
+            "selected_profile": selected_prof,
+            "selected_provider_profile": selected_prof,
             "legs": [
-                {"attempt": leg["attempt_number"], "leg": leg["leg"], "profile": leg["profile"],
+                {"attempt": leg["attempt_number"], "leg": leg["leg"],
+                 "profile": leg.get("provider_profile") or leg.get("profile"),
+                 "provider_profile": leg.get("provider_profile") or leg.get("profile"),
                  "selection_reason": leg["selection_reason"], "considered": leg["considered"],
                  "outcome": leg["outcome"], "process_started": leg["process_started"],
-                 "idempotency_key": leg["idempotency_key"]}
+                 "idempotency_key": leg["idempotency_key"],
+                 "layer_selection_trace": leg["receipt"].get("selection_trace") or []}
                 for leg in legs
             ],
             "fallback_count": max(0, len(legs) - 1),
             "side_effect_boundary": None if side_effect is None else {
                 "attempt": side_effect["attempt_number"], "leg": side_effect["leg"],
-                "profile": side_effect["profile"],
+                "profile": side_effect.get("provider_profile") or side_effect.get("profile"),
+                "provider_profile": side_effect.get("provider_profile") or side_effect.get("profile"),
                 "process_started": side_effect["process_started"],
             },
             "switch_refusals": refusals,
@@ -477,7 +485,7 @@ class MissionStore:
             "terminal_reason": mission["terminal_reason"],
             "execution_mode": payload.get("execution_mode", "fixture"),
             "provider_profile": next(
-                (leg["profile"] for leg in reversed(legs) if leg["process_started"] is not False),
+                (leg["provider_profile"] for leg in reversed(legs) if leg["process_started"] is not False),
                 None,
             ),
             "route_legs": len(legs),

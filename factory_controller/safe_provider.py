@@ -29,10 +29,10 @@ def _unavailable() -> frozenset:
 
 def dispatch(request: dict) -> dict:
     route = request["input"].get("route") or {}
-    profile = route.get("profile")
+    profile = route.get("provider_profile")
     receipt = {
-        "profile": profile,
-        "provider_identity": "local-safe-provider",
+        "provider_profile": profile,
+        "provider": "local-safe-provider",
         "execution_mode": "fixture",
         "idempotency_key": route.get("idempotency_key"),
         "duration_ms": 0,
