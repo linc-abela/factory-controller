@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import threading
 from typing import Any, Protocol
 
 from .store import MissionStore
@@ -45,9 +46,38 @@ class Controller:
         if started["status"] == "COMPLETED":
             return started["output"]
         self.store.renew(mission["id"], mission["lease_token"], self.lease_seconds)
-        output = self.adapter.execute(name, started["operation_key"], value)
+        stopped = threading.Event()
+        heartbeat_error: list[BaseException] = []
+
+        def heartbeat() -> None:
+            interval = max(0.01, min(5.0, self.lease_seconds / 3))
+            while not stopped.wait(interval):
+                try:
+                    self.store.renew(mission["id"], mission["lease_token"], self.lease_seconds)
+                except BaseException as exc:
+                    heartbeat_error.append(exc)
+                    return
+
+        thread = threading.Thread(target=heartbeat, name=f"lease-heartbeat-{mission['id']}", daemon=True)
+        if self.lease_seconds > 0:
+            thread.start()
+        try:
+            output = self.adapter.execute(name, started["operation_key"], value)
+        finally:
+            stopped.set()
+            if thread.is_alive():
+                thread.join(timeout=min(1.0, self.lease_seconds))
+        if heartbeat_error:
+            raise heartbeat_error[0]
         self.store.complete_step(mission["id"], mission["lease_token"], name, output)
         return output
+
+    def _cancelled(self, mission_id: str, lease_token: str) -> bool:
+        current = self.store.get(mission_id)
+        if current and current["cancel_requested"]:
+            self.store.transition(mission_id, lease_token, "CANCELLED", reason="OPERATOR_CANCELLED", release_lease=True)
+            return True
+        return False
 
     def work_once(self, worker_id: str) -> dict[str, Any] | None:
         self.store.recover_stale()
@@ -62,6 +92,8 @@ class Controller:
                 return self.store.get(mission_id)
             self.store.transition(mission_id, token, "IN_PROGRESS")
             dispatch = self._step(mission, "dispatch", {"mission": mission["payload"]})
+            if self._cancelled(mission_id, token):
+                return self.store.get(mission_id)
             status = dispatch.get("status")
             if status in {"blocked", "retryable_error"}:
                 raise RetryableFailure(dispatch.get("diagnostic", status))
@@ -69,6 +101,8 @@ class Controller:
                 raise NonRetryableFailure(dispatch.get("diagnostic", "DISPATCH_REFUSED"))
             self.store.transition(mission_id, token, "AWAITING_VERIFICATION", detail={"candidate_sha": dispatch["candidate_sha"]})
             verification = self._step(mission, "verify", {"mission": mission["payload"], "dispatch": dispatch})
+            if self._cancelled(mission_id, token):
+                return self.store.get(mission_id)
             if not verification.get("verified"):
                 raise NonRetryableFailure(verification.get("diagnostic", "CANDIDATE_VERIFICATION_FAILED"))
             evidence = self._step(mission, "evidence", {"mission": mission["payload"], "dispatch": dispatch, "verification": verification})
@@ -83,4 +117,3 @@ class Controller:
         except NonRetryableFailure as exc:
             self.store.transition(mission_id, token, "FAILED", reason=str(exc), release_lease=True)
         return self.store.get(mission_id)
-

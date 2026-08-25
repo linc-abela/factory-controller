@@ -103,7 +103,8 @@ class MissionStoreTests(unittest.TestCase):
         updated = self.store.get(m_id)
         self.assertEqual(updated["state"], "IN_PROGRESS")
 
-        # Complete mission to DONE
+        # Completion must pass through the explicit verification state.
+        self.store.transition(m_id, valid_token, "AWAITING_VERIFICATION")
         self.store.transition(m_id, valid_token, "DONE", result={"status": "ok"}, release_lease=True)
         finished = self.store.get(m_id)
         self.assertEqual(finished["state"], "DONE")

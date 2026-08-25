@@ -14,6 +14,11 @@ from typing import Any, Iterator
 
 TERMINAL = {"DONE", "BLOCKED", "FAILED", "CANCELLED"}
 RUNNABLE = {"READY"}
+ALLOWED_TRANSITIONS = {
+    "CLAIMED": {"IN_PROGRESS", "CANCELLED", "FAILED"},
+    "IN_PROGRESS": {"AWAITING_VERIFICATION", "CANCELLED", "FAILED"},
+    "AWAITING_VERIFICATION": {"DONE", "CANCELLED", "FAILED"},
+}
 
 
 class ConflictError(ValueError):
@@ -200,6 +205,8 @@ class MissionStore:
             row = db.execute("SELECT * FROM missions WHERE id=?", (mission_id,)).fetchone()
             if row is None or row["lease_token"] != lease_token:
                 raise LeaseLostError("LEASE_LOST")
+            if new_state not in ALLOWED_TRANSITIONS.get(row["state"], set()):
+                raise ValueError(f"INVALID_TRANSITION: {row['state']} -> {new_state}")
             now = self.clock()
             owner = token = expiry = None if release_lease else row["lease_owner"]
             if not release_lease:
@@ -310,4 +317,3 @@ class MissionStore:
     def counts(self) -> dict[str, int]:
         with self.connect() as db:
             return {row["state"]: row["n"] for row in db.execute("SELECT state,count(*) n FROM missions GROUP BY state")}
-

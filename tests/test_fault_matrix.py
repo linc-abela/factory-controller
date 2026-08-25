@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import tempfile
+import threading
 import time
 import unittest
 from pathlib import Path
@@ -248,6 +249,30 @@ class ControllerFaultMatrixTests(unittest.TestCase):
         res = self.controller.work_once("w3")
         self.assertEqual(res["state"], "BLOCKED")
         self.assertTrue("RETRIES_EXHAUSTED" in res["terminal_reason"])
+
+    # Fault 16: a long provider call is protected by heartbeat renewal
+    def test_fault_16_provider_call_renews_lease_until_completion(self) -> None:
+        class SlowAdapter(FaultHarnessAdapter):
+            def execute(inner_self, step, operation_key, value):
+                if step == "dispatch":
+                    time.sleep(0.12)
+                return super(SlowAdapter, inner_self).execute(step, operation_key, value)
+
+        controller = Controller(
+            self.store,
+            SlowAdapter(),
+            retry_policy=RetryPolicy(max_attempts=2, base_delay_seconds=0),
+            lease_seconds=0.05,
+        )
+        controller.submit({"item": "slow"}, "key-slow")
+        result_box = []
+        worker = threading.Thread(target=lambda: result_box.append(controller.work_once("slow-worker")))
+        worker.start()
+        time.sleep(0.08)
+        self.assertEqual(self.store.recover_stale(), 0)
+        self.assertIsNone(self.store.claim("duplicate-worker"))
+        worker.join()
+        self.assertEqual(result_box[0]["state"], "DONE")
 
 
 if __name__ == "__main__":
