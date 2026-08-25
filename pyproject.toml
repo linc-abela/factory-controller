@@ -1,0 +1,13 @@
+[project]
+name = "factory-controller"
+version = "0.1.0"
+description = "Durable single-host Factory mission controller"
+requires-python = ">=3.11"
+dependencies = []
+
+[project.scripts]
+factory-controller = "factory_controller.cli:main"
+
+[tool.setuptools.packages.find]
+include = ["factory_controller*"]
+

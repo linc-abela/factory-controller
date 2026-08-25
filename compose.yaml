@@ -1,0 +1,7 @@
+services:
+  controller:
+    build: .
+    working_dir: /workspace
+    volumes:
+      - .:/workspace
+

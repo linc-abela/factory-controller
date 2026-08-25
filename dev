@@ -1,0 +1,7 @@
+#!/bin/sh
+set -eu
+case "${1:-}" in
+  test) shift; exec docker compose run --rm controller python -m unittest discover -s tests "$@" ;;
+  *) exec docker compose run --rm controller python -m factory_controller.cli "$@" ;;
+esac
+
