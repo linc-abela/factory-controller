@@ -14,7 +14,8 @@ import threading
 from dataclasses import dataclass
 from typing import Any, Protocol
 
-from . import routing
+from . import context, routing
+from .context import ContextBudget, ContextError, ContextRequest
 from .routing import ExecutionPolicy, PolicyError, Selection
 from .store import MissionStore
 
@@ -88,6 +89,11 @@ class Controller:
             routing.candidates_from_payload(payload)
         except PolicyError as exc:
             raise NonRetryableFailure("INVALID_EXECUTION_POLICY: %s" % exc) from exc
+        try:
+            ContextRequest.from_payload(payload)
+            ContextBudget.from_payload(payload)
+        except ContextError as exc:
+            raise NonRetryableFailure("INVALID_CONTEXT_REQUEST: %s" % exc) from exc
         if mode != "real":
             return mode
         work_item_id = payload.get("work_item_id")
@@ -148,7 +154,7 @@ class Controller:
                 thread.join(timeout=min(1.0, self.lease_seconds))
         if heartbeat_error:
             raise heartbeat_error[0]
-        incomplete = {"retryable_error", routing.PROVIDER_UNAVAILABLE}
+        incomplete = {"retryable_error", routing.PROVIDER_UNAVAILABLE, "unavailable"}
         if not (isinstance(output, dict) and output.get("status") in incomplete):
             self.store.complete_step(mission["id"], mission["lease_token"], name, output)
         return output
@@ -161,6 +167,82 @@ class Controller:
             self.store.transition(mission_id, lease_token, target, reason=reason, release_lease=True)
             return True
         return False
+
+    # ------------------------------------------------------------------ #
+    # context
+    # ------------------------------------------------------------------ #
+
+    def _context(self, mission: dict[str, Any], resume_state: str) -> dict[str, Any] | None:
+        """Bind this mission to exactly one context manifest, or refuse.
+
+        The Controller states an entitlement and checks the answer.  It does not
+        read, rank, or open anything in the target repository; the whole of this
+        method is a policy comparison over facts a broker reported.
+
+        Two properties come out of the machinery rather than from new code.
+        *Stickiness*: the manifest is a durable memoized step, so a restart after
+        dispatch returns the manifest that was used and the broker is never asked
+        again.  *Replay safety*: for a real mission the idempotency key already
+        is ``work_item_id:context_manifest_hash``, so the same work against a
+        different manifest is not a replay at all -- it is a different mission
+        identity, which the store refuses as a key conflict.
+
+        Freshness is enforced only before the irreversible boundary.  Afterwards
+        the execution stays bound to the manifest it already ran on, and calling
+        that stale would be re-deciding a decision that has already had effects.
+        """
+
+        request = ContextRequest.from_payload(mission["payload"])
+        if request is None:
+            return None
+        budget = ContextBudget.from_payload(mission["payload"])
+        pre_boundary = resume_state == "dispatching"
+
+        token_refusal = context.reported_token_refusal(
+            budget, self.store.telemetry(mission["id"])["reported_input_tokens"])
+        if token_refusal:
+            self._refuse_context(mission, token_refusal, None)
+            raise NonRetryableFailure(
+                "%s: ceiling %s reported input tokens"
+                % (token_refusal, budget.max_reported_input_tokens))
+
+        response = self._step(mission, "context", {"context_request": request.as_wire()})
+        package = context.ContextPackage.from_response(response)
+        if package.status == "unavailable":
+            # Nothing was memoized, so a later attempt may ask again.  Only a
+            # broker that answered gets to bind this mission to anything.
+            self._refuse_context(mission, package.refusal_code or "CONTEXT_BROKER_UNAVAILABLE",
+                                 package)
+            raise RetryableFailure(package.refusal_code or "CONTEXT_BROKER_UNAVAILABLE")
+
+        refusal = context.verify(
+            request, package,
+            declared_manifest_hash=mission["payload"].get("context_manifest_hash"),
+            budget=budget,
+            now=self.store.clock() if pre_boundary else None)
+        if refusal:
+            self._refuse_context(mission, refusal, package)
+            raise NonRetryableFailure("%s: mission %s" % (refusal, mission["id"]))
+        self.store.log(mission["id"], "CONTEXT_BOUND", {
+            "attempt": mission["attempt_count"],
+            "context_manifest_hash": package.manifest.manifest_hash,
+            "corpus_identity": package.manifest.corpus_identity,
+            "policy_identity": package.manifest.policy_identity,
+            "selected_refs": len(package.manifest.selected_refs),
+            "measurement": package.as_row()["measurement"],
+            "reduction": package.measurement.reduction,
+            "freshness_enforced": pre_boundary,
+        })
+        return package.as_row()
+
+    def _refuse_context(self, mission: dict[str, Any], code: str,
+                        package: "context.ContextPackage | None") -> None:
+        self.store.log(mission["id"], "CONTEXT_REFUSED", {
+            "attempt": mission["attempt_count"], "code": code,
+            "context_manifest_hash": None if package is None or package.manifest is None
+            else package.manifest.manifest_hash,
+            "broker_status": None if package is None else package.status,
+        })
 
     # ------------------------------------------------------------------ #
     # routing
@@ -319,6 +401,7 @@ class Controller:
                 self.store.transition(mission_id, token, "cancelled", reason="OPERATOR_CANCELLED", release_lease=True)
                 return self.store.get(mission_id)
             self.validate(mission["payload"], mission["idempotency_key"])
+            self._context(mission, resume_state)
             dispatch = self._dispatch(mission, resume_state)
             if self._cancelled(mission_id, token):
                 return self.store.get(mission_id)

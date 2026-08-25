@@ -36,6 +36,8 @@ def parser() -> argparse.ArgumentParser:
     route.add_argument("mission_id")
     telemetry = sub.add_parser("telemetry")
     telemetry.add_argument("mission_id")
+    ctx = sub.add_parser("context")
+    ctx.add_argument("mission_id")
     cancel = sub.add_parser("cancel")
     cancel.add_argument("mission_id")
     harness = sub.add_parser("harness")
@@ -72,6 +74,8 @@ def main(argv: list[str] | None = None) -> int:
         print(json.dumps(store.route_history(args.mission_id), sort_keys=True))
     elif args.command == "telemetry":
         print(json.dumps(store.telemetry(args.mission_id), sort_keys=True))
+    elif args.command == "context":
+        print(json.dumps(store.context_history(args.mission_id), sort_keys=True))
     elif args.command == "cancel":
         print(json.dumps({"state": store.cancel(args.mission_id)}))
     elif args.command == "harness":

@@ -17,6 +17,8 @@ import json
 import os
 import sys
 
+from .context import CONTEXT_SCHEMA_VERSION, sha256_hex
+
 
 PROFILE_ENV = "FACTORY_CONTROLLER_UNAVAILABLE_PROFILES"
 
@@ -54,11 +56,55 @@ def dispatch(request: dict) -> dict:
     }
 
 
+BROKER_UNAVAILABLE_ENV = "FACTORY_CONTROLLER_BROKER_UNAVAILABLE"
+
+
+def build_context(request: dict) -> dict:
+    """A deterministic fixture broker: it selects exactly what it was asked for.
+
+    It opens no file and inspects no repository, which is the point -- the real
+    Context Broker is a separate program, and this exists so the local harness
+    can exercise the Controller's binding and refusal paths without one.  Sizes
+    are declared by the request, so they are fixture facts and say so.
+    """
+
+    if os.environ.get(BROKER_UNAVAILABLE_ENV):
+        return {"status": "unavailable", "refusal_code": "CONTEXT_BROKER_UNAVAILABLE"}
+    selected = list(dict.fromkeys(request.get("required_anchors") or []))
+    manifest = {
+        "schema_version": CONTEXT_SCHEMA_VERSION,
+        "mission_input_hash": request["mission_input_hash"],
+        "corpus_identity": request["corpus_identity"],
+        "policy_identity": request["policy_identity"],
+        "selected_refs": selected,
+        "unresolved_questions": [],
+    }
+    digest = sha256_hex(manifest)
+    return {
+        "status": "built",
+        "manifest": {**manifest, "manifest_hash": digest},
+        "receipt": {"schema_version": CONTEXT_SCHEMA_VERSION,
+                    "context_manifest_hash": digest, "selected_refs": selected,
+                    "excluded_refs": [], "mandatory_fact_coverage": selected,
+                    "refusal_code": None},
+        "measurement": {
+            "baseline_context_bytes": None, "baseline_context_files": None,
+            "selected_context_bytes": None, "selected_context_files": len(selected),
+            "manifest_build_ms": 0, "cache_state": "miss", "cache_identity": digest[:16],
+            "built_at": None,
+            "head_sha": request.get("baseline_sha"),
+            "repository_remote_url": request.get("repository_remote_url"),
+        },
+    }
+
+
 def main() -> int:
     request = json.load(sys.stdin)
     step = request["step"]
     operation_key = request["operation_key"]
-    if step == "dispatch":
+    if step == "context":
+        result = build_context(request["input"]["context_request"])
+    elif step == "dispatch":
         result = dispatch(request)
     elif step == "verify":
         result = {"verified": True, "evaluator": "local-safe-provider", "candidate_sha": request["input"]["dispatch"]["candidate_sha"]}

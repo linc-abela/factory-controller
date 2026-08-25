@@ -11,6 +11,8 @@ from contextlib import contextmanager
 from pathlib import Path
 from typing import Any, Iterator
 
+from . import context as context_contract
+
 
 CONTRACT_VERSION = "factory-controller/1.0"
 #: Reproduced from factory-evidence-core ``src/contracts/replay.py``; see
@@ -364,6 +366,16 @@ class MissionStore:
                 raise KeyError(name)
             self._event(db, mission_id, "STEP_COMPLETED", mission["state"], mission["state"], {"step": name})
 
+    def step_output(self, mission_id: str, name: str) -> Any | None:
+        """What a completed step recorded, or ``None`` if it never completed."""
+
+        with self.connect() as db:
+            row = db.execute(
+                "SELECT output_json FROM steps WHERE mission_id=? AND name=? AND status='COMPLETED'",
+                (mission_id, name),
+            ).fetchone()
+            return None if row is None or row["output_json"] is None else json.loads(row["output_json"])
+
     def history(self, mission_id: str) -> list[dict[str, Any]]:
         with self.connect() as db:
             rows = db.execute("SELECT * FROM events WHERE mission_id=? ORDER BY sequence", (mission_id,)).fetchall()
@@ -461,6 +473,40 @@ class MissionStore:
             "switch_refusals": refusals,
         }
 
+    def context_history(self, mission_id: str) -> dict[str, Any]:
+        """Which context manifest this mission used, why, how big, and what refused.
+
+        Everything here is read back from the durable ledger, so the answer after
+        a restart is the answer during the run.  A mission that declared no
+        context request says ``not_applicable`` rather than reporting a zero.
+        """
+
+        mission = self.get(mission_id)
+        if mission is None:
+            raise KeyError(mission_id)
+        payload = mission.get("payload") or {}
+        request = context_contract.ContextRequest.from_payload(payload)
+        budget = context_contract.ContextBudget.from_payload(payload)
+        row = self.step_output(mission_id, "context")
+        package = None if row is None else context_contract.package_from_row(row)
+        refusals = [
+            {"attempt": event["detail"].get("attempt"), "code": event["detail"].get("code"),
+             "broker_status": event["detail"].get("broker_status"),
+             "context_manifest_hash": event["detail"].get("context_manifest_hash")}
+            for event in self.history(mission_id) if event["kind"] == "CONTEXT_REFUSED"
+        ]
+        explained = context_contract.explain(
+            request, package, budget,
+            refusal=refusals[-1]["code"] if refusals and package is None else None)
+        return {
+            "mission_id": mission_id,
+            "state": mission["state"],
+            "declared_context_manifest_hash": payload.get("context_manifest_hash", "not_applicable"),
+            "idempotency_key": mission["idempotency_key"],
+            "context_refusals": refusals,
+            **explained,
+        }
+
     def receipts(self, mission_id: str) -> list[dict[str, Any]]:
         return [leg["receipt"] for leg in self.runs(mission_id)]
 
@@ -507,6 +553,37 @@ class MissionStore:
             },
             "evidence_pointer": (mission.get("result") or {}).get("evidence", {}).get("evidence_pointer", "unknown"),
             "event_count": len(events),
+            "context": self._context_telemetry(mission_id, payload, events),
+        }
+
+    def _context_telemetry(self, mission_id: str, payload: dict[str, Any],
+                           events: list[dict[str, Any]]) -> dict[str, Any]:
+        """Measured context economics.  Absent measurements stay absent words."""
+
+        refusals = [event["detail"].get("code") for event in events
+                    if event["kind"] == "CONTEXT_REFUSED"]
+        if payload.get("context_request") is None:
+            return {"state": "not_applicable", "context_refusals": refusals}
+        row = self.step_output(mission_id, "context")
+        if row is None:
+            return {"state": "not_run", "context_refusals": refusals}
+        package = context_contract.package_from_row(row)
+        measurement = package.as_row()["measurement"]
+        return {
+            "state": "bound" if package.manifest is not None else "refused",
+            "context_manifest_hash": None if package.manifest is None
+            else package.manifest.manifest_hash,
+            "corpus_identity": None if package.manifest is None
+            else package.manifest.corpus_identity,
+            "selected_context_bytes": measurement["selected_context_bytes"],
+            "selected_context_files": measurement["selected_context_files"],
+            "baseline_context_bytes": measurement["baseline_context_bytes"],
+            "baseline_context_files": measurement["baseline_context_files"],
+            "manifest_build_ms": measurement["manifest_build_ms"],
+            "cache_state": measurement["cache_state"],
+            "cache_identity": measurement["cache_identity"],
+            "reduction": package.measurement.reduction,
+            "context_refusals": refusals,
         }
 
 
