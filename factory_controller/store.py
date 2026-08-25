@@ -507,6 +507,61 @@ class MissionStore:
             **explained,
         }
 
+    def economics(self, corpus_identity: str | None = None) -> dict[str, Any]:
+        """Context economics per project, from durable state alone.
+
+        This is the Stage-4 measurement model and the handoff seam for the later
+        coordination stage in one method: missions group by the corpus their own
+        context request named, so a second project is a second group rather than
+        a schema change.  Nothing is summed that was not measured -- a project
+        whose broker reported no bytes reports ``not_measurable``, never zero.
+        """
+
+        groups: dict[str, dict[str, Any]] = {}
+        with self.connect() as db:
+            rows = db.execute("SELECT id,payload_json,state FROM missions ORDER BY created_at").fetchall()
+        for row in rows:
+            payload = json.loads(row["payload_json"])
+            request = (payload or {}).get("context_request")
+            if not isinstance(request, dict):
+                continue
+            corpus = request.get("corpus_identity")
+            if corpus_identity is not None and corpus != corpus_identity:
+                continue
+            group = groups.setdefault(str(corpus), {
+                "corpus_identity": corpus, "missions": 0, "bound": 0, "refused": 0,
+                "measured_missions": 0, "baseline_context_bytes": 0,
+                "selected_context_bytes": 0, "cache_hits": 0, "cache_misses": 0,
+                "mission_ids": [], "gate_passed": 0,
+            })
+            group["missions"] += 1
+            group["mission_ids"].append(row["id"])
+            block = self.telemetry(row["id"])["context"]
+            if block["state"] == "bound":
+                group["bound"] += 1
+            elif block["state"] == "refused" or block.get("context_refusals"):
+                group["refused"] += 1
+            if block.get("cache_state") == "hit":
+                group["cache_hits"] += 1
+            elif block.get("cache_state") == "miss":
+                group["cache_misses"] += 1
+            base = block.get("baseline_context_bytes")
+            chosen = block.get("selected_context_bytes")
+            if isinstance(base, int) and isinstance(chosen, int):
+                group["measured_missions"] += 1
+                group["baseline_context_bytes"] += base
+                group["selected_context_bytes"] += chosen
+            if row["state"] == "completed":
+                group["gate_passed"] += 1
+        for group in groups.values():
+            group["reduction"] = _group_reduction(group)
+            if not group["measured_missions"]:
+                # The broker measured nothing, so there is nothing to add up.
+                group["baseline_context_bytes"] = "not_measurable"
+                group["selected_context_bytes"] = "not_measurable"
+        return {"projects": [groups[key] for key in sorted(groups)],
+                "project_count": len(groups)}
+
     def receipts(self, mission_id: str) -> list[dict[str, Any]]:
         return [leg["receipt"] for leg in self.runs(mission_id)]
 
@@ -585,6 +640,21 @@ class MissionStore:
             "reduction": package.measurement.reduction,
             "context_refusals": refusals,
         }
+
+
+def _group_reduction(group: dict[str, Any]) -> dict[str, Any]:
+    """Aggregate reduction over the missions that actually reported both sides."""
+
+    if not group["measured_missions"]:
+        return {"state": "not_measurable", "measured_missions": 0}
+    base = group["baseline_context_bytes"]
+    if base == 0:
+        return {"state": "not_applicable", "measured_missions": group["measured_missions"]}
+    chosen = group["selected_context_bytes"]
+    return {"state": "measured", "measured_missions": group["measured_missions"],
+            "baseline_context_bytes": base, "selected_context_bytes": chosen,
+            "saved_bytes": base - chosen,
+            "reduction_ratio": round((base - chosen) / base, 6)}
 
 
 def _sum_reported(usages: list[dict[str, Any]], name: str) -> Any:

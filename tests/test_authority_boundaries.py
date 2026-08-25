@@ -17,7 +17,7 @@ import ast
 import unittest
 from pathlib import Path
 
-from factory_controller import routing
+from factory_controller import context, routing
 
 
 PACKAGE = Path(__file__).resolve().parent.parent / "factory_controller"
@@ -27,7 +27,19 @@ PACKAGE = Path(__file__).resolve().parent.parent / "factory_controller"
 ADAPTER_SEAM = {"adapter.py", "stage1_adapter.py"}
 
 #: The Controller's own runtime. Nothing here may execute anything.
-CORE = {"engine.py", "store.py", "routing.py", "cli.py", "__init__.py"}
+CORE = {"engine.py", "store.py", "routing.py", "cli.py", "context.py", "__init__.py"}
+
+#: The modules that decide what a mission is and what context it may have.
+#: None of them may touch a file system at all. `cli.py` is deliberately absent:
+#: it reads the mission file the operator named on the command line, which is
+#: the operator's own input and not repository content.
+DECIDING = {"engine.py", "store.py", "routing.py", "context.py"}
+
+#: Names that would mean the Controller had opened something itself. Selecting
+#: repository content is the Context Broker's authority; the Controller states
+#: an entitlement and checks the answer against it.
+FILE_READ_TOKENS = ("read_text", "read_bytes", "iterdir", "rglob", "glob",
+                    "walk", "listdir", "scandir", "open")
 
 #: Names that would mean a vendor had reached the Controller. Matched against
 #: code -- identifiers, imports and real string literals -- not prose, so a
@@ -168,6 +180,77 @@ class ProviderNeutralityTests(unittest.TestCase):
         self.assertEqual(
             reasons,
             {"admissible", "denied_by_policy", "not_in_allowlist", "capability_not_offered"})
+
+
+class ContextAuthorityTests(unittest.TestCase):
+    """The Context Broker selects; the Controller declares and checks.
+
+    SF-136 draws this line and it is the one most easily crossed by accident:
+    a single `read_text` in the wrong module would make the Controller a
+    retrieval engine that also happens to run missions.
+    """
+
+    def test_the_deciding_modules_never_read_a_file(self):
+        for path, text in sources(DECIDING):
+            code = code_text(text)
+            for token in FILE_READ_TOKENS:
+                self.assertNotIn(token, code, "%s reads files (%r)" % (path.name, token))
+
+    def test_the_file_read_scan_would_actually_catch_one(self):
+        """A boundary check that can never fire is not a boundary."""
+
+        planted = code_text("data = Path(p).read_text()\nfor f in os.walk(root): pass\n")
+        for token in ("read_text", "walk"):
+            self.assertIn(token, planted)
+
+    def test_the_controller_never_reorders_what_the_broker_selected(self):
+        """Ranking is the capability this seam exists to keep out."""
+
+        request = context.ContextRequest.from_payload({
+            "work_item_id": "SF-136", "context_request": {
+                "corpus_identity": "c", "policy_identity": "p"}})
+        scrambled = ("z.py", "a.py", "m.py")
+        unhashed = {"schema_version": context.CONTEXT_SCHEMA_VERSION,
+                    "mission_input_hash": request.mission_input_hash,
+                    "corpus_identity": "c", "policy_identity": "p",
+                    "selected_refs": list(scrambled), "unresolved_questions": []}
+        package = context.ContextPackage.from_response({
+            "status": "built",
+            "manifest": {**unhashed, "manifest_hash": context.sha256_hex(unhashed)},
+            "measurement": {}})
+        self.assertIsNone(context.verify(request, package))
+        self.assertEqual(package.manifest.selected_refs, scrambled)
+        self.assertEqual(tuple(package.as_row()["manifest"]["selected_refs"]), scrambled)
+        self.assertEqual(tuple(context.explain(request, package)["selected_refs"]),
+                         scrambled)
+
+    def test_the_controller_holds_no_selection_rule_of_its_own(self):
+        """No scoring, ranking, relevance or embedding vocabulary lives here."""
+
+        for path, text in sources():
+            code = code_text(text)
+            for token in ("embedding", "vector", "similarity", "relevance",
+                          "rank", "score", "tokenize", "tokenizer"):
+                self.assertNotIn(token, code, "%s names %r" % (path.name, token))
+
+    def test_the_manifest_digest_rule_belongs_to_evidence_core(self):
+        """Reproduced from `src/evidence/validation.py`, not defined here."""
+
+        value = {"schema_version": "1.0", "mission_input_hash": "a" * 64,
+                 "corpus_identity": "c", "policy_identity": "p",
+                 "selected_refs": [], "unresolved_questions": []}
+        self.assertEqual(context.canonical_bytes(value)[-1:], b"\n")
+        self.assertNotEqual(context.canonical_bytes({"x": "\u00e9"}),
+                            b'{"x":"\\u00e9"}\n')
+
+    def test_bytes_are_never_converted_into_tokens_anywhere(self):
+        """The Controller has no tokenizer and must never act as though it does."""
+
+        budget = context.ContextBudget(max_reported_input_tokens=1)
+        measurement = context.ContextMeasurement(selected_context_bytes=10 ** 9)
+        self.assertIsNone(context.budget_refusal(
+            context.ContextBudget(max_reported_input_tokens=1), measurement))
+        self.assertIsNone(context.reported_token_refusal(budget, "unknown"))
 
 
 class AuthorityOwnershipTests(unittest.TestCase):

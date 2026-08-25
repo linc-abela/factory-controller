@@ -38,6 +38,8 @@ def parser() -> argparse.ArgumentParser:
     telemetry.add_argument("mission_id")
     ctx = sub.add_parser("context")
     ctx.add_argument("mission_id")
+    economics = sub.add_parser("economics")
+    economics.add_argument("--corpus", default=None)
     cancel = sub.add_parser("cancel")
     cancel.add_argument("mission_id")
     harness = sub.add_parser("harness")
@@ -76,6 +78,8 @@ def main(argv: list[str] | None = None) -> int:
         print(json.dumps(store.telemetry(args.mission_id), sort_keys=True))
     elif args.command == "context":
         print(json.dumps(store.context_history(args.mission_id), sort_keys=True))
+    elif args.command == "economics":
+        print(json.dumps(store.economics(args.corpus), sort_keys=True))
     elif args.command == "cancel":
         print(json.dumps({"state": store.cancel(args.mission_id)}))
     elif args.command == "harness":
