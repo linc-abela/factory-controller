@@ -99,7 +99,13 @@ def build_context(request: dict) -> dict:
 
 
 def main() -> int:
-    request = json.load(sys.stdin)
+    return main_with(json.load(sys.stdin))
+
+
+def main_with(request: dict) -> int:
+    """The fixture steps, over a request already read.  Shared with the
+    reconciliation adapter, which handles ``context`` and delegates the rest."""
+
     step = request["step"]
     operation_key = request["operation_key"]
     if step == "context":

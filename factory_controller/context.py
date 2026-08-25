@@ -97,6 +97,11 @@ class ContextRequest:
     baseline_sha: str | None = None
     purpose: str | None = None
     max_age_seconds: float | None = None
+    #: Mirrored from the mission's context budget so the ceiling travels with
+    #: the entitlement.  Declared once, enforced twice: the broker refuses its
+    #: own overrun, and the Controller re-checks the measurement it gets back.
+    max_bytes: int | None = None
+    max_files: int | None = None
     schema_version: str = CONTEXT_SCHEMA_VERSION
 
     @classmethod
@@ -108,6 +113,7 @@ class ContextRequest:
             raise ContextError("context_request must be an object")
         corpus = _required_str(raw, "corpus_identity")
         policy = _required_str(raw, "policy_identity")
+        budget = ContextBudget.from_payload(payload)
         age = _optional_number(raw, "max_age_seconds")
         if age is not None and age <= 0:
             raise ContextError("max_age_seconds must be positive")
@@ -124,6 +130,8 @@ class ContextRequest:
             or _optional_str(payload or {}, "baseline_sha"),
             purpose=_optional_str(raw, "purpose"),
             max_age_seconds=age,
+            max_bytes=budget.max_bytes,
+            max_files=budget.max_files,
         )
 
     def as_wire(self) -> dict[str, Any]:
@@ -140,6 +148,8 @@ class ContextRequest:
             "repository_remote_url": self.repository_remote_url,
             "baseline_sha": self.baseline_sha,
             "purpose": self.purpose,
+            "max_bytes": self.max_bytes,
+            "max_files": self.max_files,
         }
 
 
@@ -254,6 +264,15 @@ class ContextMeasurement:
     built_at: float | None = None
     head_sha: str | None = None
     repository_remote_url: str | None = None
+    #: The broker's own opaque content-addressed reference to what it built.
+    #: The Controller carries it and never parses it: it is the broker's
+    #: identity for the materialized package, not the Controller's for the
+    #: mission, and the two must not be collapsed into one.
+    broker_manifest_digest: str | None = None
+    policy_digest: str | None = None
+    #: A broker's statement about token counting.  Always a canonical absence
+    #: word unless a real count was supplied; bytes are never converted.
+    context_token_count: Any = "unknown"
 
     @property
     def reduction(self) -> dict[str, Any]:
@@ -339,6 +358,9 @@ class ContextPackage:
                 "built_at": self.measurement.built_at,
                 "head_sha": self.measurement.head_sha,
                 "repository_remote_url": self.measurement.repository_remote_url,
+                "broker_manifest_digest": self.measurement.broker_manifest_digest,
+                "policy_digest": self.measurement.policy_digest,
+                "context_token_count": self.measurement.context_token_count,
             },
         }
 
@@ -539,6 +561,8 @@ def _measurement_from(raw: Any) -> ContextMeasurement:
     identity = raw.get("cache_identity")
     remote = raw.get("repository_remote_url")
     head = raw.get("head_sha")
+    broker_digest = raw.get("broker_manifest_digest")
+    policy = raw.get("policy_digest")
     return ContextMeasurement(
         baseline_context_bytes=_count(raw.get("baseline_context_bytes")),
         baseline_context_files=_count(raw.get("baseline_context_files")),
@@ -551,7 +575,35 @@ def _measurement_from(raw: Any) -> ContextMeasurement:
         and not isinstance(raw.get("built_at"), bool) else None,
         head_sha=head if isinstance(head, str) and head else None,
         repository_remote_url=remote if isinstance(remote, str) and remote else None,
+        broker_manifest_digest=broker_digest if isinstance(broker_digest, str)
+        and broker_digest else None,
+        policy_digest=policy if isinstance(policy, str) and policy else None,
+        context_token_count=canonical_absence(raw.get("context_token_count")),
     )
+
+
+#: Reproduced from factory-evidence-core ``src/contracts/replay.py`` via
+#: ``routing.CANONICAL_ABSENCE``.  Kept here too because this module must not
+#: import routing: context is upstream of provider selection, not part of it.
+CANONICAL_ABSENCE = frozenset({"unknown", "not_applicable", "not_run", "not_measurable"})
+
+#: Words other layers have used for absence that are not in the vocabulary.
+#: They are translated at this seam rather than propagated, because a fifth
+#: spelling of "we do not know" is the identity divergence the corpus records.
+ABSENCE_ALIASES = {"unavailable": "not_measurable", "n/a": "not_applicable",
+                   "none": "unknown", "null": "unknown", "": "unknown"}
+
+
+def canonical_absence(value: Any) -> Any:
+    """Keep a real count; translate a known alias; refuse to invent anything."""
+
+    if isinstance(value, int) and not isinstance(value, bool) and value >= 0:
+        return value
+    if isinstance(value, str):
+        if value in CANONICAL_ABSENCE:
+            return value
+        return ABSENCE_ALIASES.get(value.strip().lower(), "unknown")
+    return "unknown"
 
 
 def _count(value: Any) -> int | None:

@@ -335,11 +335,34 @@ class MeasurementTests(unittest.TestCase):
                                        selected_context_bytes=0).reduction["state"],
             "not_applicable")
 
-    def test_bytes_are_never_read_as_tokens(self):
-        """Nothing in the measurement record names a token."""
+    def test_a_byte_count_never_becomes_a_token_count(self):
+        """The Controller has no tokenizer, so an unstated count stays absent."""
 
-        row = context.ContextPackage("built").as_row()["measurement"]
-        self.assertFalse([key for key in row if "token" in key])
+        row = context.ContextPackage.from_response({
+            "status": "refused",
+            "measurement": {"selected_context_bytes": 123456},
+        }).as_row()["measurement"]
+        self.assertEqual(row["selected_context_bytes"], 123456)
+        self.assertEqual(row["context_token_count"], "unknown")
+
+    def test_a_foreign_absence_word_is_translated_not_propagated(self):
+        """`factory-context-broker` reports `unavailable`, which is not in the
+        vocabulary `src/contracts/replay.py` owns.  Translate at the seam."""
+
+        self.assertNotIn("unavailable", context.CANONICAL_ABSENCE)
+        self.assertEqual(context.canonical_absence("unavailable"), "not_measurable")
+        for word in context.CANONICAL_ABSENCE:
+            self.assertEqual(context.canonical_absence(word), word)
+        self.assertEqual(context.canonical_absence(0), 0)
+        self.assertEqual(context.canonical_absence(True), "unknown")
+
+    def test_the_brokers_own_reference_is_carried_and_never_parsed(self):
+        row = context.ContextPackage.from_response({
+            "status": "refused",
+            "measurement": {"broker_manifest_digest": "7839a263", "policy_digest": "3f353f"},
+        }).as_row()["measurement"]
+        self.assertEqual(row["broker_manifest_digest"], "7839a263")
+        self.assertEqual(row["policy_digest"], "3f353f")
 
     def test_a_negative_or_boolean_measurement_is_absent_rather_than_wrong(self):
         pkg = ContextPackage.from_response({"status": "refused", "measurement": {

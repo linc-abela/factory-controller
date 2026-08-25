@@ -11,6 +11,8 @@ for live mission state; Notion is not read by runtime code.
 ./dev --db controller.db history MISSION_ID
 ./dev --db controller.db route MISSION_ID
 ./dev --db controller.db telemetry MISSION_ID
+./dev --db controller.db context MISSION_ID
+./dev --db controller.db economics [--corpus CORPUS_IDENTITY]
 ./dev --db harness --missions 10
 ./dev test
 ```
@@ -123,3 +125,51 @@ considered, whether a fallback occurred, where the boundary was crossed, and why
 any later switch was refused. `./dev telemetry MISSION_ID` is the Stage-4 seam:
 provider, elapsed time, fallback count, retries, reported usage and cost, Owner
 intervention, and context references -- measured values only.
+
+## Context
+
+A mission may declare what repository context it is entitled to. The Controller
+never opens, ranks, or scores a repository file: it states the entitlement,
+hands it to a Context Broker, and checks the answer against it.
+
+```json
+{
+  "context_request": {
+    "corpus_identity": "repo://factory-prototype-lab@8155d65...",
+    "policy_identity": "SF-136:STAGE-4-CONTEXT",
+    "required_anchors": ["MISSION.md"],
+    "allowed_paths": [], "denied_paths": [],
+    "max_age_seconds": 900
+  },
+  "context_budget": {"max_bytes": 200000, "max_files": 40,
+                     "max_reported_input_tokens": 200000}
+}
+```
+
+The manifest is a durable memoized step. A restart after dispatch reuses the
+manifest the mission ran on and the broker is never asked again; freshness is
+only evaluated before that boundary. For a real mission the idempotency key is
+already `work_item_id:context_manifest_hash`, so the same work against a
+different manifest is a different mission identity rather than a replay.
+
+`ContextManifest` and its digest rule are `factory-evidence-core`'s
+(`src/contracts/mvp.py`, `src/evidence/validation.py`), reproduced here and
+pinned by a test, so a manifest the Controller admits is one Evidence Core
+admits. Measured bytes and files are exact or explicitly absent; nothing here
+converts bytes into tokens.
+
+`python -m factory_controller.context_adapter` is the supplied reconciliation
+adapter for `factory-context-broker`. It translates between the two dialects,
+selects nothing itself, and delegates every non-context step to the safe local
+provider:
+
+```sh
+FACTORY_CONTEXT_BROKER_COMMAND="python3 -m factory_context_broker.cli" \
+FACTORY_CONTEXT_BROKER_REPO=/path/to/target-repo \
+FACTORY_CONTEXT_BROKER_CACHE=/path/to/cache \
+./dev --adapter "python3 -m factory_controller.context_adapter" work-once --worker w1
+```
+
+The broker resolves context at the mission's own `baseline_sha` and refuses a
+manifest whose head is not the checkout's `HEAD`, so the target checkout must be
+at that commit.
