@@ -99,6 +99,25 @@ additionally:
   before evidence is sealed -- an evaluator naming some other gate does not count;
 * receive a receipt echoing that same key, or the mission refuses.
 
+### Reconciliation with factory-bridge
+
+Read against `factory-bridge` `c9787d5`. The bridge selects from its own
+priority-ordered registry, and `BridgeRequest` carries no field naming a
+requested profile, so the Controller cannot steer the choice -- it enforces the
+Owner's allow/deny list against the profile that actually ran
+(`PROVIDER_POLICY_VIOLATION`). Receipt field names are the bridge's own:
+`provider_profile`, `provider`, `selection_trace`.
+
+Two drifts are held by `tests/test_bridge_reconciliation.py` rather than
+described in a document:
+
+* `ADAPTER_UNAVAILABLE` is raised from twelve sites in the bridge, at least four
+  of them after the provider process ran, so no client can safely re-route on
+  it. The Controller does not.
+* the bridge's `selection_trace` is not on a refusal frame, so the route
+  explanation is missing on exactly the path that needs it. The Controller
+  records the trace when given one and records its absence otherwise.
+
 `./dev route MISSION_ID` explains which provider ran, why, what else was
 considered, whether a fallback occurred, where the boundary was crossed, and why
 any later switch was refused. `./dev telemetry MISSION_ID` is the Stage-4 seam:
