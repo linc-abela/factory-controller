@@ -132,6 +132,26 @@ class MissionStore:
                 BEFORE UPDATE ON events BEGIN SELECT RAISE(ABORT, 'events are append-only'); END;
                 CREATE TRIGGER IF NOT EXISTS events_no_delete
                 BEFORE DELETE ON events BEGIN SELECT RAISE(ABORT, 'events are append-only'); END;
+                CREATE TABLE IF NOT EXISTS runs (
+                  id INTEGER PRIMARY KEY AUTOINCREMENT,
+                  mission_id TEXT NOT NULL REFERENCES missions(id),
+                  attempt_number INTEGER NOT NULL,
+                  leg INTEGER NOT NULL,
+                  profile TEXT,
+                  selection_reason TEXT NOT NULL,
+                  considered_json TEXT NOT NULL,
+                  outcome TEXT NOT NULL,
+                  process_started INTEGER,
+                  idempotency_key TEXT NOT NULL,
+                  receipt_json TEXT NOT NULL,
+                  created_at REAL NOT NULL,
+                  UNIQUE(mission_id, attempt_number, leg)
+                );
+                CREATE INDEX IF NOT EXISTS runs_by_mission ON runs(mission_id, id);
+                CREATE TRIGGER IF NOT EXISTS runs_no_update
+                BEFORE UPDATE ON runs BEGIN SELECT RAISE(ABORT, 'runs are append-only'); END;
+                CREATE TRIGGER IF NOT EXISTS runs_no_delete
+                BEFORE DELETE ON runs BEGIN SELECT RAISE(ABORT, 'runs are append-only'); END;
                 """
             )
             db.execute("INSERT OR IGNORE INTO schema_meta VALUES (1, ?)", (self.clock(),))
@@ -154,6 +174,12 @@ class MissionStore:
             (mission_id, kind, old, new, canonical_json(detail), self.clock()),
         )
 
+    def log(self, mission_id: str, kind: str, detail: Any) -> None:
+        """Append one observation to the ledger without changing mission state."""
+
+        with self.transaction() as db:
+            self._event(db, mission_id, kind, None, None, detail)
+
     def submit(self, payload: dict[str, Any], idempotency_key: str,
                *, max_attempts: int = 3) -> tuple[dict[str, Any], bool]:
         if not idempotency_key or max_attempts < 1:
@@ -166,7 +192,13 @@ class MissionStore:
                 if existing["payload_hash"] != digest:
                     raise ConflictError("IDEMPOTENCY_CONFLICT: key already binds different input")
                 return self._row(existing), False  # type: ignore[return-value]
-            mission_id = f"fm_{digest[:24]}"
+            # Mission identity binds the key as well as the payload. Deriving it
+            # from the payload alone collided two distinct missions that happened
+            # to carry identical input -- routine once one repository is targeted
+            # more than once -- and surfaced as a raw IntegrityError rather than a
+            # refusal. `controller_contract.mission_identity` already derives from
+            # `request_identity_hash`, which includes the key; this matches it.
+            mission_id = f"fm_{payload_hash({'idempotency_key': idempotency_key, 'payload_hash': digest})[:24]}"
             db.execute(
                 "INSERT INTO missions(id,idempotency_key,payload_hash,payload_json,state,max_attempts,next_run_at,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?)",
                 (mission_id, idempotency_key, digest, canonical_json(payload), "admitted", max_attempts, now, now, now),
@@ -337,3 +369,158 @@ class MissionStore:
     def counts(self) -> dict[str, int]:
         with self.connect() as db:
             return {row["state"]: row["n"] for row in db.execute("SELECT state,count(*) n FROM missions GROUP BY state")}
+
+    # ----------------------------------------------------------------- #
+    # provider route history
+    # ----------------------------------------------------------------- #
+
+    def record_run(self, mission_id: str, attempt_number: int, selection: Any,
+                   receipt: Any, idempotency_key: str) -> int:
+        """Append one routing leg.  Legs are facts, so the table never updates.
+
+        The leg number is derived inside the transaction rather than counted by
+        the caller, so two writers cannot mint the same one.
+        """
+
+        with self.transaction() as db:
+            leg = db.execute(
+                "SELECT COALESCE(MAX(leg),0)+1 n FROM runs WHERE mission_id=? AND attempt_number=?",
+                (mission_id, attempt_number),
+            ).fetchone()["n"]
+            db.execute(
+                "INSERT INTO runs(mission_id,attempt_number,leg,profile,selection_reason,considered_json,outcome,process_started,idempotency_key,receipt_json,created_at) VALUES(?,?,?,?,?,?,?,?,?,?,?)",
+                (mission_id, attempt_number, leg, receipt["profile"], selection["reason"],
+                 canonical_json(selection["considered"]), receipt["classification"],
+                 None if receipt["process_started"] is None else int(receipt["process_started"]),
+                 idempotency_key, canonical_json(receipt), self.clock()),
+            )
+            self._event(db, mission_id, "ROUTE_LEG", None, None, {
+                "attempt": attempt_number, "leg": leg, "profile": receipt["profile"],
+                "selection_reason": selection["reason"], "outcome": receipt["classification"],
+                "process_started": receipt["process_started"],
+            })
+            return leg
+
+    def runs(self, mission_id: str) -> list[dict[str, Any]]:
+        """Every routing leg for one mission, oldest first.  Scoped by id only."""
+
+        with self.connect() as db:
+            rows = db.execute("SELECT * FROM runs WHERE mission_id=? ORDER BY id", (mission_id,)).fetchall()
+            return [
+                {**dict(row), "considered": json.loads(row["considered_json"]),
+                 "receipt": json.loads(row["receipt_json"]),
+                 "process_started": None if row["process_started"] is None else bool(row["process_started"])}
+                for row in rows
+            ]
+
+    def route_history(self, mission_id: str) -> dict[str, Any]:
+        """The operator's question, answered from durable state alone.
+
+        Which provider ran, why it was chosen, what else was considered, whether
+        a fallback happened, where the irreversible boundary was crossed, and
+        why any later switch was refused.
+        """
+
+        legs = self.runs(mission_id)
+        mission = self.get(mission_id)
+        side_effect = next(
+            (leg for leg in legs if leg["process_started"] is not False), None
+        )
+        refusals = [
+            {"attempt": event["detail"].get("attempt"), "code": event["detail"].get("code"),
+             "profile": event["detail"].get("profile"), "detail": event["detail"].get("detail")}
+            for event in self.history(mission_id) if event["kind"] == "ROUTE_SWITCH_REFUSED"
+        ]
+        return {
+            "mission_id": mission_id,
+            "state": None if mission is None else mission["state"],
+            "selected_profile": None if side_effect is None else side_effect["profile"],
+            "legs": [
+                {"attempt": leg["attempt_number"], "leg": leg["leg"], "profile": leg["profile"],
+                 "selection_reason": leg["selection_reason"], "considered": leg["considered"],
+                 "outcome": leg["outcome"], "process_started": leg["process_started"],
+                 "idempotency_key": leg["idempotency_key"]}
+                for leg in legs
+            ],
+            "fallback_count": max(0, len(legs) - 1),
+            "side_effect_boundary": None if side_effect is None else {
+                "attempt": side_effect["attempt_number"], "leg": side_effect["leg"],
+                "profile": side_effect["profile"],
+                "process_started": side_effect["process_started"],
+            },
+            "switch_refusals": refusals,
+        }
+
+    def receipts(self, mission_id: str) -> list[dict[str, Any]]:
+        return [leg["receipt"] for leg in self.runs(mission_id)]
+
+    def telemetry(self, mission_id: str) -> dict[str, Any]:
+        """The Stage-4 seam: measured inputs only, absence kept explicit.
+
+        Every field is either a fact this Controller observed or one a provider
+        reported.  Nothing here is estimated, and an unreported number stays
+        absent rather than becoming a zero.
+        """
+
+        mission = self.get(mission_id)
+        if mission is None:
+            raise KeyError(mission_id)
+        legs = self.runs(mission_id)
+        usages = [leg["receipt"].get("usage") or {} for leg in legs]
+        durations = [leg["receipt"].get("duration_ms") for leg in legs]
+        measured = [value for value in durations if isinstance(value, int)]
+        events = self.history(mission_id)
+        payload = mission.get("payload") or {}
+        return {
+            "mission_id": mission_id,
+            "outcome": mission["state"],
+            "terminal_reason": mission["terminal_reason"],
+            "execution_mode": payload.get("execution_mode", "fixture"),
+            "provider_profile": next(
+                (leg["profile"] for leg in reversed(legs) if leg["process_started"] is not False),
+                None,
+            ),
+            "route_legs": len(legs),
+            "fallback_count": max(0, len(legs) - 1),
+            "retries": max(0, mission["attempt_count"] - 1),
+            "elapsed_execution_ms": sum(measured) if measured else "unknown",
+            "unmeasured_legs": len(durations) - len(measured),
+            "reported_input_tokens": _sum_reported(usages, "input_tokens"),
+            "reported_output_tokens": _sum_reported(usages, "output_tokens"),
+            "reported_cost": _sum_cost(usages),
+            "owner_intervention": mission["state"] == "escalated" or mission["cancel_requested"],
+            "context_reference": {
+                "work_item_id": payload.get("work_item_id", "unknown"),
+                "context_manifest_hash": payload.get("context_manifest_hash", "unknown"),
+                "repository_remote_url": payload.get("repository_remote_url", "unknown"),
+                "idempotency_key": mission["idempotency_key"],
+            },
+            "evidence_pointer": (mission.get("result") or {}).get("evidence", {}).get("evidence_pointer", "unknown"),
+            "event_count": len(events),
+        }
+
+
+def _sum_reported(usages: list[dict[str, Any]], name: str) -> Any:
+    """Sum only what was reported; return ``unknown`` when nothing was."""
+
+    values = [usage.get(name) for usage in usages]
+    measured = [value for value in values if isinstance(value, int) and not isinstance(value, bool)]
+    if not measured:
+        return "unknown"
+    return {"total": sum(measured), "reported_legs": len(measured), "unreported_legs": len(values) - len(measured)}
+
+
+def _sum_cost(usages: list[dict[str, Any]]) -> dict[str, Any]:
+    """Cost never becomes a number unless a provider produced one."""
+
+    priced = [usage for usage in usages if usage.get("cost_state") == "reported"]
+    currencies = {usage.get("cost_currency") for usage in priced}
+    if not priced:
+        return {"state": "unknown", "unpriced_legs": len(usages)}
+    if len(currencies) > 1:
+        return {"state": "unknown", "reason": "mixed_currencies",
+                "currencies": sorted(str(value) for value in currencies),
+                "unpriced_legs": len(usages) - len(priced)}
+    return {"state": "reported", "amount": round(sum(float(usage["cost_amount"]) for usage in priced), 10),
+            "currency": priced[0].get("cost_currency"), "priced_legs": len(priced),
+            "unpriced_legs": len(usages) - len(priced)}

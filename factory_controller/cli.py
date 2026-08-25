@@ -32,6 +32,10 @@ def parser() -> argparse.ArgumentParser:
     status.add_argument("mission_id", nargs="?")
     history = sub.add_parser("history")
     history.add_argument("mission_id")
+    route = sub.add_parser("route")
+    route.add_argument("mission_id")
+    telemetry = sub.add_parser("telemetry")
+    telemetry.add_argument("mission_id")
     cancel = sub.add_parser("cancel")
     cancel.add_argument("mission_id")
     harness = sub.add_parser("harness")
@@ -64,12 +68,21 @@ def main(argv: list[str] | None = None) -> int:
         print(json.dumps(store.get(args.mission_id) if args.mission_id else store.counts(), sort_keys=True))
     elif args.command == "history":
         print(json.dumps(store.history(args.mission_id), sort_keys=True))
+    elif args.command == "route":
+        print(json.dumps(store.route_history(args.mission_id), sort_keys=True))
+    elif args.command == "telemetry":
+        print(json.dumps(store.telemetry(args.mission_id), sort_keys=True))
     elif args.command == "cancel":
         print(json.dumps({"state": store.cancel(args.mission_id)}))
     elif args.command == "harness":
         ids = []
         for index in range(args.missions):
-            mission, _ = controller.submit({"work_item_id": f"HARNESS-{index + 1}", "repository": f"disposable-{index + 1}"}, f"harness:{index + 1}")
+            mission, _ = controller.submit({
+                "work_item_id": f"HARNESS-{index + 1}",
+                "repository": f"disposable-{index + 1}",
+                "execution_mode": "fixture",
+                "acceptance_gate_ids": ["HARNESS-GATE"],
+            }, f"harness:{index + 1}")
             ids.append(mission["id"])
         while controller.work_once("harness-worker") is not None:
             pass

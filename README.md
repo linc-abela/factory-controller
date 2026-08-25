@@ -9,6 +9,8 @@ for live mission state; Notion is not read by runtime code.
 ./dev --db controller.db work-once --worker local-1
 ./dev --db controller.db status
 ./dev --db controller.db history MISSION_ID
+./dev --db controller.db route MISSION_ID
+./dev --db controller.db telemetry MISSION_ID
 ./dev --db harness --missions 10
 ./dev test
 ```
@@ -32,3 +34,73 @@ outcomes. Retry exhaustion becomes an explicit escalation.
 The append-only event ledger is the history; the mission row is its operational
 projection. Claims use `BEGIN IMMEDIATE`, expiring leases, and fencing tokens.
 Started external steps survive restart and reuse the same operation key.
+
+## Providers
+
+The Controller requests a capability and records which provider served it. It
+holds no provider CLI, SDK, credential, or availability logic; a *profile* is an
+opaque string the execution layer minted, and `tests/test_authority_boundaries.py`
+enforces that by reading this package's own AST.
+
+A mission may declare candidate profiles and an Owner policy over them:
+
+```json
+{
+  "work_item_id": "SF-1",
+  "execution_mode": "real",
+  "context_manifest_hash": "<64 hex>",
+  "acceptance_gate_ids": ["GATE-1"],
+  "provider_candidates": [{"profile": "alpha", "capabilities": ["implement"]},
+                          {"profile": "beta"}],
+  "execution_policy": {"allowed_profiles": [], "denied_profiles": [],
+                       "required_capability": "implement", "no_fallback": false,
+                       "max_route_legs": 3,
+                       "budget_ceiling": 25.0, "budget_currency": "USD"}
+}
+```
+
+Selection is deterministic: the first candidate the policy admits, in declared
+order. A mission that declares no candidates keeps the Stage-2 behaviour, with
+the layer choosing; that still records one route leg.
+
+### The side-effect boundary
+
+Fallback is legal only while nothing can have run. The execution layer answers a
+leg with `provider_unavailable` plus a receipt; the Controller falls back only
+when that receipt carries `process_started: false`. A receipt that does not say
+is treated as "may have run", and the mission fails closed with
+`PROVIDER_SWITCH_AFTER_SIDE_EFFECT` rather than handing the same work to a
+second provider. After dispatch, restart recovers the existing result by
+idempotency key on the same profile and never re-selects.
+
+### Budgets and usage
+
+`budget_ceiling` is a hard ceiling on *measured* spend, checked before every new
+dispatch. Unknown provider cost stays `unknown` -- one of Evidence Core's four
+canonical absence words -- and is never estimated, never zeroed, and never
+counted toward the ceiling. A leg priced in another currency is not converted;
+it fails the next dispatch closed with `MISSION_BUDGET_CURRENCY_MISMATCH`.
+
+Provider figures are reported claims (`evidence_class: reported_claim`). They
+never decide candidate validity: Git and Evidence Core remain authoritative.
+
+### Real missions
+
+A mission is a fixture mission unless it declares `execution_mode: real`, and the
+Controller compares the declared mode against the mode the layer reports. The
+check is an equality in both directions, so a dry-run result cannot complete a
+real mission and a real run cannot be filed as a fixture. A real mission must
+additionally:
+
+* carry `idempotency_key` equal to `work_item_id:context_manifest_hash`, which is
+  the only value `factory-evidence-core` will bind (`IDEMPOTENCY_BINDING_MISMATCH`
+  otherwise), so the key reaching `factory-bridge` is the Controller's own;
+* declare its `acceptance_gate_ids`, every one of which must be executed and pass
+  before evidence is sealed -- an evaluator naming some other gate does not count;
+* receive a receipt echoing that same key, or the mission refuses.
+
+`./dev route MISSION_ID` explains which provider ran, why, what else was
+considered, whether a fallback occurred, where the boundary was crossed, and why
+any later switch was refused. `./dev telemetry MISSION_ID` is the Stage-4 seam:
+provider, elapsed time, fallback count, retries, reported usage and cost, Owner
+intervention, and context references -- measured values only.
