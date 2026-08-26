@@ -224,6 +224,11 @@ def facts_from_response(raw: Any, profile: GatewayProfile | None = None) -> dict
         if profile is None:
             return None
         raw = {}
+    reconciled = reconcile_bridge_receipt(raw)
+    if reconciled is not None:
+        # A real bridge receipt arrives in its own schema.  One entry point
+        # reads both shapes so no caller has to know which layer answered.
+        return reconciled
     priced = _priced(raw.get("cost_amount"), raw.get("cost_currency"))
     declared = raw.get("cost_state")
     facts = {
@@ -285,6 +290,117 @@ def privacy_refusal(facts: dict[str, Any] | None, policy: GatewayPolicy) -> str 
     enforced = set((facts or {}).get("privacy_enforced") or ())
     missing = [need for need in policy.required_privacy if need not in enforced]
     return "GATEWAY_PRIVACY_NOT_CONFIRMED" if missing else None
+
+
+
+# --------------------------------------------------------------------------- #
+# reconciliation with factory-bridge
+# --------------------------------------------------------------------------- #
+
+#: The receipt schema ``factory-bridge`` cb1d02b7 emits from
+#: ``src/factory_bridge/openrouter.py``.  Reproduced, not imported: neither
+#: repository depends on the other, which is the point of the boundary.
+BRIDGE_RECEIPT_SCHEMA = "factory.bridge.metered_execution_receipt.v1"
+
+#: Their refusal code -> this Controller's.  Their names are shorter because
+#: they are already inside a gateway module; the Controller's carry the layer
+#: prefix its neighbours use, so a bare ``TIMEOUT`` cannot collide with the
+#: three other ``*_TIMEOUT`` families already on this seam.
+BRIDGE_REFUSALS = {
+    "MODEL_NOT_ALLOWED": "GATEWAY_MODEL_NOT_ALLOWLISTED",
+    "CONTEXT_TOO_LARGE": "GATEWAY_CONTEXT_TOO_LARGE",
+    "LANE_INVALID": "GATEWAY_LANE_INVALID",
+    "AUTH_FAILED": "GATEWAY_AUTHENTICATION_FAILED",
+    "QUOTA_EXHAUSTED": "GATEWAY_INSUFFICIENT_CREDITS",
+    "RATE_LIMITED": "GATEWAY_RATE_LIMITED",
+    "PROVIDER_UNAVAILABLE": "GATEWAY_OUTAGE",
+    "GATEWAY_REJECTED": "GATEWAY_OUTAGE",
+    "MODEL_MISMATCH": "GATEWAY_UNDECLARED_MODEL_SUBSTITUTION",
+    "PROVIDER_MISMATCH": "GATEWAY_UNDECLARED_MODEL_SUBSTITUTION",
+    "UNSUPPORTED_TOOL_CALL": "GATEWAY_TOOL_CAPABILITY_UNSUPPORTED",
+    "TIMEOUT": "GATEWAY_TIMEOUT",
+    "DISCONNECTED": "GATEWAY_OUTCOME_UNCERTAIN",
+    "MALFORMED_RESPONSE": "GATEWAY_MALFORMED_RESPONSE",
+    "RESPONSE_TRUNCATED": "GATEWAY_MALFORMED_RESPONSE",
+    "INVALID_EXECUTION_RESULT": "GATEWAY_MALFORMED_RESPONSE",
+}
+
+#: The three codes ``openrouter.py`` raises with ``dispatch_started=False``.
+#: Every other code inherits the constructor default ``True``, which is the
+#: safe direction -- but it is a default rather than a per-site judgement, so
+#: ``AUTH_FAILED`` and ``QUOTA_EXHAUSTED`` arrive marked "may have run" even
+#: though a rejected key and an exhausted balance are pre-spawn facts.  The
+#: Controller does not second-guess it: an unproven negative is not a proof,
+#: whichever side failed to prove it.
+BRIDGE_PRE_SPAWN_CODES = ("CONTEXT_TOO_LARGE", "LANE_INVALID", "MODEL_NOT_ALLOWED")
+
+
+def from_bridge_error(code: str, dispatch_started: bool) -> tuple[str, bool]:
+    """Translate one ``OpenRouterError`` into this Controller's vocabulary.
+
+    Returns the Controller's refusal code and the ``process_started`` fact.  It
+    adds no rule: ``may_reroute`` then decides, exactly as it does for a leg the
+    Controller refused itself.
+    """
+
+    return (BRIDGE_REFUSALS.get(code, "GATEWAY_OUTCOME_UNCERTAIN"), bool(dispatch_started))
+
+
+def reconcile_bridge_receipt(raw: Any) -> dict[str, Any] | None:
+    """Read a ``metered_execution_receipt.v1`` into this module's facts.
+
+    Three translations, each losing nothing that was measured:
+
+    *Absence.*  Their ``precision`` vocabulary is ``exact`` / ``unknown``, and
+    ``unknown`` is already one of Evidence Core's four words, so no fifth
+    dialect appears -- unlike the broker's ``unavailable``, which SF-136 had to
+    translate.  A non-exact figure becomes ``unknown``, never ``0``.
+
+    *Money.*  ``cost_usd`` is a decimal *string* on purpose, and turning it into
+    a float to compare against a ceiling loses that exactness.  Both survive:
+    ``cost_amount_text`` keeps their value verbatim and ``cost_amount`` is the
+    float the budget arithmetic uses.
+
+    *The provider.*  They report ``provider_allowlist`` -- who *may* serve --
+    and never which provider did.  That is a different fact from
+    ``actual_provider``, so the allowlist is carried under its own name and
+    ``actual_provider`` stays ``unknown`` rather than being filled from it.
+    """
+
+    if not isinstance(raw, dict) or raw.get("schema_version") != BRIDGE_RECEIPT_SCHEMA:
+        return None
+    usage = raw.get("usage") if isinstance(raw.get("usage"), dict) else {}
+    cost = raw.get("cost") if isinstance(raw.get("cost"), dict) else {}
+    exact_usage = usage.get("precision") == "exact"
+    text = cost.get("usd")
+    exact_cost = cost.get("precision") == "exact" and isinstance(text, str) and bool(text)
+    return {
+        "gateway": "openrouter",
+        "receipt_schema": BRIDGE_RECEIPT_SCHEMA,
+        "requested_model": _absent_or(_optional_string(raw.get("model"))),
+        "actual_model": _absent_or(_optional_string(raw.get("model"))),
+        "actual_provider": "unknown",
+        "provider_allowlist": tuple(item for item in raw.get("provider_allowlist") or ()
+                                    if isinstance(item, str)),
+        "generation_id": "unknown",
+        "input_tokens": _absent_or(_non_negative_int(usage.get("prompt_tokens")))
+        if exact_usage else "unknown",
+        "output_tokens": _absent_or(_non_negative_int(usage.get("completion_tokens")))
+        if exact_usage else "unknown",
+        "total_tokens": _absent_or(_non_negative_int(usage.get("total_tokens")))
+        if exact_usage else "unknown",
+        "cost_amount": float(text) if exact_cost else None,
+        "cost_amount_text": text if exact_cost else "unknown",
+        "cost_currency": "USD" if exact_cost else None,
+        "cost_state": "reported" if exact_cost else "unknown",
+        "turns": _absent_or(_non_negative_int(raw.get("turns"))),
+        "commands": _absent_or(_non_negative_int(raw.get("commands"))),
+        "transcript_hash": _absent_or(_optional_string(raw.get("transcript_hash"))),
+        "retries": "unknown",
+        "fallback_models": (),
+        "privacy_enforced": (),
+        "evidence_class": "reported_claim",
+    }
 
 
 # --------------------------------------------------------------------------- #
