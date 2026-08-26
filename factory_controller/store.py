@@ -930,6 +930,11 @@ class MissionStore:
         reading["released"] = sum(1 for row in rows if row["released_at"] is not None)
         return reading
 
+    def all_missions(self) -> list[dict[str, Any]]:
+        with self.connect() as db:
+            return [dict(row) for row in db.execute(
+                "SELECT id,project_id,state,priority,created_at FROM missions ORDER BY created_at,id")]
+
     def dependency_graph(self) -> dict[str, list[str]]:
         with self.connect() as db:
             return {key: list(value) for key, value in _edges_locked(db).items()}

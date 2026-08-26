@@ -265,6 +265,11 @@ class Receipt:
     execution_mode: str
     idempotency_key: str | None
     usage: Usage = field(default_factory=lambda: UNKNOWN_USAGE)
+    #: Facts a model gateway reported about this leg, or ``None`` when no
+    #: gateway served it.  A plain dict rather than a type, so this module stays
+    #: free of the seam that names one; ``gateway.facts_from_response`` builds
+    #: it and ``gateway.GATEWAY_FACTS`` pins the keys.
+    gateway: dict[str, Any] | None = None
     #: Production's own word for a provider's claim, from
     #: ``src/contracts/mvp.py`` line 98 (``provider_claim_evidence_class``).
     #: Deliberately not the assertion-level ``reported``: this whole record is a

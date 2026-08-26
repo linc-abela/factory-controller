@@ -9,12 +9,12 @@ afterwards unless the execution layer proves none did.
 
 from __future__ import annotations
 
-from dataclasses import asdict
+from dataclasses import asdict, replace
 import threading
 from dataclasses import dataclass
 from typing import Any, Protocol
 
-from . import context, routing
+from . import context, gateway, routing
 from .context import ContextBudget, ContextError, ContextRequest
 from .routing import ExecutionPolicy, PolicyError, Selection
 from .store import MissionStore
@@ -89,6 +89,10 @@ class Controller:
             routing.candidates_from_payload(payload)
         except PolicyError as exc:
             raise NonRetryableFailure("INVALID_EXECUTION_POLICY: %s" % exc) from exc
+        try:
+            _gateway_candidates(payload)
+        except PolicyError as exc:
+            raise NonRetryableFailure("INVALID_GATEWAY_POLICY: %s" % exc) from exc
         try:
             ContextRequest.from_payload(payload)
             ContextBudget.from_payload(payload)
@@ -267,7 +271,20 @@ class Controller:
 
         payload = mission["payload"]
         policy = ExecutionPolicy.from_payload(payload)
-        candidates = routing.candidates_from_payload(payload)
+        direct = routing.candidates_from_payload(payload)
+        admitted, refused = _gateway_candidates(payload)
+        for profile, code in refused:
+            self.store.log(mission["id"], "GATEWAY_PROFILE_REFUSED", {
+                "attempt": mission["attempt_count"], "profile": profile.profile,
+                "model_slug": profile.model_slug, "code": code})
+        # A gateway profile is an ordinary candidate, placed after the direct
+        # harnesses in declared order.  That is the whole of "prefer a direct
+        # harness, fall back to the gateway": the existing deterministic
+        # selector orders it, and the existing side-effect boundary confines it
+        # to legs where nothing can have run.  No second selection rule exists.
+        gateways = {profile.profile: profile for profile in admitted}
+        candidates = direct + tuple(routing.Candidate(profile.profile, profile.capabilities)
+                                    for profile in admitted)
         prior = self.store.runs(mission["id"])
         committed = [leg for leg in prior if leg["process_started"] is not False]
 
@@ -294,23 +311,32 @@ class Controller:
                 raise NonRetryableFailure("%s: considered %d candidate(s)" % (code, len(candidates)))
             response = self._step(
                 mission, "dispatch",
-                {"mission": payload, "route": _route(selection, attempted, mission, False)},
+                {"mission": payload, "route": _route(selection, attempted, mission, False,
+                                                     gateways.get(selection.profile))},
                 memo_value={"mission": payload})
-            receipt = routing.receipt_from_response(response, selection, attempted)
+            receipt = _with_gateway(routing.receipt_from_response(response, selection, attempted),
+                                    response, gateways.get(selection.profile))
             self._record(mission, selection, receipt)
             spent.append(receipt)
             if response.get("status") != routing.PROVIDER_UNAVAILABLE:
                 self._verify_receipt(mission, receipt, response)
                 return response
-            if receipt.side_effect_possible:
-                # The layer neither served the request nor proved nothing ran.
-                # An unproven negative is not a proof, so this mission stops here
-                # rather than handing the same work to a second provider.
-                self._refuse_switch(mission, "PROVIDER_SWITCH_AFTER_SIDE_EFFECT",
-                                    receipt.provider_profile, "process_started=%r" % (receipt.process_started,))
+            allowed, why = gateway.may_reroute(receipt.refusal_code, receipt.process_started)
+            if not allowed:
+                # Two ways to lose the right to re-route, and the second is new.
+                # The layer may have failed to prove nothing ran; or it may have
+                # claimed so under a refusal code -- a timeout, a malformed
+                # answer -- that names a condition in which it cannot know.  An
+                # unproven negative is not a proof, and neither is an unknowable
+                # one.
+                code = ("PROVIDER_SWITCH_AFTER_SIDE_EFFECT" if why == "SIDE_EFFECT_POSSIBLE"
+                        else "PROVIDER_SWITCH_AFTER_UNCERTAIN_OUTCOME")
+                self._refuse_switch(mission, code, receipt.provider_profile,
+                                    "process_started=%r refusal_code=%r"
+                                    % (receipt.process_started, receipt.refusal_code))
                 raise NonRetryableFailure(
-                    "PROVIDER_SWITCH_AFTER_SIDE_EFFECT: %s did not prove no process started"
-                    % (receipt.provider_profile or LAYER_DEFAULT))
+                    "%s: %s did not prove no process started (%s)"
+                    % (code, receipt.provider_profile or LAYER_DEFAULT, why))
             attempted.append(selection.profile or LAYER_DEFAULT)
 
     def _recover(self, mission: dict[str, Any], committed: list[dict[str, Any]],
@@ -328,7 +354,22 @@ class Controller:
             mission, "dispatch",
             {"mission": mission["payload"], "route": _route(selection, (), mission, True)},
             memo_value={"mission": mission["payload"]})
-        receipt = routing.receipt_from_response(response, selection, ())
+        receipt = _with_gateway(routing.receipt_from_response(response, selection, ()),
+                                response, None)
+        served_model = (receipt.gateway or {}).get("actual_model")
+        prior_model = (committed[-1]["receipt"].get("gateway") or {}).get("actual_model") \
+            if committed else None
+        if prior_model and served_model and served_model != prior_model \
+                and served_model not in routing.CANONICAL_ABSENCE:
+            # Same rule as the profile check below, one level finer.  A gateway
+            # that answers a recovery with a different model has changed which
+            # model did work that already had effects.
+            self._refuse_switch(mission, "GATEWAY_MODEL_SWITCH_AFTER_SIDE_EFFECT",
+                                receipt.provider_profile,
+                                "recovery returned %r for a leg served by %r"
+                                % (served_model, prior_model))
+            raise NonRetryableFailure(
+                "GATEWAY_MODEL_SWITCH_AFTER_SIDE_EFFECT: %s -> %s" % (prior_model, served_model))
         if committed and receipt.provider_profile not in (None, profile):
             self._refuse_switch(mission, "PROVIDER_SWITCH_AFTER_SIDE_EFFECT", receipt.provider_profile,
                                 "recovery returned %r for a mission dispatched on %r"
@@ -383,6 +424,19 @@ class Controller:
             raise NonRetryableFailure(
                 "IDEMPOTENCY_KEY_DIVERGED: layer bound %s, mission is %s"
                 % (receipt.idempotency_key, mission["idempotency_key"]))
+        if receipt.gateway:
+            # Admission constrained what was *asked* for.  Only the receipt says
+            # what answered, so the allowlist is enforced a second time against
+            # the model that actually ran -- the same reason the profile
+            # allow/deny list is enforced here rather than only at selection.
+            gateway_policy = gateway.GatewayPolicy.from_payload(mission["payload"])
+            served = _served_gateway_profile(mission["payload"], receipt.provider_profile)
+            for check in (gateway.undeclared_failover(receipt.gateway, gateway_policy, served),
+                          gateway.privacy_refusal(receipt.gateway, gateway_policy)):
+                if check:
+                    raise NonRetryableFailure("%s: %s reported %r" % (
+                        check, receipt.provider_profile,
+                        receipt.gateway.get("actual_model")))
 
     # ------------------------------------------------------------------ #
     # the mission
@@ -489,10 +543,44 @@ def _gate_refusal(payload: dict[str, Any], evaluation: dict[str, Any]) -> str | 
     return None
 
 
-def _route(selection: Selection, attempted: tuple | list, mission: dict[str, Any],
-           recover_only: bool) -> dict[str, Any]:
-    """What the execution layer is told about this leg.  No vendor detail here."""
+def _gateway_candidates(payload: dict[str, Any]) -> tuple:
+    """Split declared gateway profiles into admitted and refused."""
 
+    admitted, refused = [], []
+    for profile, code in gateway.admitted_profiles(payload):
+        (refused.append((profile, code)) if code else admitted.append(profile))
+    return tuple(admitted), tuple(refused)
+
+
+def _served_gateway_profile(payload: dict[str, Any], profile: str | None):
+    for candidate in gateway.profiles_from_payload(payload):
+        if candidate.profile == profile:
+            return candidate
+    return None
+
+
+def _with_gateway(receipt: routing.Receipt, response: dict[str, Any],
+                  profile) -> routing.Receipt:
+    raw = response.get("receipt") if isinstance(response.get("receipt"), dict) else {}
+    facts = gateway.facts_from_response(raw.get("gateway"), profile)
+    return receipt if facts is None else replace(receipt, gateway=facts)
+
+
+def _route(selection: Selection, attempted: tuple | list, mission: dict[str, Any],
+           recover_only: bool, gateway_profile=None) -> dict[str, Any]:
+    """What the execution layer is told about this leg.
+
+    A gateway leg carries the model slug the Owner admitted, because the layer
+    cannot request a model it was not told.  That is the only vendor-shaped
+    value that crosses, it came from the mission's own declaration, and no
+    credential accompanies it.
+    """
+
+    if gateway_profile is not None:
+        return {**_route(selection, attempted, mission, recover_only),
+                "gateway": {"gateway": gateway_profile.gateway,
+                            "model_slug": gateway_profile.model_slug,
+                            "privacy": list(gateway_profile.privacy)}}
     return {
         "provider_profile": selection.profile,
         "selection_reason": selection.reason,
@@ -521,4 +609,5 @@ def _receipt_value(row: dict[str, Any]) -> routing.Receipt:
     raw["fallback_chain"] = tuple(raw.get("fallback_chain") or ())
     raw["selection_trace"] = tuple(raw.get("selection_trace") or ())
     raw["usage"] = routing.Usage(**(raw.get("usage") or {}))
+    raw["gateway"] = raw.get("gateway") or None
     return routing.Receipt(**raw)

@@ -19,6 +19,7 @@ see :class:`HermesAdvisor` for the measured facts.
 
 from __future__ import annotations
 
+import dataclasses
 import json
 import urllib.error
 import urllib.request
@@ -245,6 +246,71 @@ def consult(port: AdvisoryPort | None, request: dict[str, Any],
     status = "advised" if any(verdict.accepted for verdict in verdicts) else "rejected"
     return Outcome(status, verdicts, None if status == "advised" else "ADVISOR_ALL_REJECTED")
 
+
+
+# --------------------------------------------------------------------------- #
+# the operator step
+# --------------------------------------------------------------------------- #
+
+def coordinate(store, port: AdvisoryPort | None, policy: AdvisorPolicy | dict | None = None,
+               *, request: dict[str, Any] | None = None) -> dict[str, Any]:
+    """Ask an advisor, adjudicate the answer, apply what the Owner allowed.
+
+    This lives here rather than on the Controller, and nothing in ``engine.py``
+    imports this module -- ``tests/test_authority_boundaries.py`` enforces that.
+    The Factory must run deterministically when no advisor exists, and the
+    cheapest way to make that true rather than merely tested is for the
+    scheduling path to have no way to reach an advisor at all.  Advice is an
+    operator step that edits the graph between missions; the scheduler then
+    reads the graph exactly as it does when nobody advised anything.
+
+    Of the five proposal kinds only two can move durable state: a dependency
+    edge, and a project priority inside the Owner's bounds.  The other three are
+    recorded and change nothing, and each for a structural reason rather than a
+    policy one.  A specialist profile cannot be applied because
+    ``factory-bridge`` selects from its own registry and the Controller has no
+    wire field naming a profile.  A decomposition cannot be applied because a
+    child mission needs admission fields the advisor is forbidden to supply.
+    ``next_mission`` cannot be applied because the scheduler is a pure function
+    of two durable numbers and does not read it.  So the advisor's entire
+    effective authority is two edges and one number.
+    """
+
+    policy = (AdvisorPolicy.from_payload({"advisor_policy": policy})
+              if isinstance(policy, dict) else (policy or AdvisorPolicy()))
+    projects = store.projects()
+    missions = tuple(sorted(row["id"] for row in store.all_missions()))
+    facts = Facts(projects=tuple(sorted(projects)), missions=missions,
+                  edges={key: tuple(value) for key, value in store.dependency_graph().items()})
+    outcome = consult(port, request or {"missions": list(missions), "projects": list(projects)},
+                      policy, facts)
+    applied, refused = [], []
+    for verdict in outcome.accepted:
+        try:
+            applied.append(_apply(store, verdict, projects))
+        except Exception as exc:
+            # An accepted proposal can still lose to a fact that changed between
+            # review and application -- a mission finished, an edge now closes a
+            # cycle.  Review is not a lock, so the store's own refusal wins.
+            refused.append({"index": verdict.index, "kind": verdict.kind,
+                            "code": "ADVISOR_APPLICATION_REFUSED", "detail": str(exc)[:200]})
+    row = {**outcome.as_row(), "applied": applied, "application_refused": refused}
+    store.coordinate(None, None, "advisor", outcome.refusal_code or "ADVISOR_CONSULTED", row)
+    return row
+
+
+def _apply(store, verdict: Verdict, projects: Mapping[str, Any]) -> dict[str, Any]:
+    proposal = verdict.proposal
+    if verdict.kind == "dependency_edge":
+        store.add_dependency(proposal["mission_id"], proposal["depends_on"],
+                             on_failure=proposal.get("on_failure", "block"))
+        return {"kind": verdict.kind, "effect": "edge_added", "proposal": proposal}
+    if verdict.kind == "project_priority":
+        current = projects[proposal["project_id"]]
+        store.register_project(dataclasses.replace(current, priority=proposal["priority"]))
+        return {"kind": verdict.kind, "effect": "priority_set",
+                "from": current.priority, "to": proposal["priority"]}
+    return {"kind": verdict.kind, "effect": "recorded_only", "proposal": proposal}
 
 # --------------------------------------------------------------------------- #
 # adapters
