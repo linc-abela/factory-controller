@@ -29,6 +29,15 @@ ADAPTER_SEAM = {"adapter.py", "stage1_adapter.py", "context_adapter.py"}
 #: The Controller's own runtime. Nothing here may execute anything.
 CORE = {"engine.py", "store.py", "routing.py", "cli.py", "context.py", "__init__.py"}
 
+#: The two files permitted to name an external system, on the same principle
+#: as ADAPTER_SEAM: a seam is allowed to speak its counterpart's dialect, and
+#: confining that to a named file is what makes the rest of the package
+#: checkable.  `gateway.py` names the model gateway the Owner admitted;
+#: `advisor.py` names the advisory service the Owner may point it at.  Both are
+#: still scanned for everything else, and the list is pinned below so a third
+#: file cannot join it quietly.
+EXTERNAL_SEAM = {"advisor.py", "gateway.py"}
+
 #: The modules that decide what a mission is and what context it may have.
 #: None of them may touch a file system at all. `cli.py` is deliberately absent:
 #: it reads the mission file the operator named on the command line, which is
@@ -102,12 +111,75 @@ def code_text(text: str) -> str:
 class ProviderNeutralityTests(unittest.TestCase):
     def test_no_vendor_name_appears_anywhere_in_the_package(self):
         for path, text in sources():
+            if path.name in EXTERNAL_SEAM:
+                continue
             code = code_text(text)
             for token in VENDOR_TOKENS:
                 self.assertNotIn(token, code, "%s names %r" % (path.name, token))
 
+    def test_the_external_seam_is_exactly_two_files(self):
+        """An exemption nobody can extend without changing this line."""
+
+        self.assertEqual(EXTERNAL_SEAM, {"advisor.py", "gateway.py"})
+        present = {path.name for path, _ in sources()}
+        self.assertTrue(EXTERNAL_SEAM <= present)
+
+    def test_the_deciding_modules_never_import_the_external_seam(self):
+        """A vendor name may live at the seam; it may not reach the core.
+
+        This is the check the exemption is worth having.  `engine.py` composes
+        the seam's *contracts*, and importing the seam into `store.py` or
+        `routing.py` would put a named gateway inside durable state and routing.
+        """
+
+        for path, text in sources(DECIDING):
+            imported = set()
+            for node in ast.walk(ast.parse(text)):
+                if isinstance(node, ast.ImportFrom) and node.module is None:
+                    imported.update(alias.name for alias in node.names)
+                elif isinstance(node, ast.Import):
+                    imported.update(alias.name.split(".")[-1] for alias in node.names)
+            self.assertNotIn("advisor", imported, "%s imports the advisory seam" % path.name)
+            if path.name != "engine.py":
+                self.assertNotIn("gateway", imported, "%s imports the gateway seam" % path.name)
+
+    def test_the_external_seam_holds_no_credential_of_its_own(self):
+        """The seam may send a credential it was handed.  It may not find one.
+
+        Reading the environment belongs to the two execution-side modules and
+        nowhere else: `context_adapter.py` takes the broker command and paths
+        that way, and `safe_provider.py` takes its own local settings.  The
+        external seam is deliberately not on that list, so a token can only
+        arrive as an argument from the operator -- which is what keeps it out of
+        durable state.  No module anywhere reads a keyring or a secrets file.
+        """
+
+        readers = set()
+        for path, text in sources():
+            code = code_text(text)
+            for token in ("keyring", "netrc", "credentials.json", "id_rsa"):
+                self.assertNotIn(token, code, "%s sources a secret (%r)" % (path.name, token))
+            if "environ" in code or "getenv" in code:
+                readers.add(path.name)
+        self.assertEqual(readers, {"context_adapter.py", "safe_provider.py"},
+                         "unexpected environment readers: %s" % readers)
+        self.assertFalse(readers & EXTERNAL_SEAM)
+
+    def test_no_credential_value_can_reach_the_coordination_ledger(self):
+        """An advisor's token is never an argument to anything durable."""
+
+        import inspect
+        from factory_controller import advisor as advisor_module
+        signature = inspect.signature(advisor_module.HermesAdvisor.__init__)
+        self.assertEqual(signature.parameters["token"].kind,
+                         inspect.Parameter.KEYWORD_ONLY)
+        self.assertIsNone(signature.parameters["token"].default)
+        self.assertNotIn("token", advisor_module.HermesAdvisor().probe())
+
     def test_no_credential_shaped_name_appears_anywhere(self):
         for path, text in sources():
+            if path.name in EXTERNAL_SEAM:
+                continue
             code = code_text(text)
             for token in CREDENTIAL_TOKENS:
                 self.assertNotIn(token, code, "%s names %r" % (path.name, token))
@@ -225,7 +297,13 @@ class ContextAuthorityTests(unittest.TestCase):
                          scrambled)
 
     def test_the_controller_holds_no_selection_rule_of_its_own(self):
-        """No scoring, ranking, relevance or embedding vocabulary lives here."""
+        """No scoring, ranking, relevance or embedding vocabulary lives here.
+
+        Stage 5 adds a scheduler, which is the first thing in this package that
+        orders anything -- so this check matters more than it did, not less.  It
+        still passes because the scheduler orders *missions* by two durable
+        numbers and never orders repository content by anything.
+        """
 
         for path, text in sources():
             code = code_text(text)

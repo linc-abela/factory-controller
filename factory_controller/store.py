@@ -12,6 +12,7 @@ from pathlib import Path
 from typing import Any, Iterator
 
 from . import context as context_contract
+from . import portfolio
 
 
 CONTRACT_VERSION = "factory-controller/1.0"
@@ -157,9 +158,70 @@ class MissionStore:
                 BEFORE UPDATE ON runs BEGIN SELECT RAISE(ABORT, 'runs are append-only'); END;
                 CREATE TRIGGER IF NOT EXISTS runs_no_delete
                 BEFORE DELETE ON runs BEGIN SELECT RAISE(ABORT, 'runs are append-only'); END;
+                CREATE TABLE IF NOT EXISTS projects (
+                  project_id TEXT PRIMARY KEY,
+                  repository TEXT NOT NULL,
+                  state TEXT NOT NULL,
+                  priority INTEGER NOT NULL,
+                  concurrency_cap INTEGER NOT NULL,
+                  budget_ceiling REAL,
+                  budget_currency TEXT,
+                  context_ceiling_bytes INTEGER,
+                  policy_version TEXT NOT NULL,
+                  created_at REAL NOT NULL,
+                  updated_at REAL NOT NULL
+                );
+                CREATE TABLE IF NOT EXISTS portfolio (
+                  id INTEGER PRIMARY KEY CHECK (id = 1),
+                  portfolio_concurrency INTEGER NOT NULL,
+                  emergency_stop INTEGER NOT NULL DEFAULT 0,
+                  aging_seconds REAL NOT NULL,
+                  policy_version TEXT NOT NULL,
+                  updated_at REAL NOT NULL
+                );
+                CREATE TABLE IF NOT EXISTS dependencies (
+                  mission_id TEXT NOT NULL REFERENCES missions(id),
+                  depends_on TEXT NOT NULL REFERENCES missions(id),
+                  on_failure TEXT NOT NULL,
+                  created_at REAL NOT NULL,
+                  released_at REAL,
+                  PRIMARY KEY(mission_id, depends_on)
+                );
+                CREATE INDEX IF NOT EXISTS dependencies_by_prerequisite
+                  ON dependencies(depends_on);
+                CREATE TABLE IF NOT EXISTS coordination (
+                  sequence INTEGER PRIMARY KEY AUTOINCREMENT,
+                  mission_id TEXT,
+                  project_id TEXT,
+                  decision TEXT NOT NULL,
+                  reason TEXT NOT NULL,
+                  detail_json TEXT NOT NULL,
+                  created_at REAL NOT NULL
+                );
+                CREATE INDEX IF NOT EXISTS coordination_by_mission
+                  ON coordination(mission_id, sequence);
+                CREATE TRIGGER IF NOT EXISTS coordination_no_update
+                BEFORE UPDATE ON coordination BEGIN SELECT RAISE(ABORT, 'coordination is append-only'); END;
+                CREATE TRIGGER IF NOT EXISTS coordination_no_delete
+                BEFORE DELETE ON coordination BEGIN SELECT RAISE(ABORT, 'coordination is append-only'); END;
                 """
             )
+            # A Stage-4 database predates the coordination columns, and dropping
+            # it to add two nullable ones would destroy the durable state the
+            # whole stage exists to protect.  NULL keeps the Stage-4 meaning:
+            # a mission belonging to no project, scheduled under portfolio
+            # limits alone.
+            present = {row["name"] for row in db.execute("PRAGMA table_info(missions)")}
+            for column, ddl in (("project_id", "TEXT"), ("priority", "INTEGER")):
+                if column not in present:
+                    db.execute("ALTER TABLE missions ADD COLUMN %s %s" % (column, ddl))
+            db.execute(
+                "INSERT OR IGNORE INTO portfolio VALUES (1,?,0,?,'unset',?)",
+                (portfolio.DEFAULT_PORTFOLIO_CONCURRENCY, portfolio.DEFAULT_AGING_SECONDS,
+                 self.clock()),
+            )
             db.execute("INSERT OR IGNORE INTO schema_meta VALUES (1, ?)", (self.clock(),))
+            db.execute("INSERT OR IGNORE INTO schema_meta VALUES (2, ?)", (self.clock(),))
 
     @staticmethod
     def _row(row: sqlite3.Row | None) -> dict[str, Any] | None:
@@ -204,9 +266,15 @@ class MissionStore:
             # refusal. `controller_contract.mission_identity` already derives from
             # `request_identity_hash`, which includes the key; this matches it.
             mission_id = f"fm_{payload_hash({'idempotency_key': idempotency_key, 'payload_hash': digest})[:24]}"
+            project_id = payload.get("project_id") if isinstance(payload, dict) else None
+            priority = payload.get("priority") if isinstance(payload, dict) else None
+            if not isinstance(project_id, str) or not project_id:
+                project_id = None
+            if not isinstance(priority, int) or isinstance(priority, bool):
+                priority = None
             db.execute(
-                "INSERT INTO missions(id,idempotency_key,payload_hash,payload_json,state,max_attempts,next_run_at,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?)",
-                (mission_id, idempotency_key, digest, canonical_json(payload), "admitted", max_attempts, now, now, now),
+                "INSERT INTO missions(id,idempotency_key,payload_hash,payload_json,state,max_attempts,next_run_at,created_at,updated_at,project_id,priority) VALUES(?,?,?,?,?,?,?,?,?,?,?)",
+                (mission_id, idempotency_key, digest, canonical_json(payload), "admitted", max_attempts, now, now, now, project_id, priority),
             )
             self._event(db, mission_id, "SUBMITTED_ADMITTED", None, "admitted", {"payload_hash": digest, "contract_version": CONTRACT_VERSION})
             row = db.execute("SELECT * FROM missions WHERE id=?", (mission_id,)).fetchone()
@@ -217,13 +285,29 @@ class MissionStore:
             return self._row(db.execute("SELECT * FROM missions WHERE id=?", (mission_id,)).fetchone())
 
     def claim(self, worker_id: str, *, lease_seconds: float = 30) -> dict[str, Any] | None:
+        """Take the lease on the one mission the portfolio scheduler picked.
+
+        Scheduling happens *inside* the claiming transaction, not in a separate
+        pass, so the Stage-2 no-duplicate-claim property still comes from the
+        same ``BEGIN IMMEDIATE`` plus the guarded update below.  A second worker
+        running the identical scheduler concurrently either loses the write and
+        returns ``None``, or sees the first worker's lease and schedules around
+        it -- there is no window in which both succeed.
+        """
+
         now = self.clock()
         token = str(uuid.uuid4())
         with self.transaction() as db:
-            row = db.execute(
-                "SELECT * FROM missions WHERE state IN ('admitted','dispatched','candidate_verified','evaluated','evidence_sealed') AND lease_token IS NULL AND next_run_at<=? AND cancel_requested=0 ORDER BY next_run_at,created_at LIMIT 1",
-                (now,),
-            ).fetchone()
+            decision = self._schedule_locked(db, now)
+            if decision.verdicts:
+                # An idle poll with nothing to consider writes nothing; a poll
+                # that passed over real work explains why, once, in one row.
+                self._coordination_locked(
+                    db, decision.selected, self._project_of(db, decision.selected),
+                    "claim", decision.reason, decision.as_row())
+            if decision.selected is None:
+                return None
+            row = db.execute("SELECT * FROM missions WHERE id=?", (decision.selected,)).fetchone()
             if row is None:
                 return None
             fresh_attempt = row["state"] == "admitted"
@@ -266,6 +350,17 @@ class MissionStore:
                     "UPDATE attempts SET ended_at=?,outcome=?,diagnostic=? WHERE mission_id=? AND number=?",
                     (now, new_state, reason, mission_id, row["attempt_count"]),
                 )
+            # Dependency release is a consequence of reaching a terminal state,
+            # so it lives at the one choke point every terminal state passes
+            # through rather than at each caller that happens to finish work.
+            if new_state == "completed":
+                released = self._release_dependencies_locked(db, mission_id)
+                if released:
+                    self._coordination_locked(db, mission_id, row["project_id"], "dependency",
+                                              "DEPENDENTS_RELEASED",
+                                              {"released": released, "count": len(released)})
+            elif new_state in TERMINAL:
+                self._propagate_failure_locked(db, mission_id, new_state)
 
     def renew(self, mission_id: str, lease_token: str, lease_seconds: float) -> None:
         with self.transaction() as db:
@@ -640,6 +735,472 @@ class MissionStore:
             "reduction": package.measurement.reduction,
             "context_refusals": refusals,
         }
+
+
+    # ------------------------------------------------------------------ #
+    # Stage 5: the portfolio
+    # ------------------------------------------------------------------ #
+
+    def _coordination_locked(self, db: sqlite3.Connection, mission_id: str | None,
+                             project_id: str | None, decision: str, reason: str,
+                             detail: Any) -> None:
+        db.execute(
+            "INSERT INTO coordination(mission_id,project_id,decision,reason,detail_json,created_at) VALUES(?,?,?,?,?,?)",
+            (mission_id, project_id, decision, reason, canonical_json(detail), self.clock()),
+        )
+
+    def coordinate(self, mission_id: str | None, project_id: str | None,
+                   decision: str, reason: str, detail: Any = None) -> None:
+        """Record why something was or was not done.  Append-only, like events."""
+
+        with self.transaction() as db:
+            self._coordination_locked(db, mission_id, project_id, decision, reason, detail or {})
+
+    def coordination(self, mission_id: str | None = None, *, limit: int = 200) -> list[dict[str, Any]]:
+        query = "SELECT * FROM coordination"
+        params: tuple[Any, ...] = ()
+        if mission_id is not None:
+            query += " WHERE mission_id=?"
+            params = (mission_id,)
+        query += " ORDER BY sequence DESC LIMIT ?"
+        with self.connect() as db:
+            rows = db.execute(query, params + (limit,)).fetchall()
+        out = []
+        for row in reversed(rows):
+            value = dict(row)
+            value["detail"] = json.loads(value.pop("detail_json"))
+            out.append(value)
+        return out
+
+    @staticmethod
+    def _project_of(db: sqlite3.Connection, mission_id: str | None) -> str | None:
+        if mission_id is None:
+            return None
+        row = db.execute("SELECT project_id FROM missions WHERE id=?", (mission_id,)).fetchone()
+        return None if row is None else row["project_id"]
+
+    # -- registry ------------------------------------------------------- #
+
+    def register_project(self, policy: portfolio.ProjectPolicy) -> dict[str, Any]:
+        """Create or update one project.  The Owner's word, stored verbatim."""
+
+        now = self.clock()
+        row = policy.as_row()
+        with self.transaction() as db:
+            existing = db.execute("SELECT project_id FROM projects WHERE project_id=?",
+                                  (policy.project_id,)).fetchone()
+            db.execute(
+                "INSERT INTO projects(project_id,repository,state,priority,concurrency_cap,"
+                "budget_ceiling,budget_currency,context_ceiling_bytes,policy_version,created_at,updated_at)"
+                " VALUES(?,?,?,?,?,?,?,?,?,?,?)"
+                " ON CONFLICT(project_id) DO UPDATE SET repository=excluded.repository,"
+                " state=excluded.state, priority=excluded.priority,"
+                " concurrency_cap=excluded.concurrency_cap, budget_ceiling=excluded.budget_ceiling,"
+                " budget_currency=excluded.budget_currency,"
+                " context_ceiling_bytes=excluded.context_ceiling_bytes,"
+                " policy_version=excluded.policy_version, updated_at=excluded.updated_at",
+                (policy.project_id, policy.repository, policy.state, policy.priority,
+                 policy.concurrency_cap, policy.budget_ceiling, policy.budget_currency,
+                 policy.context_ceiling_bytes, policy.policy_version, now, now),
+            )
+            self._coordination_locked(db, None, policy.project_id, "registry",
+                                      "PROJECT_UPDATED" if existing else "PROJECT_REGISTERED", row)
+        return row
+
+    def set_project_state(self, project_id: str, state: str, *, reason: str = "OWNER") -> dict[str, Any]:
+        """Pause, resume, drain, or stop one project.
+
+        No mission row is touched.  A paused project stops *new* claims; every
+        mission already past the dispatch boundary is resumed exactly as before,
+        because abandoning one is the durable-state corruption the pause exists
+        to avoid.
+        """
+
+        if state not in portfolio.PROJECT_STATES:
+            raise portfolio.PolicyError("unknown project state %r" % (state,))
+        with self.transaction() as db:
+            row = db.execute("SELECT * FROM projects WHERE project_id=?", (project_id,)).fetchone()
+            if row is None:
+                raise KeyError(project_id)
+            db.execute("UPDATE projects SET state=?,updated_at=? WHERE project_id=?",
+                       (state, self.clock(), project_id))
+            in_flight = db.execute(
+                "SELECT COUNT(*) AS n FROM missions WHERE project_id=? AND lease_token IS NOT NULL",
+                (project_id,)).fetchone()["n"]
+            detail = {"from": row["state"], "to": state, "in_flight": in_flight,
+                      "drained": in_flight == 0, "reason": reason}
+            self._coordination_locked(db, None, project_id, "registry", "PROJECT_STATE_CHANGED", detail)
+        return detail
+
+    def project(self, project_id: str) -> portfolio.ProjectPolicy | None:
+        with self.connect() as db:
+            row = db.execute("SELECT * FROM projects WHERE project_id=?", (project_id,)).fetchone()
+        return None if row is None else _project_policy(row)
+
+    def projects(self) -> dict[str, portfolio.ProjectPolicy]:
+        with self.connect() as db:
+            rows = db.execute("SELECT * FROM projects ORDER BY project_id").fetchall()
+        return {row["project_id"]: _project_policy(row) for row in rows}
+
+    def portfolio_policy(self) -> portfolio.PortfolioPolicy:
+        with self.connect() as db:
+            row = db.execute("SELECT * FROM portfolio WHERE id=1").fetchone()
+        return _portfolio_policy(row)
+
+    def set_portfolio_policy(self, policy: portfolio.PortfolioPolicy, *,
+                             reason: str = "OWNER") -> dict[str, Any]:
+        with self.transaction() as db:
+            db.execute(
+                "UPDATE portfolio SET portfolio_concurrency=?,emergency_stop=?,aging_seconds=?,"
+                "policy_version=?,updated_at=? WHERE id=1",
+                (policy.portfolio_concurrency, int(policy.emergency_stop), policy.aging_seconds,
+                 policy.policy_version, self.clock()),
+            )
+            self._coordination_locked(db, None, None, "registry", "PORTFOLIO_POLICY_SET",
+                                      {**policy.as_row(), "reason": reason})
+        return policy.as_row()
+
+    def emergency_stop(self, engaged: bool = True, *, reason: str = "OWNER") -> dict[str, Any]:
+        """Stop the whole portfolio starting anything new, immediately.
+
+        One boolean, checked ahead of every other admission gate.  In-flight
+        missions are still resumed: a portfolio-wide stop that orphaned a
+        provider process mid-run would be the thing it is meant to prevent.
+        """
+
+        current = self.portfolio_policy()
+        return self.set_portfolio_policy(
+            portfolio.PortfolioPolicy(current.portfolio_concurrency, engaged,
+                                      current.aging_seconds, current.policy_version),
+            reason="EMERGENCY_STOP" if engaged else ("EMERGENCY_STOP_CLEARED: " + reason))
+
+    # -- the dependency graph -------------------------------------------- #
+
+    def add_dependency(self, mission_id: str, depends_on: str, *,
+                       on_failure: str = "block") -> dict[str, Any]:
+        if on_failure not in portfolio.ON_FAILURE:
+            raise portfolio.PolicyError("on_failure must be one of %s" % (portfolio.ON_FAILURE,))
+        with self.transaction() as db:
+            for identifier in (mission_id, depends_on):
+                if db.execute("SELECT 1 FROM missions WHERE id=?", (identifier,)).fetchone() is None:
+                    raise KeyError(identifier)
+            edges = _edges_locked(db)
+            cycle = portfolio.cycle_path(edges, mission_id, depends_on)
+            if cycle:
+                self._coordination_locked(db, mission_id, self._project_of(db, mission_id),
+                                          "dependency", "DEPENDENCY_CYCLE",
+                                          {"cycle": list(cycle), "depends_on": depends_on})
+                raise portfolio.PolicyError("DEPENDENCY_CYCLE: " + " -> ".join(cycle))
+            released = db.execute("SELECT state FROM missions WHERE id=?", (depends_on,)).fetchone()
+            now = self.clock()
+            db.execute(
+                "INSERT OR IGNORE INTO dependencies(mission_id,depends_on,on_failure,created_at,released_at)"
+                " VALUES(?,?,?,?,?)",
+                (mission_id, depends_on, on_failure, now,
+                 now if released["state"] == portfolio.SATISFIED else None),
+            )
+            detail = {"mission_id": mission_id, "depends_on": depends_on,
+                      "on_failure": on_failure,
+                      "already_satisfied": released["state"] == portfolio.SATISFIED}
+            self._coordination_locked(db, mission_id, self._project_of(db, mission_id),
+                                      "dependency", "DEPENDENCY_DECLARED", detail)
+        return detail
+
+    def dependencies(self, mission_id: str) -> list[dict[str, Any]]:
+        with self.connect() as db:
+            rows = db.execute(
+                "SELECT d.*, m.state AS prerequisite_state FROM dependencies d"
+                " JOIN missions m ON m.id=d.depends_on WHERE d.mission_id=?"
+                " ORDER BY d.depends_on", (mission_id,)).fetchall()
+        return [dict(row) for row in rows]
+
+    def dependency_status(self, mission_id: str) -> dict[str, Any]:
+        """The derived reading -- ready, waiting, blocked -- plus its evidence."""
+
+        rows = self.dependencies(mission_id)
+        prerequisites = tuple(
+            portfolio.Prerequisite(row["depends_on"], row["prerequisite_state"], row["on_failure"])
+            for row in rows)
+        reading = portfolio.dependency_reading(prerequisites)
+        reading["mission_id"] = mission_id
+        reading["edges"] = [
+            {"depends_on": row["depends_on"], "state": row["prerequisite_state"],
+             "on_failure": row["on_failure"], "released_at": row["released_at"]}
+            for row in rows]
+        reading["released"] = sum(1 for row in rows if row["released_at"] is not None)
+        return reading
+
+    def dependency_graph(self) -> dict[str, list[str]]:
+        with self.connect() as db:
+            return {key: list(value) for key, value in _edges_locked(db).items()}
+
+    def _release_dependencies_locked(self, db: sqlite3.Connection, mission_id: str) -> list[str]:
+        """Mark this mission's dependents released.  Exactly once, per edge.
+
+        The guard is ``released_at IS NULL`` inside the claiming transaction, so
+        a repeated or concurrent completion releases nothing a second time and
+        the count is a fact rather than an intention.
+        """
+
+        rows = db.execute(
+            "SELECT mission_id FROM dependencies WHERE depends_on=? AND released_at IS NULL",
+            (mission_id,)).fetchall()
+        released = []
+        for row in rows:
+            changed = db.execute(
+                "UPDATE dependencies SET released_at=? WHERE mission_id=? AND depends_on=?"
+                " AND released_at IS NULL",
+                (self.clock(), row["mission_id"], mission_id)).rowcount
+            if changed == 1:
+                released.append(row["mission_id"])
+                self._coordination_locked(
+                    db, row["mission_id"], self._project_of(db, row["mission_id"]),
+                    "dependency", "DEPENDENCY_RELEASED",
+                    {"depends_on": mission_id, "released_at": self.clock()})
+        return released
+
+    def _propagate_failure_locked(self, db: sqlite3.Connection, mission_id: str,
+                                  state: str) -> list[str]:
+        """Apply each dependent's declared failure policy.  ``block`` does nothing.
+
+        Blocking needs no write: the dependent's reading is derived from the
+        edge and the prerequisite's state, and both are already durable.  Only
+        ``cancel`` mutates, and only for a dependent that has not started.
+        """
+
+        rows = db.execute(
+            "SELECT mission_id,on_failure FROM dependencies WHERE depends_on=?",
+            (mission_id,)).fetchall()
+        affected = []
+        for row in rows:
+            self._coordination_locked(
+                db, row["mission_id"], self._project_of(db, row["mission_id"]),
+                "dependency", "PREREQUISITE_FAILED",
+                {"depends_on": mission_id, "prerequisite_state": state,
+                 "on_failure": row["on_failure"]})
+            if row["on_failure"] != "cancel":
+                continue
+            dependent = db.execute("SELECT * FROM missions WHERE id=?",
+                                   (row["mission_id"],)).fetchone()
+            if dependent is None or dependent["state"] in TERMINAL:
+                continue
+            if dependent["state"] == "admitted" and dependent["lease_token"] is None:
+                db.execute(
+                    "UPDATE missions SET state='cancelled',cancel_requested=1,"
+                    "terminal_reason=?,updated_at=? WHERE id=? AND state='admitted'",
+                    ("DEPENDENCY_FAILURE_PROPAGATED: " + mission_id, self.clock(), row["mission_id"]))
+                self._event(db, row["mission_id"], "CANCELLED", "admitted", "cancelled",
+                            {"cause": "DEPENDENCY_FAILURE_PROPAGATED", "depends_on": mission_id})
+            else:
+                # Past the boundary, cancellation is a request the running
+                # attempt observes; forcing it here would be a cancel after a
+                # side effect, which Stage 2 already refuses.
+                db.execute("UPDATE missions SET cancel_requested=1,updated_at=? WHERE id=?",
+                           (self.clock(), row["mission_id"]))
+                self._event(db, row["mission_id"], "CANCELLATION_REQUESTED",
+                            dependent["state"], dependent["state"],
+                            {"cause": "DEPENDENCY_FAILURE_PROPAGATED", "depends_on": mission_id})
+            affected.append(row["mission_id"])
+        return affected
+
+    # -- scheduling ------------------------------------------------------ #
+
+    def _schedule_locked(self, db: sqlite3.Connection, now: float) -> portfolio.ScheduleDecision:
+        rows = db.execute(
+            "SELECT id,project_id,priority,state,created_at,next_run_at FROM missions"
+            " WHERE state IN ('admitted','dispatched','candidate_verified','evaluated','evidence_sealed')"
+            " AND lease_token IS NULL AND cancel_requested=0 ORDER BY created_at,id").fetchall()
+        if not rows:
+            return portfolio.ScheduleDecision(None, "NO_RUNNABLE_MISSION", ())
+        edges: dict[str, list[tuple[str, str, str]]] = {}
+        for edge in db.execute(
+                "SELECT d.mission_id,d.depends_on,d.on_failure,m.state FROM dependencies d"
+                " JOIN missions m ON m.id=d.depends_on").fetchall():
+            edges.setdefault(edge["mission_id"], []).append(
+                (edge["depends_on"], edge["state"], edge["on_failure"]))
+        in_flight: dict[str, int] = {}
+        portfolio_in_flight = 0
+        for row in db.execute(
+                "SELECT project_id,COUNT(*) AS n FROM missions WHERE lease_token IS NOT NULL"
+                " AND state NOT IN ('completed','refused','failed','cancelled')"
+                " GROUP BY project_id").fetchall():
+            portfolio_in_flight += row["n"]
+            if row["project_id"] is not None:
+                in_flight[row["project_id"]] = row["n"]
+        candidates = tuple(
+            portfolio.MissionCandidate(
+                mission_id=row["id"], project_id=row["project_id"], state=row["state"],
+                created_at=row["created_at"], ready_at=row["next_run_at"],
+                priority=row["priority"],
+                prerequisites=tuple(portfolio.Prerequisite(*item)
+                                    for item in edges.get(row["id"], ())))
+            for row in rows)
+        snapshot = portfolio.Snapshot(
+            portfolio=_portfolio_policy(db.execute("SELECT * FROM portfolio WHERE id=1").fetchone()),
+            projects={row["project_id"]: _project_policy(row)
+                      for row in db.execute("SELECT * FROM projects").fetchall()},
+            candidates=candidates, in_flight=in_flight, portfolio_in_flight=portfolio_in_flight,
+            project_spend=self._spend_locked(db), now=now)
+        return portfolio.schedule(snapshot)
+
+    def schedule_preview(self) -> dict[str, Any]:
+        """What the scheduler would do right now.  Reads only; claims nothing."""
+
+        with self.connect() as db:
+            return self._schedule_locked(db, self.clock()).as_row()
+
+    def _spend_locked(self, db: sqlite3.Connection) -> dict[str, dict[str, Any]]:
+        """Measured spend per project, from receipts alone.
+
+        A leg's cost is counted once.  The provider-neutral ``usage`` figure is
+        preferred, and a gateway's own priced figure is used only where ``usage``
+        reported none -- they describe the same money, and adding both would
+        double-charge a project for one call.  Anything unpriced increments
+        ``unpriced_legs`` and contributes nothing: unknown cost is not zero.
+        """
+
+        spend: dict[str, dict[str, Any]] = {}
+        for row in db.execute(
+                "SELECT m.project_id AS pid, r.receipt_json FROM runs r"
+                " JOIN missions m ON m.id=r.mission_id WHERE m.project_id IS NOT NULL").fetchall():
+            group = spend.setdefault(row["pid"], {"known_spend": 0.0, "currency": None,
+                                                  "priced_legs": 0, "unpriced_legs": 0,
+                                                  "currencies": []})
+            receipt = json.loads(row["receipt_json"])
+            usage = receipt.get("usage") or {}
+            gateway = receipt.get("gateway") or {}
+            amount = currency = None
+            if usage.get("cost_state") == "reported":
+                amount, currency = usage.get("cost_amount"), usage.get("cost_currency")
+            elif gateway.get("cost_state") == "reported":
+                amount, currency = gateway.get("cost_amount"), gateway.get("cost_currency")
+            if amount is None or not currency:
+                group["unpriced_legs"] += 1
+                continue
+            group["priced_legs"] += 1
+            group["known_spend"] += float(amount)
+            if currency not in group["currencies"]:
+                group["currencies"].append(currency)
+            group["currency"] = group["currencies"][0] if len(group["currencies"]) == 1 else currency
+            if len(group["currencies"]) > 1:
+                # Mixed currencies are never converted.  The first one stays the
+                # comparison basis and the mismatch fails the next dispatch.
+                group["currency"] = group["currencies"][0]
+                group["mixed_currencies"] = list(group["currencies"])
+        return spend
+
+    # -- portfolio economics --------------------------------------------- #
+
+    def portfolio_economics(self, project_id: str | None = None) -> dict[str, Any]:
+        """Context and provider spend per project and for the portfolio.
+
+        Two fact classes stay apart and are never blended: measured context
+        bytes come from the broker, priced provider spend comes from receipts,
+        and each keeps its own absence word when nothing measured it.  Nothing
+        here estimates an unknown, so a portfolio total is the sum of what was
+        actually reported plus an explicit count of what was not.
+        """
+
+        with self.connect() as db:
+            projects = {row["project_id"]: _project_policy(row)
+                        for row in db.execute("SELECT * FROM projects ORDER BY project_id").fetchall()}
+            spend = self._spend_locked(db)
+            rows = db.execute("SELECT id,project_id,state FROM missions ORDER BY created_at").fetchall()
+        groups: dict[str, dict[str, Any]] = {}
+        for key, policy in projects.items():
+            groups[key] = _economics_group(key, policy)
+        for row in rows:
+            key = row["project_id"]
+            if key is None or (project_id is not None and key != project_id):
+                continue
+            group = groups.setdefault(key, _economics_group(key, None))
+            group["missions"] += 1
+            if row["state"] == "completed":
+                group["completed"] += 1
+            elif row["state"] in TERMINAL:
+                group["terminal_not_completed"] += 1
+            block = self.telemetry(row["id"])["context"]
+            base, chosen = block.get("baseline_context_bytes"), block.get("selected_context_bytes")
+            if isinstance(base, int) and isinstance(chosen, int):
+                group["measured_missions"] += 1
+                group["baseline_context_bytes"] += base
+                group["selected_context_bytes"] += chosen
+            else:
+                group["unmeasured_missions"] += 1
+        for key, group in groups.items():
+            group.update(_spend_block(spend.get(key, {})))
+            group["reduction"] = _group_reduction(group)
+            if not group["measured_missions"]:
+                group["baseline_context_bytes"] = "not_measurable"
+                group["selected_context_bytes"] = "not_measurable"
+        selected = {key: group for key, group in groups.items()
+                    if project_id is None or key == project_id}
+        return {"projects": [selected[key] for key in sorted(selected)],
+                "project_count": len(selected),
+                "portfolio": _portfolio_total(selected.values()),
+                "policy": self.portfolio_policy().as_row()}
+
+
+def _project_policy(row: sqlite3.Row) -> portfolio.ProjectPolicy:
+    return portfolio.ProjectPolicy(
+        project_id=row["project_id"], repository=row["repository"], state=row["state"],
+        priority=row["priority"], concurrency_cap=row["concurrency_cap"],
+        budget_ceiling=row["budget_ceiling"], budget_currency=row["budget_currency"],
+        context_ceiling_bytes=row["context_ceiling_bytes"], policy_version=row["policy_version"])
+
+
+def _portfolio_policy(row: sqlite3.Row | None) -> portfolio.PortfolioPolicy:
+    if row is None:
+        return portfolio.PortfolioPolicy()
+    return portfolio.PortfolioPolicy(
+        portfolio_concurrency=row["portfolio_concurrency"], emergency_stop=bool(row["emergency_stop"]),
+        aging_seconds=row["aging_seconds"], policy_version=row["policy_version"])
+
+
+def _edges_locked(db: sqlite3.Connection) -> dict[str, list[str]]:
+    edges: dict[str, list[str]] = {}
+    for row in db.execute("SELECT mission_id,depends_on FROM dependencies").fetchall():
+        edges.setdefault(row["mission_id"], []).append(row["depends_on"])
+    return edges
+
+
+def _economics_group(project_id: str, policy: portfolio.ProjectPolicy | None) -> dict[str, Any]:
+    return {"project_id": project_id, "policy": None if policy is None else policy.as_row(),
+            "missions": 0, "completed": 0, "terminal_not_completed": 0,
+            "measured_missions": 0, "unmeasured_missions": 0,
+            "baseline_context_bytes": 0, "selected_context_bytes": 0}
+
+
+def _spend_block(spend: dict[str, Any]) -> dict[str, Any]:
+    priced = int(spend.get("priced_legs", 0))
+    return {"provider_spend": {
+        "known_spend": float(spend.get("known_spend", 0.0)) if priced else "not_measurable",
+        "currency": spend.get("currency") if priced else "not_applicable",
+        "priced_legs": priced, "unpriced_legs": int(spend.get("unpriced_legs", 0)),
+        "mixed_currencies": spend.get("mixed_currencies", []),
+        "evidence_class": "reported_claim"}}
+
+
+def _portfolio_total(groups) -> dict[str, Any]:
+    groups = list(groups)
+    priced = [group["provider_spend"] for group in groups
+              if isinstance(group["provider_spend"]["known_spend"], float)]
+    currencies = sorted({block["currency"] for block in priced if isinstance(block["currency"], str)})
+    total: Any = "not_measurable"
+    if priced and len(currencies) == 1:
+        total = sum(block["known_spend"] for block in priced)
+    elif priced:
+        # Two currencies are not added.  Converting them would invent a rate,
+        # and the corpus's rule is that an unmeasurable figure stays one.
+        total = "not_measurable"
+    return {"projects": len(groups),
+            "missions": sum(group["missions"] for group in groups),
+            "completed": sum(group["completed"] for group in groups),
+            "known_spend": total,
+            "currency": currencies[0] if len(currencies) == 1 else "not_applicable",
+            "currencies": currencies,
+            "unpriced_legs": sum(group["provider_spend"]["unpriced_legs"] for group in groups),
+            "unmeasured_missions": sum(group["unmeasured_missions"] for group in groups)}
 
 
 def _group_reduction(group: dict[str, Any]) -> dict[str, Any]:
