@@ -29,6 +29,10 @@ from typing import Any, Mapping, Protocol, Sequence
 from . import portfolio
 
 
+#: Where the advisory service answers on this host.  An address, not a
+#: dependency: nothing fails if it is absent.
+DEFAULT_ENDPOINT = "http://127.0.0.1:9119"
+
 PROPOSAL_KINDS = ("decompose", "dependency_edge", "project_priority",
                   "specialist_profile", "next_mission")
 
@@ -328,6 +332,17 @@ class StaticAdvisor:
         if not self.responses:
             return None
         return self.responses.pop(0) if len(self.responses) > 1 else self.responses[0]
+
+
+def endpoint_advisor(base_url: str | None = None, *, token: str | None = None):
+    """Build the HTTP advisory adapter without naming its vendor at the call site.
+
+    The exemption that lets this file hold a vendor name is worth keeping narrow:
+    `cli.py` and `engine.py` stay scannable because they ask for *an advisory
+    endpoint*, and only this module knows which one is running here.
+    """
+
+    return HermesAdvisor(base_url or DEFAULT_ENDPOINT, token=token)
 
 
 class HermesAdvisor:

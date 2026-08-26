@@ -123,3 +123,56 @@ class RouteTestCase:
         return Controller(MissionStore(path), adapter,
                           retry_policy=RetryPolicy(base_delay_seconds=0),
                           lease_seconds=lease_seconds)
+
+
+class Clock:
+    """A hand-wound clock.  Ageing is a function of time, so time is an input."""
+
+    def __init__(self, now: float = 1_000_000.0) -> None:
+        self.now = now
+
+    def __call__(self) -> float:
+        return self.now
+
+    def advance(self, seconds: float) -> float:
+        self.now += seconds
+        return self.now
+
+
+class PortfolioTestCase(RouteTestCase):
+    """A store with a controllable clock, plus the two registry conveniences."""
+
+    def portfolio_store(self, adapter=None, *, clock=None, **policy):
+        import tempfile
+        from pathlib import Path
+        from factory_controller import portfolio
+        from factory_controller.engine import Controller, RetryPolicy
+        from factory_controller.store import MissionStore
+
+        temp = tempfile.TemporaryDirectory()
+        self.addCleanup(temp.cleanup)  # type: ignore[attr-defined]
+        path = Path(temp.name) / "controller.db"
+        clock = clock or Clock()
+        store = MissionStore(path, clock=clock)
+        if policy:
+            store.set_portfolio_policy(portfolio.PortfolioPolicy(**policy))
+        controller = Controller(store, adapter or LayerAdapter(),
+                                retry_policy=RetryPolicy(base_delay_seconds=0),
+                                lease_seconds=0)
+        return controller, store, clock, path
+
+    @staticmethod
+    def register(store, project_id, **policy):
+        from factory_controller import portfolio
+        policy.setdefault("repository", "repo://" + project_id)
+        return store.register_project(portfolio.ProjectPolicy(project_id=project_id, **policy))
+
+    @staticmethod
+    def submit(controller, key, project_id=None, **extra):
+        payload = {"work_item_id": key, "execution_mode": "fixture",
+                   "acceptance_gate_ids": ["G"]}
+        if project_id is not None:
+            payload["project_id"] = project_id
+        payload.update(extra)
+        mission, _ = controller.submit(payload, key)
+        return mission["id"]

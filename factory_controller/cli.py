@@ -9,6 +9,8 @@ import sys
 import time
 from pathlib import Path
 
+from . import advisor as advisory
+from . import portfolio
 from .adapter import JsonProcessAdapter
 from .engine import Controller, RetryPolicy
 from .store import MissionStore
@@ -44,6 +46,45 @@ def parser() -> argparse.ArgumentParser:
     cancel.add_argument("mission_id")
     harness = sub.add_parser("harness")
     harness.add_argument("--missions", type=int, default=10)
+
+    project = sub.add_parser("project")
+    project.add_argument("action", choices=("register", "state", "list"))
+    project.add_argument("--id")
+    project.add_argument("--repository")
+    project.add_argument("--state", choices=portfolio.PROJECT_STATES)
+    project.add_argument("--priority", type=int, default=portfolio.DEFAULT_PRIORITY)
+    project.add_argument("--cap", type=int, default=portfolio.DEFAULT_PROJECT_CONCURRENCY)
+    project.add_argument("--budget", type=float)
+    project.add_argument("--currency")
+    project.add_argument("--context-ceiling", type=int)
+    project.add_argument("--policy-version", default="unset")
+
+    pf = sub.add_parser("portfolio")
+    pf.add_argument("--concurrency", type=int)
+    pf.add_argument("--aging", type=float)
+    pf.add_argument("--policy-version")
+    pf.add_argument("--emergency-stop", action="store_true")
+    pf.add_argument("--resume", action="store_true")
+
+    depend = sub.add_parser("depend")
+    depend.add_argument("mission_id")
+    depend.add_argument("--on", required=True, dest="depends_on")
+    depend.add_argument("--on-failure", choices=portfolio.ON_FAILURE, default="block")
+    deps = sub.add_parser("deps")
+    deps.add_argument("mission_id")
+    sub.add_parser("schedule")
+    coordination = sub.add_parser("coordination")
+    coordination.add_argument("mission_id", nargs="?")
+    coordination.add_argument("--limit", type=int, default=200)
+    pfe = sub.add_parser("portfolio-economics")
+    pfe.add_argument("--project", default=None)
+    advise = sub.add_parser("advise")
+    advise.add_argument("--proposals", type=Path,
+                        help="a JSON advisor response to replay deterministically")
+    advise.add_argument("--endpoint", help="an advisory HTTP endpoint to consult instead")
+    advise.add_argument("--policy", type=Path, help="the Owner's advisor policy, as JSON")
+    advise.add_argument("--probe", action="store_true",
+                        help="report endpoint presence without consulting it")
     return p
 
 
@@ -82,6 +123,54 @@ def main(argv: list[str] | None = None) -> int:
         print(json.dumps(store.economics(args.corpus), sort_keys=True))
     elif args.command == "cancel":
         print(json.dumps({"state": store.cancel(args.mission_id)}))
+    elif args.command == "project":
+        if args.action == "list":
+            print(json.dumps({key: value.as_row() for key, value in store.projects().items()},
+                             sort_keys=True))
+        elif args.action == "state":
+            print(json.dumps(store.set_project_state(args.id, args.state), sort_keys=True))
+        else:
+            print(json.dumps(store.register_project(portfolio.ProjectPolicy(
+                project_id=args.id, repository=args.repository,
+                state=args.state or "enabled", priority=args.priority,
+                concurrency_cap=args.cap, budget_ceiling=args.budget,
+                budget_currency=args.currency, context_ceiling_bytes=args.context_ceiling,
+                policy_version=args.policy_version)), sort_keys=True))
+    elif args.command == "portfolio":
+        current = store.portfolio_policy()
+        if args.emergency_stop or args.resume:
+            print(json.dumps(store.emergency_stop(bool(args.emergency_stop)), sort_keys=True))
+        elif args.concurrency is None and args.aging is None and args.policy_version is None:
+            print(json.dumps(current.as_row(), sort_keys=True))
+        else:
+            print(json.dumps(store.set_portfolio_policy(portfolio.PortfolioPolicy(
+                portfolio_concurrency=current.portfolio_concurrency if args.concurrency is None
+                else args.concurrency,
+                emergency_stop=current.emergency_stop,
+                aging_seconds=current.aging_seconds if args.aging is None else args.aging,
+                policy_version=current.policy_version if args.policy_version is None
+                else args.policy_version)), sort_keys=True))
+    elif args.command == "depend":
+        print(json.dumps(store.add_dependency(args.mission_id, args.depends_on,
+                                              on_failure=args.on_failure), sort_keys=True))
+    elif args.command == "deps":
+        print(json.dumps(store.dependency_status(args.mission_id), sort_keys=True))
+    elif args.command == "schedule":
+        print(json.dumps(store.schedule_preview(), sort_keys=True))
+    elif args.command == "coordination":
+        print(json.dumps(store.coordination(args.mission_id, limit=args.limit), sort_keys=True))
+    elif args.command == "portfolio-economics":
+        print(json.dumps(store.portfolio_economics(args.project), sort_keys=True))
+    elif args.command == "advise":
+        endpoint = advisory.endpoint_advisor(args.endpoint) if args.endpoint else None
+        if args.probe:
+            print(json.dumps((endpoint or advisory.endpoint_advisor()).probe(), sort_keys=True))
+            return 0
+        port = endpoint
+        if args.proposals:
+            port = advisory.StaticAdvisor(json.loads(args.proposals.read_text()))
+        policy = json.loads(args.policy.read_text()) if args.policy else {}
+        print(json.dumps(advisory.coordinate(store, port, policy), sort_keys=True))
     elif args.command == "harness":
         ids = []
         for index in range(args.missions):

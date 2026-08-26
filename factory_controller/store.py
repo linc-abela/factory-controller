@@ -40,6 +40,16 @@ class LeaseLostError(RuntimeError):
     """A worker attempted to mutate a mission after losing its lease."""
 
 
+class _Refused(Exception):
+    """A refusal carried out of a transaction so its explanation can outlive it."""
+
+    def __init__(self, code: str, detail: dict[str, Any], mission_id: str | None,
+                 project_id: str | None) -> None:
+        super().__init__(code)
+        self.code, self.detail = code, detail
+        self.mission_id, self.project_id = mission_id, project_id
+
+
 def canonical_json(value: Any) -> str:
     return json.dumps(value, sort_keys=True, separators=(",", ":"), ensure_ascii=True)
 
@@ -880,17 +890,31 @@ class MissionStore:
                        on_failure: str = "block") -> dict[str, Any]:
         if on_failure not in portfolio.ON_FAILURE:
             raise portfolio.PolicyError("on_failure must be one of %s" % (portfolio.ON_FAILURE,))
+        try:
+            return self._add_dependency(mission_id, depends_on, on_failure)
+        except _Refused as refusal:
+            self.coordinate(refusal.mission_id, refusal.project_id, "dependency",
+                            refusal.code, refusal.detail)
+            raise portfolio.PolicyError(
+                "%s: %s" % (refusal.code, " -> ".join(refusal.detail.get("cycle", ())))) from None
+
+    def _add_dependency(self, mission_id: str, depends_on: str,
+                        on_failure: str) -> dict[str, Any]:
         with self.transaction() as db:
             for identifier in (mission_id, depends_on):
                 if db.execute("SELECT 1 FROM missions WHERE id=?", (identifier,)).fetchone() is None:
                     raise KeyError(identifier)
             edges = _edges_locked(db)
             cycle = portfolio.cycle_path(edges, mission_id, depends_on)
+            project = self._project_of(db, mission_id)
             if cycle:
-                self._coordination_locked(db, mission_id, self._project_of(db, mission_id),
-                                          "dependency", "DEPENDENCY_CYCLE",
-                                          {"cycle": list(cycle), "depends_on": depends_on})
-                raise portfolio.PolicyError("DEPENDENCY_CYCLE: " + " -> ".join(cycle))
+                # Recorded *after* this transaction rolls back, not inside it.
+                # Writing the explanation next to the refusal loses it: the
+                # raise unwinds the transaction and takes the coordination row
+                # with it, leaving a refusal nobody can read afterwards.
+                raise _Refused("DEPENDENCY_CYCLE",
+                               {"cycle": list(cycle), "depends_on": depends_on},
+                               mission_id, project)
             released = db.execute("SELECT state FROM missions WHERE id=?", (depends_on,)).fetchone()
             now = self.clock()
             db.execute(
@@ -902,8 +926,8 @@ class MissionStore:
             detail = {"mission_id": mission_id, "depends_on": depends_on,
                       "on_failure": on_failure,
                       "already_satisfied": released["state"] == portfolio.SATISFIED}
-            self._coordination_locked(db, mission_id, self._project_of(db, mission_id),
-                                      "dependency", "DEPENDENCY_DECLARED", detail)
+            self._coordination_locked(db, mission_id, project, "dependency",
+                                      "DEPENDENCY_DECLARED", detail)
         return detail
 
     def dependencies(self, mission_id: str) -> list[dict[str, Any]]:
