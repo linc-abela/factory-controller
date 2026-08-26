@@ -13,6 +13,15 @@ for live mission state; Notion is not read by runtime code.
 ./dev --db controller.db telemetry MISSION_ID
 ./dev --db controller.db context MISSION_ID
 ./dev --db controller.db economics [--corpus CORPUS_IDENTITY]
+./dev --db controller.db project register --id P --repository repo://P [--priority N]
+./dev --db controller.db project state --id P --state paused|draining|enabled|stopped
+./dev --db controller.db portfolio [--concurrency N] [--aging S] [--emergency-stop|--resume]
+./dev --db controller.db depend MISSION --on PREREQUISITE [--on-failure block|cancel|ignore]
+./dev --db controller.db deps MISSION
+./dev --db controller.db schedule
+./dev --db controller.db coordination [MISSION]
+./dev --db controller.db portfolio-economics [--project P]
+./dev --db controller.db advise --probe | --proposals FILE [--policy FILE]
 ./dev --db harness --missions 10
 ./dev test
 ```
@@ -173,3 +182,119 @@ FACTORY_CONTEXT_BROKER_CACHE=/path/to/cache \
 The broker resolves context at the mission's own `baseline_sha` and refuses a
 manifest whose head is not the checkout's `HEAD`, so the target checkout must be
 at that commit.
+
+## The portfolio
+
+Stage 4 asked whether one mission may proceed.  Stage 5 adds the second
+question -- *which* one, across projects competing for one host -- and
+`portfolio.py` is the whole of the answer.  It dispatches nothing, opens
+nothing, and talks to nothing; it is a decision over durable rows.
+
+A project is an identity, a repository binding, a state, a priority, a
+concurrency cap, and optional spending and context ceilings, under a named Owner
+policy version.  A mission with no `project_id` keeps the Stage-4 meaning: it is
+scheduled under portfolio limits alone.
+
+```sh
+./dev --db c.db project register --id urgent --repository repo://urgent \
+      --priority 1 --cap 1 --budget 25 --currency USD --policy-version SF-137:v1
+./dev --db c.db depend fm_child --on fm_parent
+./dev --db c.db schedule          # what the scheduler would pick, and why not the rest
+```
+
+### Ordering and fairness
+
+Priority is an ordering position: lower runs first, compared and never
+multiplied.  Fairness is unbounded ageing -- a mission's effective position
+improves by one step for every `aging_seconds` it has waited, without limit --
+so for any pair of priorities there is a finite wait after which the lower one
+wins.  Permanent starvation is therefore impossible rather than unlikely, and
+because the rule is a pure function of two durable numbers, two workers reading
+the same database reach the same answer.
+
+Scheduling happens *inside* the claiming transaction.  The Stage-2 guarantee
+that no two workers claim one mission is inherited rather than re-implemented,
+and a second scheduler could not produce a duplicate claim if one existed.
+
+### Dependencies
+
+Edges point from a mission to what it waits for.  There is no `blocked` mission
+state: ready/waiting/blocked is derived from the edges every time it is asked,
+so the reading cannot drift away from the graph.  A cycle is refused at
+declaration with the path that would have closed it.  Release is guarded on
+`released_at IS NULL` inside the transaction, so an edge releases exactly once.
+
+Only `completed` satisfies a prerequisite; a cancelled mission produced no
+artifact either.  Each edge declares `block` (the default, and a pure
+derivation that writes nothing), `cancel`, or `ignore`.
+
+### Pause, drain, and emergency stop
+
+`paused`, `draining` and `stopped` all stop *new* claims and differ only in
+declared intent, which is honest: `drained` is the one place they diverge.
+Portfolio-wide emergency stop is one boolean checked ahead of every other gate.
+
+None of them touch a mission row, and all of them still allow a mission past the
+dispatch boundary to be resumed -- orphaning a provider run that already had
+effects is the durable-state corruption a stop exists to prevent, not the cure.
+
+### Advisory coordination
+
+`advisor.py` holds the port intended for Hermes.  An advisor may propose; it
+may never decide.  `coordinate()` lives there and nothing in `engine.py`
+imports it, which is enforced by `tests/test_authority_boundaries.py`: the
+scheduling path has no way to reach an advisor, so "the Factory schedules
+deterministically without one" is structural rather than tested.
+
+Of five proposal kinds, two can move durable state -- a dependency edge and a
+project priority inside the Owner's bounds.  The others are recorded and change
+nothing, each for a structural reason: the bridge selects profiles from its own
+registry, a child mission needs admission fields an advisor may not supply, and
+the scheduler is a pure function that does not read a hint.
+
+Hermes 0.19.0 is running on this host and its kanban orchestration plugin
+exposes the advisory verbs this port names.  It is not usable from here: every
+`/api` route answers `401`, while its own unauthenticated `/api/status` reports
+`auth_required: false`.  The missing thing is an Owner session credential, which
+stays outside Controller durable state.  `./dev advise --probe` reports presence
+without consulting anything.
+
+## The model gateway
+
+`gateway.py` admits an OpenRouter-backed execution profile.  A gateway supplies
+inference; a bounded execution adapter performs admitted repository actions --
+the gateway never reaches a filesystem, a shell, a Git admission, evidence, or
+a deployment.
+
+An admitted gateway profile is an ordinary candidate placed after the direct
+harnesses in declared order, so "prefer a direct harness, fall back to the
+gateway before dispatch" is the existing selector plus the existing side-effect
+boundary, not a second rule.  `openrouter/auto` is never an implicit default: an
+implicit model cannot be allowlisted, priced, or reproduced.  Cross-model
+fallback must be declared by Factory policy, and a reported model outside the
+allowlist and the declared fallback order fails the mission
+(`GATEWAY_UNDECLARED_MODEL_SUBSTITUTION`) whoever performed the substitution.
+
+`may_reroute` adds the one gate the side-effect boundary lacked.  A refusal code
+that *names an unknowable outcome* -- a timeout, a malformed body -- loses to
+the layer's `process_started: false` claim, because a request that timed out may
+have been served.
+
+Gateway receipts carry the gateway, requested and actual model, actual provider,
+generation identity, reported tokens, exact cost with its currency, retries and
+declared fallbacks.  Anything the gateway did not report stays one of Evidence
+Core's four canonical absence words: never `0`, never an estimate, and never an
+echo of the request -- an echoed `actual_model` would hide a failover entirely.
+
+Disabling or removing the gateway configuration does not break direct-harness
+operation, and the same logical mission runs either way without a change to the
+mission or evidence contracts.
+
+## Portfolio economics
+
+`./dev portfolio-economics` combines two fact classes that are never blended:
+measured context bytes from the broker, and priced provider spend from receipts.
+A leg's cost is counted once -- the provider-neutral `usage` figure is preferred
+and a gateway's own priced figure is used only where `usage` reported none, since
+they describe the same money.  Unpriced legs are counted and contribute nothing.
+Two currencies are reported side by side and never converted.
