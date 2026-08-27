@@ -297,7 +297,7 @@ def privacy_refusal(facts: dict[str, Any] | None, policy: GatewayPolicy) -> str 
 # reconciliation with factory-bridge
 # --------------------------------------------------------------------------- #
 
-#: The receipt schema ``factory-bridge`` cb1d02b7 emits from
+#: The receipt schema ``factory-bridge`` emits from
 #: ``src/factory_bridge/openrouter.py``.  Reproduced, not imported: neither
 #: repository depends on the other, which is the point of the boundary.
 BRIDGE_RECEIPT_SCHEMA = "factory.bridge.metered_execution_receipt.v1"
@@ -361,10 +361,9 @@ def reconcile_bridge_receipt(raw: Any) -> dict[str, Any] | None:
     ``cost_amount_text`` keeps their value verbatim and ``cost_amount`` is the
     float the budget arithmetic uses.
 
-    *The provider.*  They report ``provider_allowlist`` -- who *may* serve --
-    and never which provider did.  That is a different fact from
-    ``actual_provider``, so the allowlist is carried under its own name and
-    ``actual_provider`` stays ``unknown`` rather than being filled from it.
+    *The provider.*  Final bridge receipts report the serving provider beside
+    the allow/deny policy.  Older v1 receipts reported only the allowlist, so
+    their serving provider remains ``unknown`` rather than being invented.
     """
 
     if not isinstance(raw, dict) or raw.get("schema_version") != BRIDGE_RECEIPT_SCHEMA:
@@ -374,15 +373,24 @@ def reconcile_bridge_receipt(raw: Any) -> dict[str, Any] | None:
     exact_usage = usage.get("precision") == "exact"
     text = cost.get("usd")
     exact_cost = cost.get("precision") == "exact" and isinstance(text, str) and bool(text)
+    generation_ids = raw.get("generation_ids")
+    generation_id = (generation_ids[0]
+                     if isinstance(generation_ids, (list, tuple))
+                     and generation_ids and isinstance(generation_ids[0], str)
+                     else None)
     return {
         "gateway": "openrouter",
         "receipt_schema": BRIDGE_RECEIPT_SCHEMA,
-        "requested_model": _absent_or(_optional_string(raw.get("model"))),
-        "actual_model": _absent_or(_optional_string(raw.get("model"))),
-        "actual_provider": "unknown",
+        "requested_model": _absent_or(_optional_string(
+            raw.get("requested_model") or raw.get("model"))),
+        "actual_model": _absent_or(_optional_string(
+            raw.get("actual_model") or raw.get("model"))),
+        "actual_provider": _absent_or(_optional_string(raw.get("actual_provider"))),
         "provider_allowlist": tuple(item for item in raw.get("provider_allowlist") or ()
                                     if isinstance(item, str)),
-        "generation_id": "unknown",
+        "provider_denylist": tuple(item for item in raw.get("provider_denylist") or ()
+                                   if isinstance(item, str)),
+        "generation_id": _absent_or(generation_id),
         "input_tokens": _absent_or(_non_negative_int(usage.get("prompt_tokens")))
         if exact_usage else "unknown",
         "output_tokens": _absent_or(_non_negative_int(usage.get("completion_tokens")))
@@ -396,9 +404,11 @@ def reconcile_bridge_receipt(raw: Any) -> dict[str, Any] | None:
         "turns": _absent_or(_non_negative_int(raw.get("turns"))),
         "commands": _absent_or(_non_negative_int(raw.get("commands"))),
         "transcript_hash": _absent_or(_optional_string(raw.get("transcript_hash"))),
-        "retries": "unknown",
+        "retries": _absent_or(_non_negative_int(raw.get("retry_count"))),
         "fallback_models": (),
-        "privacy_enforced": (),
+        "privacy_enforced": (
+            ("zero_data_retention",)
+            if raw.get("zero_data_retention_required") is True else ()),
         "evidence_class": "reported_claim",
     }
 

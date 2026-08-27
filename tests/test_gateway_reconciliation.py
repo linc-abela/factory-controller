@@ -1,20 +1,12 @@
 """Reconciliation against the landed `factory-bridge` OpenRouter surface.
 
-Read against `factory-bridge` `cb1d02b7bd0efe55301d5a6b6a71584445647d8a`
-(SF-137C), whose `src/factory_bridge/openrouter.py` is a metered tool loop with
-its own receipt schema.  Both sides built a model-gateway contract in parallel
-and neither could see the other, so what matters is what survives the wire.
+The bridge and Controller built their model-gateway contracts in parallel, so
+this suite records what survives their final wire reconciliation.
 
 Three facts are recorded here as executable checks rather than as prose.
 
-**GR-1.  The executor has no caller on the bridge's request path.**  At
-cb1d02b7, `openrouter.py` is imported by `tests/test_openrouter.py` and by
-nothing in `src/` -- not `adapter.py`, `service.py`, `provider.py` or
-`protocol.py` -- so a metered gateway execution cannot yet be *requested*
-through the bridge protocol, and no `metered_execution_receipt.v1` reaches a
-Controller over the wire.  This Controller's seam is therefore specified and
-tested against a translation of their frozen record shape.  That is a
-sequencing fact about parallel work, not a defect in it.
+**GR-1.  The executor uses the bridge's normal adapter path.**  Its receipt is
+translated at this boundary rather than carried inward as a second dialect.
 
 **GR-2.  Only three refusal codes are marked pre-spawn.**  `OpenRouterError`
 defaults `dispatch_started=True`, and exactly `CONTEXT_TOO_LARGE`,
@@ -26,13 +18,9 @@ whichever side failed to prove it.  The consequence is recorded below, because
 it means the brief's pre-dispatch gateway selection cannot be driven by those
 two codes as the bridge reports them today.
 
-**GR-3.  The bridge reports a provider allowlist, never a serving provider,
-and no data-policy enforcement at all.**  So `actual_provider` stays `unknown`
-rather than being filled in from the allowlist, and a mission requiring
-zero-data-retention is refused against a real bridge receipt.  Failing closed
-is the correct outcome; it is recorded so nobody reads the refusal as a bug.
-
-Nothing is edited in the sibling's repository.
+**GR-3.  Final receipts distinguish actual routing from policy.**  The serving
+provider, allow/deny policy, and zero-data-retention requirement are carried as
+separate facts; older v1 receipts continue to fail closed where silent.
 """
 
 from __future__ import annotations
@@ -67,6 +55,19 @@ BRIDGE_RECEIPT = {
     "cost": {"usd": "0.01824000", "precision": "exact"},
     "candidate_sha": "b" * 40,
     "transcript_hash": "c" * 64,
+}
+
+FINAL_BRIDGE_RECEIPT = {
+    **BRIDGE_RECEIPT,
+    "requested_model": SLUG,
+    "actual_model": SLUG,
+    "actual_provider": "vendor-a",
+    "provider_denylist": ["vendor-c"],
+    "zero_data_retention_required": True,
+    "generation_ids": ["generation-1"],
+    "request_ids": ["request-1"],
+    "retry_count": 0,
+    "fallback_count": 0,
 }
 
 
@@ -114,6 +115,21 @@ class SchemaTests(unittest.TestCase):
         facts = gateway.reconcile_bridge_receipt(BRIDGE_RECEIPT)
         self.assertEqual(facts["provider_allowlist"], ("vendor-a", "vendor-b"))
         self.assertEqual(facts["actual_provider"], "unknown")
+
+    def test_final_routing_and_privacy_facts_survive_the_translation(self):
+        facts = gateway.reconcile_bridge_receipt(FINAL_BRIDGE_RECEIPT)
+        self.assertEqual(facts["requested_model"], SLUG)
+        self.assertEqual(facts["actual_model"], SLUG)
+        self.assertEqual(facts["actual_provider"], "vendor-a")
+        self.assertEqual(facts["provider_denylist"], ("vendor-c",))
+        self.assertEqual(facts["generation_id"], "generation-1")
+        self.assertEqual(facts["retries"], 0)
+        self.assertEqual(facts["privacy_enforced"], ("zero_data_retention",))
+
+    def test_malformed_generation_ids_do_not_become_invented_identifiers(self):
+        facts = gateway.reconcile_bridge_receipt({
+            **FINAL_BRIDGE_RECEIPT, "generation_ids": "generation-1"})
+        self.assertEqual(facts["generation_id"], "unknown")
 
     def test_a_bridge_receipt_is_read_through_the_one_entry_point(self):
         self.assertEqual(gateway.facts_from_response(BRIDGE_RECEIPT, None),
@@ -174,11 +190,15 @@ class EndToEndBridgeShapeTests(RouteTestCase, unittest.TestCase):
         self.assertEqual(facts["transcript_hash"], "c" * 64)
 
     def test_a_zero_data_retention_requirement_fails_closed_against_the_bridge(self):
-        """GR-3: the bridge confirms no data policy, so the mission stops."""
+        """An older v1 receipt stays fail-closed where it is silent."""
 
         mission, _ = self.run_with(BRIDGE_RECEIPT)
         self.assertEqual(mission["state"], "refused")
         self.assertIn("GATEWAY_PRIVACY_NOT_CONFIRMED", mission["terminal_reason"])
+
+    def test_final_bridge_privacy_fact_satisfies_the_controller_policy(self):
+        mission, _ = self.run_with(FINAL_BRIDGE_RECEIPT, key="final-bridge-shape")
+        self.assertEqual(mission["state"], "completed")
 
     def test_a_bridge_priced_leg_counts_once_toward_a_project_budget(self):
         """`usage` reported nothing here, so the gateway's own figure is used."""
