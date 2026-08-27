@@ -9,6 +9,7 @@ import sys
 import time
 from pathlib import Path
 
+from . import activation
 from . import advisor as advisory
 from . import improvement as imp
 from . import maintenance as mnt
@@ -205,7 +206,8 @@ def parser() -> argparse.ArgumentParser:
         "status", "policy", "policies", "enable", "disable", "cycle", "start",
         "pause", "resume", "drain", "stop", "emergency-stop", "clear-emergency",
         "hold", "release", "clear-health", "brief", "cycles", "selections",
-        "transitions", "service"))
+        "transitions", "service", "service-plan", "service-install",
+        "service-doctor", "service-uninstall", "approval"))
     sup_parser.add_argument("--project", dest="sup_project")
     sup_parser.add_argument("--worker", dest="sup_worker", default="supervisor")
     sup_parser.add_argument("--actor", dest="sup_actor", default="owner")
@@ -240,6 +242,19 @@ def parser() -> argparse.ArgumentParser:
     sup_parser.add_argument("--limit", type=int, dest="sup_limit", default=50)
     sup_parser.add_argument("--policy-version", dest="sup_policy_version",
                             default="unset")
+    sup_parser.add_argument("--label", dest="sup_label",
+                            default=activation.DEFAULT_LABEL)
+    sup_parser.add_argument("--agents-dir", dest="sup_agents_dir",
+                            default=str(Path.home() / "Library" / "LaunchAgents"))
+    sup_parser.add_argument("--state-dir", dest="sup_state_dir",
+                            default=str(Path.home() / ".factory-controller"))
+    sup_parser.add_argument("--working-dir", dest="sup_working_dir",
+                            default=str(Path.cwd()))
+    sup_parser.add_argument("--approval", dest="sup_approval",
+                            help="path to a durable Owner activation approval")
+    sup_parser.add_argument("--apply", dest="sup_apply", action="store_true",
+                            help="write the service files; without it nothing "
+                                 "is written and the plan is printed")
     return p
 
 
@@ -574,10 +589,13 @@ def _supervisor(args, controller) -> int:
             result = list(plane.transitions())
         elif args.action == "selections":
             result = list(plane.selections(args.sup_cycle))
+        elif args.action == "approval":
+            result = activation.approval(args.sup_approval, label=args.sup_label)
+        elif args.action.startswith("service-"):
+            return _supervisor_service(args, plane)
         else:
             result = plane.service_contract(
-                invocation=[sys.executable, "-m", "factory_controller.cli",
-                            "--db", args.db, "supervisor", "cycle"],
+                invocation=_service_invocation(args),
                 interval_seconds=args.sup_interval)
     except sup.SupervisorRefusal as refusal:
         print(json.dumps({"refused": refusal.as_row()}, sort_keys=True))
@@ -587,6 +605,58 @@ def _supervisor(args, controller) -> int:
                                       "detail": str(exc)}}, sort_keys=True))
         return 2
     print(json.dumps(result, sort_keys=True, default=str))
+    return 0
+
+
+def _service_invocation(args) -> list[str]:
+    return [sys.executable, "-m", "factory_controller.cli",
+            "--db", args.db, "supervisor", "cycle"]
+
+
+def _supervisor_service(args, plane) -> int:
+    """Install, inspect or remove the host service.  It never loads one.
+
+    ``--apply`` is required to write anything, and an apply is refused unless a
+    durable Owner approval already says this host may run the supervisor --
+    scope 5 of SF-142, expressed where it can be checked rather than promised.
+    Even with both, the job definition is written and nothing is started: the
+    activation step is returned as text for the Owner to run.
+    """
+
+    contract = plane.service_contract(invocation=_service_invocation(args),
+                                      interval_seconds=args.sup_interval)
+    try:
+        plan = activation.from_contract(
+            contract, agents_dir=args.sup_agents_dir,
+            state_dir=args.sup_state_dir, working_dir=args.sup_working_dir,
+            label=args.sup_label)
+    except activation.ActivationError as exc:
+        print(json.dumps({"refused": {"code": "SUPERVISOR_SERVICE_PLAN_INVALID",
+                                      "detail": str(exc)}}, sort_keys=True))
+        return 2
+    granted = activation.approval(args.sup_approval, label=plan.label)
+    if args.action == "service-doctor":
+        print(json.dumps({**activation.doctor(plan), "approval": granted},
+                         sort_keys=True))
+        return 0
+    if args.action == "service-uninstall":
+        print(json.dumps(activation.uninstall(plan, apply=args.sup_apply),
+                         sort_keys=True))
+        return 0
+    if args.action == "service-plan" or not args.sup_apply:
+        print(json.dumps({**activation.install(plan, apply=False),
+                          "approval": granted}, sort_keys=True))
+        return 0
+    if not granted["approved"]:
+        print(json.dumps({"refused": {
+            "code": "SUPERVISOR_ACTIVATION_UNAPPROVED",
+            "detail": "writing the host service needs a durable Owner "
+                      "approval; %s" % granted["detail"],
+            "approval": granted,
+            "activation": activation.activation_command(plan)}}, sort_keys=True))
+        return 2
+    print(json.dumps({**activation.install(plan, apply=True),
+                      "approval": granted}, sort_keys=True))
     return 0
 
 
