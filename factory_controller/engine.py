@@ -442,9 +442,10 @@ class Controller:
     # the mission
     # ------------------------------------------------------------------ #
 
-    def work_once(self, worker_id: str) -> dict[str, Any] | None:
+    def work_once(self, worker_id: str, *, resume_only: bool = False) -> dict[str, Any] | None:
         self.store.recover_stale()
-        mission = self.store.claim(worker_id, lease_seconds=self.lease_seconds)
+        mission = self.store.claim(worker_id, lease_seconds=self.lease_seconds,
+                                   resume_only=resume_only)
         if mission is None:
             return None
         mission_id, token = mission["id"], mission["lease_token"]

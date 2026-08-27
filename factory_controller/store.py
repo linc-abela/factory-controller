@@ -294,7 +294,8 @@ class MissionStore:
         with self.connect() as db:
             return self._row(db.execute("SELECT * FROM missions WHERE id=?", (mission_id,)).fetchone())
 
-    def claim(self, worker_id: str, *, lease_seconds: float = 30) -> dict[str, Any] | None:
+    def claim(self, worker_id: str, *, lease_seconds: float = 30,
+              resume_only: bool = False) -> dict[str, Any] | None:
         """Take the lease on the one mission the portfolio scheduler picked.
 
         Scheduling happens *inside* the claiming transaction, not in a separate
@@ -303,12 +304,21 @@ class MissionStore:
         running the identical scheduler concurrently either loses the write and
         returns ``None``, or sees the first worker's lease and schedules around
         it -- there is no window in which both succeed.
+
+        ``resume_only`` is what a drain is.  It narrows the candidate set to
+        missions that already crossed the dispatch boundary *before* the
+        scheduler runs, inside the same transaction, so there is no read-then-act
+        window in which a drain could still start something new.  It reuses
+        ``MissionCandidate.resume`` rather than a second definition of "already
+        in flight", because a drain that disagreed with the scheduler about which
+        missions those are would abandon exactly the half-finished work it exists
+        to protect.
         """
 
         now = self.clock()
         token = str(uuid.uuid4())
         with self.transaction() as db:
-            decision = self._schedule_locked(db, now)
+            decision = self._schedule_locked(db, now, resume_only=resume_only)
             if decision.verdicts:
                 # An idle poll with nothing to consider writes nothing; a poll
                 # that passed over real work explains why, once, in one row.
@@ -1034,7 +1044,8 @@ class MissionStore:
 
     # -- scheduling ------------------------------------------------------ #
 
-    def _schedule_locked(self, db: sqlite3.Connection, now: float) -> portfolio.ScheduleDecision:
+    def _schedule_locked(self, db: sqlite3.Connection, now: float,
+                         *, resume_only: bool = False) -> portfolio.ScheduleDecision:
         rows = db.execute(
             "SELECT id,project_id,priority,state,created_at,next_run_at FROM missions"
             " WHERE state IN ('admitted','dispatched','candidate_verified','evaluated','evidence_sealed')"
@@ -1064,6 +1075,10 @@ class MissionStore:
                 prerequisites=tuple(portfolio.Prerequisite(*item)
                                     for item in edges.get(row["id"], ())))
             for row in rows)
+        if resume_only:
+            candidates = tuple(item for item in candidates if item.resume)
+            if not candidates:
+                return portfolio.ScheduleDecision(None, "DRAINED_NO_RESUMABLE_MISSION", ())
         snapshot = portfolio.Snapshot(
             portfolio=_portfolio_policy(db.execute("SELECT * FROM portfolio WHERE id=1").fetchone()),
             projects={row["project_id"]: _project_policy(row)

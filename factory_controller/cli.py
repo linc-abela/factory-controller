@@ -14,6 +14,7 @@ from . import improvement as imp
 from . import maintenance as mnt
 from . import portfolio
 from . import production
+from . import supervisor as sup
 from .adapter import JsonProcessAdapter
 from .engine import Controller, RetryPolicy
 from .store import MissionStore
@@ -191,6 +192,47 @@ def parser() -> argparse.ArgumentParser:
     mnt_parser.add_argument("--disposition", choices=mnt.DISPOSITIONS)
     mnt_parser.add_argument("--reason", dest="mnt_reason", default="operator")
     mnt_parser.add_argument("--policy-version", dest="mnt_policy_version",
+                            default="unset")
+
+    sup_parser = sub.add_parser("supervisor")
+    sup_parser.add_argument("action", choices=(
+        "status", "policy", "policies", "enable", "disable", "cycle", "start",
+        "pause", "resume", "drain", "stop", "emergency-stop", "clear-emergency",
+        "hold", "release", "clear-health", "brief", "cycles", "selections",
+        "transitions", "service"))
+    sup_parser.add_argument("--project", dest="sup_project")
+    sup_parser.add_argument("--worker", dest="sup_worker", default="supervisor")
+    sup_parser.add_argument("--actor", dest="sup_actor", default="owner")
+    sup_parser.add_argument("--reason", dest="sup_reason", default="operator")
+    sup_parser.add_argument("--evidence", dest="sup_evidence",
+                            default="not_applicable")
+    sup_parser.add_argument("--class", action="append", default=[],
+                            dest="sup_classes", choices=sup.WORK_CLASSES,
+                            help="a work class this project allows; repeatable")
+    sup_parser.add_argument("--missions-per-cycle", type=int,
+                            dest="sup_missions",
+                            default=sup.DEFAULT_MISSIONS_PER_CYCLE)
+    sup_parser.add_argument("--maintenance-admissions", type=int,
+                            dest="sup_maintenance",
+                            default=sup.DEFAULT_MAINTENANCE_ADMISSIONS)
+    sup_parser.add_argument("--improvement-admissions", type=int,
+                            dest="sup_improvement",
+                            default=sup.DEFAULT_IMPROVEMENT_ADMISSIONS)
+    sup_parser.add_argument("--window-start", type=int, dest="sup_window_start")
+    sup_parser.add_argument("--window-end", type=int, dest="sup_window_end")
+    sup_parser.add_argument("--failure-threshold", type=int,
+                            dest="sup_threshold",
+                            default=sup.DEFAULT_FAILURE_THRESHOLD)
+    sup_parser.add_argument("--suppression-seconds", type=float,
+                            dest="sup_suppression",
+                            default=sup.DEFAULT_SUPPRESSION_SECONDS)
+    sup_parser.add_argument("--lease-seconds", type=float, dest="sup_lease",
+                            default=sup.DEFAULT_CYCLE_LEASE_SECONDS)
+    sup_parser.add_argument("--interval-seconds", type=int, dest="sup_interval",
+                            default=300)
+    sup_parser.add_argument("--cycle", dest="sup_cycle")
+    sup_parser.add_argument("--limit", type=int, dest="sup_limit", default=50)
+    sup_parser.add_argument("--policy-version", dest="sup_policy_version",
                             default="unset")
     return p
 
@@ -437,6 +479,83 @@ def _improvement(args, controller) -> int:
     return 0
 
 
+def _supervisor(args, controller) -> int:
+    """The Owner's own surface onto Stage 9.
+
+    ``cycle`` is the only verb that causes anything, and it causes exactly one
+    bounded cycle: the command returns and nothing is left running.  There is
+    deliberately no verb here that approves a release, widens a policy, changes
+    a protected surface, or installs a host service -- each of those is an act
+    an earlier stage already made an explicit Owner decision, and offering a
+    shortcut to it from the always-on surface is precisely how an operating
+    layer would acquire authority it was never granted.
+    """
+
+    plane = sup.OperationsSupervisor(controller)
+    transitions = {"start": "running", "resume": "running", "pause": "paused",
+                   "drain": "draining", "stop": "stopped",
+                   "emergency-stop": "emergency_stopped",
+                   "clear-emergency": "stopped"}
+    try:
+        if args.action == "status":
+            result = plane.control()
+        elif args.action == "policy":
+            if args.sup_project and not args.sup_classes \
+                    and args.sup_policy_version == "unset" \
+                    and args.sup_window_start is None:
+                current = plane.policy(args.sup_project)
+                if current is not None:
+                    print(json.dumps(current.as_row(), sort_keys=True))
+                    return 0
+            result = plane.set_policy(sup.SupervisorPolicy(
+                project_id=args.sup_project,
+                work_classes=tuple(args.sup_classes) or sup.WORK_CLASSES,
+                missions_per_cycle=args.sup_missions,
+                maintenance_admissions=args.sup_maintenance,
+                improvement_admissions=args.sup_improvement,
+                window_start_hour=args.sup_window_start,
+                window_end_hour=args.sup_window_end,
+                failure_threshold=args.sup_threshold,
+                suppression_seconds=args.sup_suppression,
+                policy_version=args.sup_policy_version))
+        elif args.action == "policies":
+            result = [policy.as_row() for policy in plane.policies()]
+        elif args.action in ("enable", "disable"):
+            result = plane.set_enabled(args.sup_project, args.action == "enable")
+        elif args.action == "cycle":
+            result = plane.cycle(args.sup_worker, lease_seconds=args.sup_lease)
+        elif args.action in transitions:
+            result = plane.transition(transitions[args.action],
+                                      actor=args.sup_actor, reason=args.sup_reason,
+                                      evidence_ref=args.sup_evidence)
+        elif args.action in ("hold", "release"):
+            result = plane.hold(args.sup_project, held=args.action == "hold")
+        elif args.action == "clear-health":
+            result = plane.clear_health(args.sup_project, actor=args.sup_actor)
+        elif args.action == "brief":
+            result = plane.brief()
+        elif args.action == "cycles":
+            result = list(plane.cycles(limit=args.sup_limit))
+        elif args.action == "transitions":
+            result = list(plane.transitions())
+        elif args.action == "selections":
+            result = list(plane.selections(args.sup_cycle))
+        else:
+            result = plane.service_contract(
+                invocation=[sys.executable, "-m", "factory_controller.cli",
+                            "--db", args.db, "supervisor", "cycle"],
+                interval_seconds=args.sup_interval)
+    except sup.SupervisorRefusal as refusal:
+        print(json.dumps({"refused": refusal.as_row()}, sort_keys=True))
+        return 2
+    except sup.PolicyError as exc:
+        print(json.dumps({"refused": {"code": "SUPERVISOR_POLICY_INVALID",
+                                      "detail": str(exc)}}, sort_keys=True))
+        return 2
+    print(json.dumps(result, sort_keys=True, default=str))
+    return 0
+
+
 def _improvement_policy(declared: dict) -> "imp.ImprovementPolicy":
     """Turn a declaration file into a policy, keeping the tuples tuples."""
 
@@ -536,6 +655,8 @@ def main(argv: list[str] | None = None) -> int:
         return _maintenance(args, controller)
     elif args.command == "improvement":
         return _improvement(args, controller)
+    elif args.command == "supervisor":
+        return _supervisor(args, controller)
     elif args.command == "harness":
         ids = []
         for index in range(args.missions):
