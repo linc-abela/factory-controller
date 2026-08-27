@@ -25,6 +25,8 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Any, Iterable, Mapping, Sequence
 
+from . import capacity as capacity_policy
+
 
 #: A project admits *new* missions only while ``enabled``.  ``paused`` and
 #: ``draining`` share their claim mechanics exactly and differ only in declared
@@ -290,6 +292,11 @@ class MissionCandidate:
     ready_at: float
     prerequisites: tuple[Prerequisite, ...] = ()
     priority: int | None = None
+    #: The execution profiles this mission declared, in declared order.  Empty
+    #: means the mission named none and the execution layer's own default
+    #: serves it -- capacity has no subject and does not narrow it.
+    runtimes: tuple[str, ...] = ()
+    estimate: "capacity_policy.WorkEstimate | None" = None
 
     @property
     def resume(self) -> bool:
@@ -313,6 +320,10 @@ class Snapshot:
     portfolio_in_flight: int
     project_spend: Mapping[str, dict[str, Any]] = field(default_factory=dict)
     now: float = 0.0
+    #: One reading per runtime the Owner registered or anybody measured.  An
+    #: empty mapping is the pre-capacity Factory and narrows nothing, which is
+    #: what keeps capacity opt-in.
+    capacity: Mapping[str, "capacity_policy.RuntimeReading"] = field(default_factory=dict)
 
 
 @dataclass(frozen=True)
@@ -426,6 +437,20 @@ def evaluate(candidate: MissionCandidate, snapshot: Snapshot) -> Verdict:
         return verdict(False, "PORTFOLIO_CONCURRENCY_CAP",
                        in_flight=snapshot.portfolio_in_flight,
                        cap=snapshot.portfolio.portfolio_concurrency)
+
+    # Capacity is deliberately the last gate, and the reason is the same one
+    # that orders the refusals inside a capacity reading: report the condition
+    # that is true independently of the moment first.  An unregistered project
+    # or a spent budget will still be true in five hours; a closed quota window
+    # will not, so it is the least useful thing to say about a mission that is
+    # also unregistered.  Capacity can only *narrow* what the gates above
+    # already admitted -- there is no path from here to an admission.
+    if snapshot.capacity and candidate.runtimes:
+        plan = capacity_policy.plan(candidate.runtimes, snapshot.capacity, candidate.estimate)
+        if plan.exhausted:
+            return verdict(False, "CAPACITY_UNAVAILABLE",
+                           resume_at="unknown" if plan.resume_at is None else plan.resume_at,
+                           considered=[item.as_row() for item in plan.considered])
 
     base = candidate.priority if candidate.priority is not None else (
         project.priority if project is not None else DEFAULT_PRIORITY)

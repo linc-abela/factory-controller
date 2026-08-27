@@ -11,6 +11,7 @@ from contextlib import contextmanager
 from pathlib import Path
 from typing import Any, Iterator
 
+from . import capacity as capacity_policy
 from . import context as context_contract
 from . import portfolio
 
@@ -216,6 +217,36 @@ class MissionStore:
                 BEFORE UPDATE ON coordination BEGIN SELECT RAISE(ABORT, 'coordination is append-only'); END;
                 CREATE TRIGGER IF NOT EXISTS coordination_no_delete
                 BEFORE DELETE ON coordination BEGIN SELECT RAISE(ABORT, 'coordination is append-only'); END;
+                CREATE TABLE IF NOT EXISTS capacity_runtimes (
+                  runtime_id TEXT PRIMARY KEY,
+                  managed INTEGER NOT NULL,
+                  max_observation_age_seconds REAL NOT NULL,
+                  handoff TEXT NOT NULL,
+                  unknown_reset_backoff_seconds REAL NOT NULL,
+                  policy_version TEXT NOT NULL,
+                  updated_at REAL NOT NULL
+                );
+                CREATE TABLE IF NOT EXISTS capacity_observations (
+                  sequence INTEGER PRIMARY KEY AUTOINCREMENT,
+                  runtime_id TEXT NOT NULL,
+                  state TEXT NOT NULL,
+                  observed_at REAL NOT NULL,
+                  recorded_at REAL NOT NULL,
+                  source TEXT NOT NULL,
+                  source_ref TEXT NOT NULL,
+                  window_started_at REAL,
+                  expected_reset_at REAL,
+                  remaining_units REAL,
+                  unit TEXT,
+                  precision TEXT NOT NULL,
+                  detail_json TEXT NOT NULL
+                );
+                CREATE INDEX IF NOT EXISTS capacity_observations_by_runtime
+                  ON capacity_observations(runtime_id, observed_at, sequence);
+                CREATE TRIGGER IF NOT EXISTS capacity_observations_no_update
+                BEFORE UPDATE ON capacity_observations BEGIN SELECT RAISE(ABORT, 'observations are append-only'); END;
+                CREATE TRIGGER IF NOT EXISTS capacity_observations_no_delete
+                BEFORE DELETE ON capacity_observations BEGIN SELECT RAISE(ABORT, 'observations are append-only'); END;
                 """
             )
             # A Stage-4 database predates the coordination columns, and dropping
@@ -224,7 +255,12 @@ class MissionStore:
             # a mission belonging to no project, scheduled under portfolio
             # limits alone.
             present = {row["name"] for row in db.execute("PRAGMA table_info(missions)")}
-            for column, ddl in (("project_id", "TEXT"), ("priority", "INTEGER")):
+            for column, ddl in (("project_id", "TEXT"), ("priority", "INTEGER"),
+                                # A Stage-9 database predates capacity, and a
+                                # deferral it never had is zero -- the one case
+                                # where a default of 0 is the fact rather than a
+                                # stand-in for an absent measurement.
+                                ("deferrals", "INTEGER NOT NULL DEFAULT 0")):
                 if column not in present:
                     db.execute("ALTER TABLE missions ADD COLUMN %s %s" % (column, ddl))
             # Same reasoning one stage later: a Stage-5..8 database predates the
@@ -243,6 +279,7 @@ class MissionStore:
             )
             db.execute("INSERT OR IGNORE INTO schema_meta VALUES (1, ?)", (self.clock(),))
             db.execute("INSERT OR IGNORE INTO schema_meta VALUES (2, ?)", (self.clock(),))
+            db.execute("INSERT OR IGNORE INTO schema_meta VALUES (3, ?)", (self.clock(),))
 
     @staticmethod
     def _row(row: sqlite3.Row | None) -> dict[str, Any] | None:
@@ -422,7 +459,12 @@ class MissionStore:
             if row is None:
                 raise LeaseLostError("LEASE_LOST")
             now = self.clock()
-            exhausted = row["attempt_count"] >= row["max_attempts"]
+            # A capacity deferral is not an attempt.  Nothing was dispatched,
+            # no leg was recorded, and counting a closed quota window against a
+            # mission's retry budget would make a five-hour window look like a
+            # broken provider -- the mission would be escalated for a reason
+            # that has nothing to do with the work.
+            exhausted = row["attempt_count"] - row["deferrals"] >= row["max_attempts"]
             state = "escalated" if exhausted else "admitted"
             reason = "RETRIES_EXHAUSTED: " + diagnostic if exhausted else diagnostic
             db.execute(
@@ -435,6 +477,148 @@ class MissionStore:
             )
             self._event(db, mission_id, "RETRY_EXHAUSTED" if exhausted else "RETRY_SCHEDULED", row["state"], state, {"diagnostic": diagnostic, "delay": delay})
             return state
+
+    def defer(self, mission_id: str, lease_token: str, reason: str,
+              resume_at: float | None) -> dict[str, Any]:
+        """Put a mission back for a later window, having started nothing.
+
+        This is the one new mission verb capacity needed, and it exists because
+        the alternative loses work: a quota window that closed between the
+        claim and the dispatch would otherwise walk the mission through
+        ``NO_ADMISSIBLE_PROVIDER`` into ``refused``, which is terminal.
+
+        Two guards make it safe rather than convenient, and both are checked
+        here rather than at the caller so no second caller can skip them.  The
+        mission must still be ``dispatching`` -- the only pre-boundary state a
+        lease-holder can be in -- and no run leg may have failed to prove that
+        nothing started.  A deferral after either is refused, and the existing
+        uncertainty path handles that case instead.
+        """
+
+        with self.transaction() as db:
+            row = db.execute("SELECT * FROM missions WHERE id=? AND lease_token=?",
+                             (mission_id, lease_token)).fetchone()
+            if row is None:
+                raise LeaseLostError("LEASE_LOST")
+            if row["state"] != "dispatching":
+                raise ValueError("CAPACITY_DEFER_AFTER_BOUNDARY: state=%s" % row["state"])
+            committed = db.execute(
+                "SELECT COUNT(*) AS n FROM runs WHERE mission_id=?"
+                " AND (process_started IS NULL OR process_started=1)",
+                (mission_id,)).fetchone()["n"]
+            if committed:
+                raise ValueError("CAPACITY_DEFER_AFTER_BOUNDARY: %d unproven leg(s)" % committed)
+            now = self.clock()
+            when = now if resume_at is None else max(now, float(resume_at))
+            db.execute(
+                "UPDATE missions SET state='admitted',next_run_at=?,deferrals=deferrals+1,"
+                "lease_owner=NULL,lease_token=NULL,lease_expires_at=NULL,updated_at=?"
+                " WHERE id=?", (when, now, mission_id))
+            db.execute(
+                "UPDATE attempts SET ended_at=?,outcome='CAPACITY_DEFERRED',diagnostic=?"
+                " WHERE mission_id=? AND number=?",
+                (now, reason, mission_id, row["attempt_count"]))
+            self._event(db, mission_id, "CAPACITY_DEFERRED", "dispatching", "admitted",
+                        {"reason": reason, "resume_at": when,
+                         "deferrals": row["deferrals"] + 1})
+            return {"mission_id": mission_id, "state": "admitted", "resume_at": when,
+                    "reason": reason, "deferrals": row["deferrals"] + 1}
+
+    # ----------------------------------------------------------------- #
+    # capacity
+    # ----------------------------------------------------------------- #
+
+    def set_runtime_policy(self, policy: capacity_policy.RuntimePolicy) -> dict[str, Any]:
+        """Put one runtime under capacity management, or take it out again."""
+
+        with self.transaction() as db:
+            db.execute(
+                "INSERT INTO capacity_runtimes VALUES(?,?,?,?,?,?,?)"
+                " ON CONFLICT(runtime_id) DO UPDATE SET managed=excluded.managed,"
+                " max_observation_age_seconds=excluded.max_observation_age_seconds,"
+                " handoff=excluded.handoff,"
+                " unknown_reset_backoff_seconds=excluded.unknown_reset_backoff_seconds,"
+                " policy_version=excluded.policy_version, updated_at=excluded.updated_at",
+                (policy.runtime_id, int(policy.managed), policy.max_observation_age_seconds,
+                 policy.handoff, policy.unknown_reset_backoff_seconds,
+                 policy.policy_version, self.clock()))
+        return policy.as_row()
+
+    def runtime_policies(self) -> dict[str, capacity_policy.RuntimePolicy]:
+        with self.connect() as db:
+            return {row["runtime_id"]: _runtime_policy(row)
+                    for row in db.execute("SELECT * FROM capacity_runtimes")}
+
+    def observe_capacity(self, observation: capacity_policy.CapacityObservation) -> dict[str, Any]:
+        """Append one measurement.  Observations are facts, so nothing updates."""
+
+        with self.transaction() as db:
+            db.execute(
+                "INSERT INTO capacity_observations(runtime_id,state,observed_at,recorded_at,"
+                "source,source_ref,window_started_at,expected_reset_at,remaining_units,unit,"
+                "precision,detail_json) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",
+                (observation.runtime_id, observation.state, observation.observed_at,
+                 self.clock(), observation.source, observation.source_ref,
+                 observation.window_started_at, observation.expected_reset_at,
+                 observation.remaining_units, observation.unit, observation.precision,
+                 canonical_json(observation.detail)))
+        return observation.as_row()
+
+    def latest_observations(self) -> dict[str, capacity_policy.CapacityObservation]:
+        """The newest measurement per runtime, by observation time then arrival.
+
+        Ordering by ``observed_at`` before ``sequence`` is what stops a
+        late-arriving *older* reading from reopening a window that a newer one
+        closed -- the direction in which a mistake would invent capacity.
+        """
+
+        with self.connect() as db:
+            rows = db.execute(
+                "SELECT * FROM capacity_observations ORDER BY observed_at,sequence").fetchall()
+        return {row["runtime_id"]: _observation(row) for row in rows}
+
+    def capacity_readings(self, now: float | None = None) -> dict[str, capacity_policy.RuntimeReading]:
+        return capacity_policy.readings(self.runtime_policies(), self.latest_observations(),
+                                        self.clock() if now is None else now)
+
+    def capacity_observations(self, runtime_id: str | None = None, *,
+                              limit: int = 200) -> list[dict[str, Any]]:
+        with self.connect() as db:
+            if runtime_id is None:
+                rows = db.execute("SELECT * FROM capacity_observations"
+                                  " ORDER BY sequence DESC LIMIT ?", (limit,)).fetchall()
+            else:
+                rows = db.execute("SELECT * FROM capacity_observations WHERE runtime_id=?"
+                                  " ORDER BY sequence DESC LIMIT ?",
+                                  (runtime_id, limit)).fetchall()
+        return [{**_observation(row).as_row(), "sequence": row["sequence"],
+                 "recorded_at": row["recorded_at"]} for row in rows]
+
+    def capacity_checkpoint(self, mission_id: str,
+                            reading: capacity_policy.RuntimeReading | None = None
+                            ) -> dict[str, Any]:
+        """What the ledger says about one mission, as a portable checkpoint.
+
+        Re-derived on every call rather than stored.  ``continuity.py`` owns the
+        Work Baton -- a token issued once and consumed once -- and this is the
+        reading a baton is built *from*, so the two cannot drift: there is only
+        one copy of these facts and it is the mission ledger.
+        """
+
+        mission = self.get(mission_id)
+        if mission is None:
+            raise KeyError(mission_id)
+        with self.connect() as db:
+            steps = {row["name"]: row["status"] for row in db.execute(
+                "SELECT name,status FROM steps WHERE mission_id=?", (mission_id,))}
+        dispatch = self.step_output(mission_id, "dispatch") or {}
+        evidence = self.step_output(mission_id, "evidence") or {}
+        project = self.project(mission["project_id"]) if mission["project_id"] else None
+        return capacity_policy.checkpoint_facts(
+            mission, mission["payload"], steps, self.runs(mission_id), reading,
+            repository=None if project is None else project.repository,
+            candidate_sha=dispatch.get("candidate_sha") if isinstance(dispatch, dict) else None,
+            evidence_pointer=evidence.get("evidence_pointer") if isinstance(evidence, dict) else None)
 
     def cancel(self, mission_id: str) -> str:
         with self.transaction() as db:
@@ -1114,7 +1298,7 @@ class MissionStore:
                          project_ids: tuple[str, ...] | None = None
                          ) -> portfolio.ScheduleDecision:
         rows = db.execute(
-            "SELECT id,project_id,priority,state,created_at,next_run_at FROM missions"
+            "SELECT id,project_id,priority,state,created_at,next_run_at,payload_json FROM missions"
             " WHERE state IN ('admitted','dispatched','candidate_verified','evaluated','evidence_sealed')"
             " AND lease_token IS NULL AND cancel_requested=0 ORDER BY created_at,id").fetchall()
         if not rows:
@@ -1134,13 +1318,15 @@ class MissionStore:
             portfolio_in_flight += row["n"]
             if row["project_id"] is not None:
                 in_flight[row["project_id"]] = row["n"]
+        capacity_readings = self._capacity_readings_locked(db, now)
         candidates = tuple(
             portfolio.MissionCandidate(
                 mission_id=row["id"], project_id=row["project_id"], state=row["state"],
                 created_at=row["created_at"], ready_at=row["next_run_at"],
                 priority=row["priority"],
                 prerequisites=tuple(portfolio.Prerequisite(*item)
-                                    for item in edges.get(row["id"], ())))
+                                    for item in edges.get(row["id"], ())),
+                **_capacity_declaration(row["payload_json"]))
             for row in rows)
         if project_ids is not None:
             # A resume survives the narrowing, ahead of it, for the same reason
@@ -1162,8 +1348,27 @@ class MissionStore:
             projects={row["project_id"]: _project_policy(row)
                       for row in db.execute("SELECT * FROM projects").fetchall()},
             candidates=candidates, in_flight=in_flight, portfolio_in_flight=portfolio_in_flight,
-            project_spend=self._spend_locked(db), now=now)
+            project_spend=self._spend_locked(db), now=now, capacity=capacity_readings)
         return portfolio.schedule(snapshot)
+
+    def _capacity_readings_locked(self, db: sqlite3.Connection,
+                                  now: float) -> dict[str, capacity_policy.RuntimeReading]:
+        """Capacity, read inside the claiming transaction with everything else.
+
+        Read here rather than through :meth:`capacity_readings` for the same
+        reason the scheduler itself runs inside ``claim``: a reading taken on a
+        separate connection would be a snapshot of a different instant, and two
+        workers comparing different instants is exactly the read-then-act
+        window the single transaction exists to close.
+        """
+
+        policies = {row["runtime_id"]: _runtime_policy(row)
+                    for row in db.execute("SELECT * FROM capacity_runtimes")}
+        observations = {row["runtime_id"]: _observation(row) for row in db.execute(
+            "SELECT * FROM capacity_observations ORDER BY observed_at,sequence")}
+        if not policies and not observations:
+            return {}
+        return capacity_policy.readings(policies, observations, now)
 
     def schedule_preview(self) -> dict[str, Any]:
         """What the scheduler would do right now.  Reads only; claims nothing."""
@@ -1261,6 +1466,53 @@ class MissionStore:
                 "project_count": len(selected),
                 "portfolio": _portfolio_total(selected.values()),
                 "policy": self.portfolio_policy().as_row()}
+
+
+def _capacity_declaration(payload_json: str) -> dict[str, Any]:
+    """The runtimes and estimate one mission declared, for the scheduler.
+
+    A payload the Controller already accepted cannot become unreadable later,
+    but a malformed declaration must not take the whole scheduling pass down
+    with it: an unreadable estimate narrows nothing, and the mission is then
+    refused by ``Controller.validate`` on its own terms rather than by
+    disappearing from every other mission's schedule.
+    """
+
+    try:
+        payload = json.loads(payload_json)
+        runtimes = tuple(
+            entry if isinstance(entry, str) else entry.get("profile")
+            for entry in (payload.get("provider_candidates") or ()))
+        estimate = capacity_policy.WorkEstimate.from_payload(payload)
+    except (ValueError, TypeError, AttributeError, capacity_policy.PolicyError):
+        return {}
+    return {"runtimes": tuple(name for name in runtimes if isinstance(name, str) and name),
+            "estimate": estimate}
+
+
+def _absent_number(value: Any) -> Any:
+    """An absent time as a canonical absence word, never as ``0``."""
+
+    return "unknown" if value is None else value
+
+
+def _runtime_policy(row: sqlite3.Row) -> capacity_policy.RuntimePolicy:
+    return capacity_policy.RuntimePolicy(
+        runtime_id=row["runtime_id"], managed=bool(row["managed"]),
+        max_observation_age_seconds=row["max_observation_age_seconds"],
+        handoff=row["handoff"],
+        unknown_reset_backoff_seconds=row["unknown_reset_backoff_seconds"],
+        policy_version=row["policy_version"])
+
+
+def _observation(row: sqlite3.Row) -> capacity_policy.CapacityObservation:
+    return capacity_policy.CapacityObservation(
+        runtime_id=row["runtime_id"], state=row["state"], observed_at=row["observed_at"],
+        source=row["source"], source_ref=row["source_ref"],
+        window_started_at=row["window_started_at"],
+        expected_reset_at=row["expected_reset_at"],
+        remaining_units=row["remaining_units"], unit=row["unit"],
+        precision=row["precision"], detail=json.loads(row["detail_json"]))
 
 
 def _project_policy(row: sqlite3.Row) -> portfolio.ProjectPolicy:

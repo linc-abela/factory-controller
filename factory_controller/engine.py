@@ -14,7 +14,7 @@ import threading
 from dataclasses import dataclass
 from typing import Any, Protocol
 
-from . import context, gateway, routing
+from . import capacity, context, gateway, routing
 from .context import ContextBudget, ContextError, ContextRequest
 from .routing import ExecutionPolicy, PolicyError, Selection
 from .store import MissionStore
@@ -39,6 +39,23 @@ class RetryableFailure(RuntimeError):
 
 class NonRetryableFailure(RuntimeError):
     pass
+
+
+class CapacityDeferred(Exception):
+    """Every runtime this mission may use is out of quota, and none of them ran.
+
+    Deliberately not a failure of either existing kind.  A retry would spend an
+    attempt on a fact about a window rather than about the work, and a
+    non-retryable failure would refuse a mission that is perfectly good and
+    will run unchanged in a few hours.  Carried out of ``_dispatch`` so the
+    baton is written and the deferral taken by the one caller that holds the
+    lease.
+    """
+
+    def __init__(self, reason: str, resume_at: float | None,
+                 plan: "capacity.CapacityPlan | None" = None) -> None:
+        super().__init__(reason)
+        self.reason, self.resume_at, self.plan = reason, resume_at, plan
 
 
 #: Used when the mission declares no candidate profiles at all.  The execution
@@ -291,6 +308,31 @@ class Controller:
         if resume_state != "dispatching" or committed:
             return self._recover(mission, committed, prior)
 
+        # Capacity narrows, and narrows through the Owner's own mechanism: the
+        # profiles a closed window rules out are added to `denied_profiles`, so
+        # `routing.select` refuses them for the reason it already has and no
+        # second concept of "unavailable" enters the selector.  The list can
+        # only grow here, which is what makes "capacity cannot widen authority"
+        # structural rather than asserted.
+        plan = self._capacity_plan(mission, direct)
+        if plan is not None:
+            if plan.exhausted:
+                # Every subscription runtime this mission declared is cooling.
+                # A declared gateway is deliberately *not* tried: substituting
+                # metered capacity for a quota window is the one thing Phase 1
+                # says must never happen by itself.  A mission the Owner wants
+                # served by a gateway declares it as the mission's own runtime,
+                # which reaches this code with no direct candidate at all.
+                gate = Selection(None, "capacity_gate", ())
+                self._record(mission, gate,
+                             routing.unserved_receipt(gate, [], "CAPACITY_UNAVAILABLE"))
+                self.store.log(mission["id"], "CAPACITY_REFUSED", plan.as_row())
+                raise CapacityDeferred("CAPACITY_UNAVAILABLE", plan.resume_at, plan)
+            if plan.denied:
+                policy = replace(policy,
+                                 denied_profiles=policy.denied_profiles + plan.denied)
+                self.store.log(mission["id"], "CAPACITY_NARROWED", plan.as_row())
+
         spent = [_receipt_value(leg["receipt"]) for leg in prior]
         attempted: list[str] = []
         while True:
@@ -308,6 +350,13 @@ class Controller:
             if candidates and not selection.selected:
                 code = selection.refusal_code or "NO_ADMISSIBLE_PROVIDER"
                 self._record(mission, selection, routing.unserved_receipt(selection, attempted, code))
+                exhausted, resume_at = self._quota_exhaustion(spent)
+                if exhausted:
+                    # The window closed between the claim and the dispatch, and
+                    # every leg proved nothing began.  Losing the mission here
+                    # is the defect: it is a good mission whose provider is
+                    # asleep, so it goes back on the queue for the reset.
+                    raise CapacityDeferred("CAPACITY_EXHAUSTED_MID_DISPATCH", resume_at)
                 raise NonRetryableFailure("%s: considered %d candidate(s)" % (code, len(candidates)))
             response = self._step(
                 mission, "dispatch",
@@ -318,6 +367,7 @@ class Controller:
                                     response, gateways.get(selection.profile))
             self._record(mission, selection, receipt)
             spent.append(receipt)
+            self._observe_refusal(receipt)
             if response.get("status") != routing.PROVIDER_UNAVAILABLE:
                 self._verify_receipt(mission, receipt, response)
                 return response
@@ -338,6 +388,70 @@ class Controller:
                     "%s: %s did not prove no process started (%s)"
                     % (code, receipt.provider_profile or LAYER_DEFAULT, why))
             attempted.append(selection.profile or LAYER_DEFAULT)
+
+    # ------------------------------------------------------------------ #
+    # capacity
+    # ------------------------------------------------------------------ #
+
+    def _capacity_plan(self, mission: dict[str, Any],
+                       direct: tuple[routing.Candidate, ...]) -> capacity.CapacityPlan | None:
+        """What the durable capacity record says about this mission's runtimes.
+
+        ``None`` means capacity has no subject: nobody registered a runtime and
+        nobody recorded a measurement, so the Factory behaves exactly as it did
+        before this module existed.  That is the same shape the scheduler uses,
+        and it is what keeps every pre-capacity mission unchanged.
+        """
+
+        if not direct:
+            return None
+        readings = self.store.capacity_readings()
+        if not readings:
+            return None
+        return capacity.plan(tuple(item.profile for item in direct), readings,
+                             capacity.WorkEstimate.from_payload(mission["payload"]))
+
+    def _observe_refusal(self, receipt: routing.Receipt) -> None:
+        """Record a provider's quota refusal as the capacity observation it is.
+
+        This is the whole of "no probe".  The most current statement anyone can
+        make about a window is the harness declining to serve one, and it
+        arrives on a path that was already recording the leg.
+        """
+
+        if receipt.provider_profile is None:
+            return
+        observation = capacity.observation_from_refusal(
+            receipt.provider_profile, receipt.refusal_code, self.store.clock())
+        if observation is not None:
+            self.store.observe_capacity(observation)
+
+    def _quota_exhaustion(self, spent: list[routing.Receipt]) -> tuple[bool, float | None]:
+        """Was every leg so far a *proven* quota refusal, and when may we retry?
+
+        Both halves of the test are required.  One leg that failed for another
+        reason means the mission has a problem a reset will not fix, and one
+        leg that could not prove nothing started means the mission is past the
+        boundary -- where a deferral would be exactly the duplicate irreversible
+        effect this design exists to make impossible.
+
+        The resume time comes from the readings the refusals themselves just
+        wrote, so it is the provider's own statement rather than a guess.
+        """
+
+        if not spent:
+            return (False, None)
+        for receipt in spent:
+            if receipt.process_started is not False:
+                return (False, None)
+            if receipt.refusal_code not in capacity.QUOTA_REFUSAL_CODES:
+                return (False, None)
+        readings = self.store.capacity_readings()
+        times = [readings[receipt.provider_profile].resume_at
+                 for receipt in spent
+                 if receipt.provider_profile in readings
+                 and readings[receipt.provider_profile].resume_at is not None]
+        return (True, min(times) if times else None)
 
     def _recover(self, mission: dict[str, Any], committed: list[dict[str, Any]],
                  prior: list[dict[str, Any]]) -> dict[str, Any]:
@@ -497,6 +611,22 @@ class Controller:
                 self.store.transition(mission_id, token, "evidence_sealed", detail={"evidence_pointer": evidence.get("evidence_pointer")})
             result = {"dispatch": dispatch, "verification": verification, "evaluation": evaluation, "evidence": evidence}
             self.store.transition(mission_id, token, "completed", result=result, release_lease=True)
+        except CapacityDeferred as exc:
+            # The checkpoint is recorded *before* the deferral, while the lease
+            # is still held, so what it says is what was true when the work
+            # stopped.  `store.defer` then re-checks the safe boundary itself
+            # and refuses if anything might have run, which is why this handler
+            # needs no boundary test of its own -- and why a checkpoint that
+            # says `post_dispatch_unreconciled` can never be followed by one.
+            checkpoint = self.store.capacity_checkpoint(
+                mission_id,
+                _last_runtime_reading(self.store, mission_id,
+                                      self.store.capacity_readings()))
+            self.store.log(mission_id, "CAPACITY_CHECKPOINT", {
+                "reason": exc.reason,
+                "resume_at": exc.resume_at if exc.resume_at is not None else "unknown",
+                "checkpoint": checkpoint})
+            self.store.defer(mission_id, token, exc.reason, exc.resume_at)
         except RetryableFailure as exc:
             current = self.store.get(mission_id)
             if current and current["state"] == "dispatching":
@@ -513,6 +643,15 @@ class Controller:
 # --------------------------------------------------------------------------- #
 # helpers
 # --------------------------------------------------------------------------- #
+
+def _last_runtime_reading(store: MissionStore, mission_id: str,
+                          readings: dict[str, Any]):
+    """The capacity reading for the runtime this mission last touched, if any."""
+
+    legs = store.runs(mission_id)
+    profile = legs[-1]["provider_profile"] if legs else None
+    return readings.get(profile) if profile else None
+
 
 def _declared_gates(payload: dict[str, Any]) -> tuple[str, ...]:
     raw = payload.get("acceptance_gate_ids") or ()

@@ -258,7 +258,14 @@ class EndToEndTests(RouteTestCase, unittest.TestCase):
                                                   "allowed_model_slugs": [OTHER]})
         layer = GatewayLayer(direct_refusal="quota_exhausted")
         mission, store = self.run_mission(layer, payload)
-        self.assertEqual(mission["state"], "refused")
+        # SF-143 changed the *outcome* here and not the subject.  The direct
+        # harness refused for quota and proved nothing started, so the mission
+        # is deferred for the window rather than refused terminally -- losing a
+        # good mission because a subscription window closed was the defect.
+        # What this test is about is unchanged: the unadmitted gateway profile
+        # was recorded and never offered, and ALPHA is still the only route.
+        self.assertEqual(mission["state"], "admitted")
+        self.assertEqual(mission["deferrals"], 1)
         self.assertEqual([route["provider_profile"] for route in layer.routes], [ALPHA])
         refusals = [event for event in store.history(mission["id"])
                     if event["kind"] == "GATEWAY_PROFILE_REFUSED"]
