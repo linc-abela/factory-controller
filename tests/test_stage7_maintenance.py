@@ -800,3 +800,102 @@ def inspect_signature(function) -> list[str]:
 
 if __name__ == "__main__":
     unittest.main()
+
+
+# --------------------------------------------------------------------------- #
+# the operator surface
+# --------------------------------------------------------------------------- #
+
+class MaintenanceCLITests(unittest.TestCase):
+    """The Owner's own surface, including that it has no `run` verb.
+
+    Every command is one act.  Nothing here starts something that keeps going
+    after the command returns, which is the same property the module holds and
+    is worth checking at the surface an operator actually types at.
+    """
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.db = str(Path(self.tmp.name) / "cli.db")
+        self.out = []
+
+    def run_cli(self, *argv):
+        import contextlib
+        import io
+        import json
+        from factory_controller.cli import main
+        buffer = io.StringIO()
+        with contextlib.redirect_stdout(buffer):
+            code = main(["--db", self.db, *argv])
+        text = buffer.getvalue().strip()
+        return code, (json.loads(text) if text else None)
+
+    def prepare(self):
+        self.run_cli("project", "register", "--id", PROJECT,
+                     "--repository", REPO, "--policy-version", "1.0")
+        self.run_cli("production", "env-register", "--environment", "shop-staging",
+                     "--project", PROJECT, "--class", "staging",
+                     "--repository", REPO, "--service", "shop-web",
+                     "--approver", "owner", "--autonomous",
+                     "--policy-version", "p1")
+        self.run_cli("production", "incident", "--incident", "INC-1",
+                     "--environment", "shop-staging", "--actor", "owner",
+                     "--incident-class", "triaged_defect", "--release-sha", SHA,
+                     "--ref", "rc-000", "--behaviour", "checkout 500s",
+                     "--blast-radius", "all checkout traffic")
+
+    def test_a_refusal_prints_its_code_and_exits_non_zero(self):
+        self.prepare()
+        code, result = self.run_cli("maintenance", "trigger", "--source", "INC-1")
+        self.assertEqual(code, 2)
+        self.assertEqual(result["refused"]["code"], "MAINTENANCE_DISABLED")
+
+    def test_policy_then_trigger_then_repair_then_close(self):
+        self.prepare()
+        code, policy = self.run_cli("maintenance", "policy", "--project", PROJECT,
+                                    "--env-class", "staging", "--cooldown", "0",
+                                    "--policy-version", "mp-1")
+        self.assertEqual((code, policy["enabled"]), (0, True))
+        code, trigger = self.run_cli("maintenance", "trigger", "--source", "INC-1")
+        self.assertEqual(code, 0)
+        ref = trigger["trigger_ref"]
+
+        code, again = self.run_cli("maintenance", "trigger", "--source", "INC-1")
+        self.assertEqual(again["trigger_ref"], ref)
+        _, listed = self.run_cli("maintenance", "list", "--project", PROJECT)
+        self.assertEqual(len(listed), 1)
+
+        code, repair = self.run_cli("maintenance", "repair", "--trigger", ref,
+                                    "--gate", "G-BUILD")
+        self.assertEqual((code, repair["created"]), (0, True))
+        _, repeat = self.run_cli("maintenance", "repair", "--trigger", ref,
+                                 "--gate", "G-BUILD")
+        self.assertFalse(repeat["created"])
+
+        _, lineage = self.run_cli("maintenance", "lineage", "--trigger", ref)
+        self.assertEqual(lineage["candidate_sha"], "not_run")
+        code, closed = self.run_cli("maintenance", "close", "--trigger", ref,
+                                    "--disposition", "escalated",
+                                    "--reason", "operator stopped it")
+        self.assertEqual((code, closed["disposition"]), (0, "escalated"))
+        code, refused = self.run_cli("maintenance", "close", "--trigger", ref,
+                                     "--disposition", "recovered")
+        self.assertEqual(code, 2)
+        self.assertEqual(refused["refused"]["code"], "MAINTENANCE_REPAIR_CLOSED")
+
+    def test_a_production_class_cannot_be_scoped_from_the_command_line(self):
+        self.prepare()
+        code, result = self.run_cli("maintenance", "policy", "--project", PROJECT,
+                                    "--env-class", "production",
+                                    "--policy-version", "mp-1")
+        self.assertEqual(code, 2)
+        self.assertEqual(result["refused"]["code"], "MAINTENANCE_POLICY_INVALID")
+
+    def test_the_operator_surface_offers_nothing_that_keeps_running(self):
+        from factory_controller.cli import parser
+        actions = [action for action in parser()._subparsers._group_actions[0]
+                   .choices["maintenance"]._actions if action.dest == "action"]
+        self.assertEqual(len(actions), 1)
+        for forbidden in ("run", "worker", "loop", "watch", "start"):
+            self.assertNotIn(forbidden, actions[0].choices)

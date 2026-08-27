@@ -10,6 +10,7 @@ import time
 from pathlib import Path
 
 from . import advisor as advisory
+from . import maintenance as mnt
 from . import portfolio
 from . import production
 from .adapter import JsonProcessAdapter
@@ -130,6 +131,38 @@ def parser() -> argparse.ArgumentParser:
     prod.add_argument("--work-item")
     prod.add_argument("--summary")
     prod.add_argument("--policy-version", dest="prod_policy_version", default="unset")
+
+    mnt_parser = sub.add_parser("maintenance")
+    mnt_parser.add_argument("action", choices=(
+        "policy", "enable", "disable", "trigger", "repair", "lineage", "list",
+        "close"))
+    mnt_parser.add_argument("--project")
+    mnt_parser.add_argument("--trigger-class", choices=mnt.TRIGGER_CLASSES,
+                            default="production_incident")
+    mnt_parser.add_argument("--source")
+    mnt_parser.add_argument("--trigger")
+    mnt_parser.add_argument("--env-class", action="append", default=[],
+                            dest="mnt_environment_classes",
+                            choices=production.ENVIRONMENT_CLASSES,
+                            help="repeatable; a production class is refused")
+    mnt_parser.add_argument("--budget", type=int, dest="mnt_budget",
+                            default=mnt.DEFAULT_REPAIR_BUDGET)
+    mnt_parser.add_argument("--concurrency", type=int, dest="mnt_concurrency",
+                            default=mnt.DEFAULT_CONCURRENCY)
+    mnt_parser.add_argument("--cooldown", type=float,
+                            default=mnt.DEFAULT_COOLDOWN_SECONDS)
+    mnt_parser.add_argument("--attempt-ceiling", type=int,
+                            default=mnt.DEFAULT_ATTEMPT_CEILING)
+    mnt_parser.add_argument("--suppression-threshold", type=int,
+                            default=mnt.DEFAULT_SUPPRESSION_THRESHOLD)
+    mnt_parser.add_argument("--mode", dest="mnt_mode", default="fixture",
+                            choices=("fixture", "real"))
+    mnt_parser.add_argument("--gate", action="append", default=[],
+                            dest="mnt_gates")
+    mnt_parser.add_argument("--disposition", choices=mnt.DISPOSITIONS)
+    mnt_parser.add_argument("--reason", dest="mnt_reason", default="operator")
+    mnt_parser.add_argument("--policy-version", dest="mnt_policy_version",
+                            default="unset")
     return p
 
 
@@ -225,6 +258,58 @@ def _production(args, store) -> int:
     return 0
 
 
+def _maintenance(args, controller) -> int:
+    """The Owner's own surface onto Stage 7.
+
+    Deliberately without a ``run`` verb.  Every command here is one act an
+    operator asked for; there is nothing to start and therefore nothing that
+    keeps going after the command returns.
+    """
+    store = controller.store
+    plane = mnt.MaintenancePlane(store, production.ProductionLedger(store))
+    try:
+        if args.action == "policy":
+            if not args.mnt_environment_classes and args.project and not args.mnt_gates:
+                current = plane.policy(args.project)
+                if current is not None and args.mnt_policy_version == "unset":
+                    print(json.dumps(current.as_row(), sort_keys=True))
+                    return 0
+            classes = tuple(args.mnt_environment_classes) or ("local-sim", "staging")
+            result = plane.set_policy(mnt.MaintenancePolicy(
+                project_id=args.project, enabled=True, environment_classes=classes,
+                repair_budget=args.mnt_budget, concurrency=args.mnt_concurrency,
+                cooldown_seconds=args.cooldown,
+                attempt_ceiling=args.attempt_ceiling,
+                suppression_threshold=args.suppression_threshold,
+                execution_mode=args.mnt_mode,
+                policy_version=args.mnt_policy_version))
+        elif args.action in ("enable", "disable"):
+            result = plane.set_enabled(args.project, args.action == "enable")
+        elif args.action == "trigger":
+            result = plane.admit_trigger(args.trigger_class, args.source)
+        elif args.action == "repair":
+            mission, created = plane.create_repair_mission(
+                args.trigger, controller,
+                acceptance_gate_ids=args.mnt_gates or ["ACCEPTANCE"])
+            result = {"created": created, "mission": mission}
+        elif args.action == "lineage":
+            result = plane.lineage(args.trigger)
+        elif args.action == "close":
+            result = plane.close(args.trigger, args.disposition,
+                                 reason=args.mnt_reason)
+        else:
+            result = list(plane.repairs(args.project))
+    except mnt.MaintenanceRefusal as refusal:
+        print(json.dumps({"refused": refusal.as_row()}, sort_keys=True))
+        return 2
+    except mnt.PolicyError as exc:
+        print(json.dumps({"refused": {"code": "MAINTENANCE_POLICY_INVALID",
+                                      "detail": str(exc)}}, sort_keys=True))
+        return 2
+    print(json.dumps(result, sort_keys=True, default=str))
+    return 0
+
+
 def main(argv: list[str] | None = None) -> int:
     args = parser().parse_args(argv)
     controller = _controller(args)
@@ -306,6 +391,8 @@ def main(argv: list[str] | None = None) -> int:
         print(json.dumps(advisory.coordinate(store, port, policy), sort_keys=True))
     elif args.command == "production":
         return _production(args, store)
+    elif args.command == "maintenance":
+        return _maintenance(args, controller)
     elif args.command == "harness":
         ids = []
         for index in range(args.missions):
