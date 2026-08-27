@@ -23,7 +23,9 @@ for live mission state; Notion is not read by runtime code.
 ./dev --db controller.db portfolio-economics [--project P]
 ./dev --db controller.db advise --probe | --proposals FILE [--policy FILE]
 ./dev --db harness --missions 10
+./dev --db controller.db supervisor status | brief | cycle --worker host
 ./dev test
+./dev stage9
 ```
 
 The default adapter is a token-free safe local process. Supply `--adapter` with
@@ -381,3 +383,74 @@ restating any of them.  A self-target experiment -- the Factory improving itself
 -- is refused a promotion outright: an accepted self-improvement candidate is a
 commit in an isolated lane and an evidence record, and installing it is an Owner
 act with no representation in this package.
+
+## Always-on operation
+
+Stage 9 is the caller every plane above was missing.  Stages 2 to 8 each end at
+a verb an operator invokes, and nothing in the package invoked any of them; the
+supervisor does, and the whole design question is how much of a caller it is
+allowed to be.
+
+**One bounded cycle per invocation.**  `supervisor cycle` performs a finite
+amount of work and returns.  It never sleeps, never loops on a constant and
+never calls itself, and all three are checked structurally rather than by
+running it and hoping -- a runaway is the failure a timed test would not catch.
+A host scheduler may invoke it repeatedly; installing that scheduler is an Owner
+act, and `supervisor service` prints the exact step without taking it.
+
+```sh
+./dev --db controller.db supervisor policy --project P \
+    --missions-per-cycle 2 --class backlog --class maintenance \
+    --window-start 8 --window-end 20
+./dev --db controller.db supervisor start --reason "night shift"
+./dev --db controller.db supervisor cycle --worker host-1
+./dev --db controller.db supervisor pause|resume|drain|stop --reason WHY
+./dev --db controller.db supervisor emergency-stop --reason WHY
+./dev --db controller.db supervisor hold --project P
+./dev --db controller.db supervisor brief
+./dev --db controller.db supervisor cycles [--limit N]
+./dev --db controller.db supervisor selections [--cycle CYC]
+./dev --db controller.db supervisor service [--interval-seconds 300]
+```
+
+Seven absences carry the design, and each is an enforcement rather than a
+decision deferred: no supervisor process, no second mission runtime, no way to
+create work, no approval verb, no drain of its own, no emergency stop of its
+own, and no project hold of its own.  The last three are the Stage-5 primitives
+the scheduler, maintenance and improvement already honour -- a supervisor-local
+stop would have been a second stop the other planes never read.
+
+A cycle can promote exactly two things, and both were admitted by an earlier
+stage against a durable fact: a repair whose production failure this ledger
+recorded, and an experiment whose baseline was pinned before any candidate
+existed.  It cannot admit either.  It calls three methods on the maintenance
+plane, two on the improvement plane, and none at all on the production ledger,
+which is pinned by an AST walk in `tests/test_stage9_supervisor.py` -- so "the
+supervisor cannot deploy" is an absent verb rather than a refused one.
+
+Control state is durable and restart-safe: `stopped`, `running`, `paused`,
+`draining`, `emergency_stopped`.  A drain is `resume_only` on the existing
+claim, narrowing candidates inside the transaction the scheduler already runs
+in, so there is no window in which a drain could still start something new.
+Every other bound -- a closed execution window, a hold, a disabled policy, a
+suppression -- narrows the same claim by project, with a resume exempt ahead of
+it because half-finished work has to finish.
+
+Overlapping invocations refuse rather than queue.  An abandoned cycle is settled
+on the next claim as `recovered_replayable` or `recovered_uncertain`, and while
+any mission sits past the dispatch boundary the next cycle advances work but
+promotes none: finishing what may already have run comes before opening anything
+new.
+
+Repeated *infrastructure* failure -- a provider that is not there, a broker that
+cannot be read -- suppresses one project for a declared window and then
+escalates it to wait for the Owner.  A spent budget is deliberately not
+infrastructure: it is a policy fact that will still be true next cycle, and
+backing off from it would hide an Owner decision behind a timer.
+
+`tests/test_stage9_long_horizon.py` runs 72 virtual hours over four projects
+with outages, budget pressure, incidents, a failed staging deployment, a quiet
+window, an Owner pause and a host restart.  It is a fixture rather than a soak
+test: the same 288 cycles in the same order every time, and a failure names a
+virtual hour.  `evidence/SF-141/long_horizon_summary.py` re-derives its numbers
+from durable state after the run.

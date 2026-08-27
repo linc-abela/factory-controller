@@ -1,0 +1,57 @@
+{
+  "completed_by_project": {
+    "alpha": 18,
+    "beta": 24,
+    "delta": 2,
+    "gamma": 21
+  },
+  "cycle_refusals": {
+    "NO_RUNNABLE_MISSION": 239,
+    "SUPERVISOR_OUTSIDE_EXECUTION_WINDOW": 144
+  },
+  "cycles": 288,
+  "cycles_recorded": 288,
+  "delta_provider_spend": {
+    "currency": "USD",
+    "evidence_class": "reported_claim",
+    "known_spend": 0.06,
+    "mixed_currencies": [],
+    "priced_legs": 3,
+    "unpriced_legs": 0
+  },
+  "deployments_caused_by_supervisor": 0,
+  "deployments_total": 1,
+  "distinct_provider_invocations": 72,
+  "duplicate_irreversible_effects": 0,
+  "final_control_state": "running",
+  "idle_cycles": 16,
+  "mission_advances": 74,
+  "mission_states": {
+    "admitted": 26,
+    "completed": 65,
+    "escalated": 7,
+    "refused": 2
+  },
+  "missions": 100,
+  "outage_hours": [
+    14,
+    15,
+    16,
+    40,
+    41
+  ],
+  "outcome_classification": {
+    "infrastructure": 2,
+    "progressed": 65,
+    "settled": 7
+  },
+  "projects": [
+    "alpha",
+    "beta",
+    "delta",
+    "gamma"
+  ],
+  "promotions": 4,
+  "provider_invocations": 72,
+  "virtual_hours": 72
+}
