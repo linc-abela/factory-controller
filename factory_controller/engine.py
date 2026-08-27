@@ -134,9 +134,9 @@ class Controller:
                                         value if memo_value is None else memo_value)
         if started["status"] == "COMPLETED":
             return started["output"]
-        self.store.renew(mission["id"], mission["lease_token"], self.lease_seconds)
         stopped = threading.Event()
         heartbeat_error: list[BaseException] = []
+        thread = None
 
         def heartbeat() -> None:
             interval = max(0.01, min(5.0, self.lease_seconds / 3))
@@ -147,14 +147,20 @@ class Controller:
                     heartbeat_error.append(exc)
                     return
 
-        thread = threading.Thread(target=heartbeat, name=f"lease-heartbeat-{mission['id']}", daemon=True)
         if self.lease_seconds > 0:
+            # A lease with no window has nothing to keep alive. The heartbeat
+            # was already not started in that case, and the renewal above it
+            # wrote `lease_expires_at = now`, an expiry that is already past --
+            # so both were a durable round trip per step that bought nothing.
+            self.store.renew(mission["id"], mission["lease_token"], self.lease_seconds)
+            thread = threading.Thread(
+                target=heartbeat, name=f"lease-heartbeat-{mission['id']}", daemon=True)
             thread.start()
         try:
             output = self.adapter.execute(name, started["operation_key"], value)
         finally:
             stopped.set()
-            if thread.is_alive():
+            if thread is not None and thread.is_alive():
                 thread.join(timeout=min(1.0, self.lease_seconds))
         if heartbeat_error:
             raise heartbeat_error[0]
@@ -202,8 +208,12 @@ class Controller:
         budget = ContextBudget.from_payload(mission["payload"])
         pre_boundary = resume_state == "dispatching"
 
-        token_refusal = context.reported_token_refusal(
-            budget, self.store.telemetry(mission["id"])["reported_input_tokens"])
+        # `reported_token_refusal` returns None for an undeclared ceiling
+        # whatever the reading is, so the telemetry roll-up behind it is only
+        # worth computing when the mission actually declared one.
+        token_refusal = None if budget.max_reported_input_tokens is None else \
+            context.reported_token_refusal(
+                budget, self.store.telemetry(mission["id"])["reported_input_tokens"])
         if token_refusal:
             self._refuse_context(mission, token_refusal, None)
             raise NonRetryableFailure(
