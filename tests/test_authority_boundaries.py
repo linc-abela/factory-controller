@@ -160,11 +160,28 @@ class ProviderNeutralityTests(unittest.TestCase):
             code = code_text(text)
             for token in ("keyring", "netrc", "credentials.json", "id_rsa"):
                 self.assertNotIn(token, code, "%s sources a secret (%r)" % (path.name, token))
-            if "environ" in code or "getenv" in code:
+            # Whole identifiers, not substrings.  `environ` inside
+            # `environment_id` is the Stage-6 domain noun, and a scan that
+            # cannot tell those apart would force the wrong name on the code
+            # rather than catch the thing it exists to catch.
+            if {"environ", "environb", "getenv"} & set(code.split("\n")):
                 readers.add(path.name)
         self.assertEqual(readers, {"context_adapter.py", "safe_provider.py"},
                          "unexpected environment readers: %s" % readers)
         self.assertFalse(readers & EXTERNAL_SEAM)
+
+    def test_the_environment_reader_scan_would_actually_catch_one(self):
+        """Narrowing it to whole identifiers must not make it unable to fire."""
+
+        for planted in ("import os\nkey = os.environ['X']\n",
+                        "from os import environ\n",
+                        "import os\nkey = os.getenv('X')\n"):
+            self.assertTrue(
+                {"environ", "getenv"} & set(code_text(planted).split("\n")),
+                planted)
+        self.assertFalse(
+            {"environ", "getenv"}
+            & set(code_text("environment_id = row['environment_id']\n").split("\n")))
 
     def test_no_credential_value_can_reach_the_coordination_ledger(self):
         """An advisor's token is never an argument to anything durable."""

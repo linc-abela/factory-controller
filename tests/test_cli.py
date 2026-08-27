@@ -43,5 +43,77 @@ class ControllerCLITests(unittest.TestCase):
         self.assertEqual(store.counts().get("completed"), 1)
 
 
+class ProductionCLITests(unittest.TestCase):
+    """The Owner's surface, exercised as an operator would during an incident."""
+
+    def setUp(self) -> None:
+        self.temp_dir = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp_dir.cleanup)
+        self.db_path = str(Path(self.temp_dir.name) / "production.db")
+        self.bundle_path = Path(self.temp_dir.name) / "bundle.json"
+        self.bundle_path.write_text(json.dumps({
+            "bundle_ref": "rc-cli", "project_id": "shop",
+            "repository": "https://example.invalid/shop.git",
+            "release_sha": "a" * 40, "mission_ref": "SF-138",
+            "evidence_refs": ["evidence/cli.json"],
+            "evaluator_receipts": ["receipts/cli.json"],
+            "artifact": "not_applicable",
+            "env_schema": {"PORT": {"type": "integer", "required": True}},
+            "migration": {"forward_ref": "not_applicable",
+                          "reverse_ref": "not_applicable"},
+            "release_policy_version": "1.0",
+            "provenance": {"built_by": "cli", "built_at": "2026-08-27T00:00:00Z",
+                           "contract_version": "factory-controller/production/1.0"},
+        }))
+
+    def run_cli(self, *argv) -> int:
+        return main(["--db", self.db_path, "production", *argv])
+
+    def register(self, environment_class="production", *extra):
+        argv = ["env-register", "--environment", "shop-prod", "--project", "shop",
+                "--class", environment_class, "--repository",
+                "https://example.invalid/shop.git", "--service", "shop-web",
+                "--approver", "owner", *extra]
+        return self.run_cli(*argv)
+
+    def admit(self):
+        return self.run_cli("admit", "--environment", "shop-prod",
+                            "--actor", "factory", "--bundle", str(self.bundle_path))
+
+    def deployment_id(self):
+        from factory_controller import production
+        from factory_controller.store import MissionStore as Store
+        ledger = production.ProductionLedger(Store(self.db_path))
+        return ledger.events("shop")[-1]["deployment_id"]
+
+    def test_a_production_environment_cannot_be_registered_as_autonomous(self):
+        self.assertEqual(self.register("production", "--autonomous"), 1)
+
+    def test_the_cli_cannot_deploy_to_production_without_an_approval(self):
+        self.assertEqual(self.register(), 0)
+        self.assertEqual(self.admit(), 0)
+        deployment = self.deployment_id()
+        self.assertEqual(self.run_cli("deploy", "--deployment", deployment), 1)
+
+    def test_an_approved_release_deploys_and_the_receipt_records_who(self):
+        self.assertEqual(self.register(), 0)
+        self.assertEqual(self.admit(), 0)
+        deployment = self.deployment_id()
+        from factory_controller import production
+        digest = production.ReleaseBundle.from_payload(
+            json.loads(self.bundle_path.read_text())).bundle_digest
+        self.assertEqual(self.run_cli("approve", "--deployment", deployment,
+                                      "--actor", "owner", "--ref", "signoff/cli",
+                                      "--digest", digest), 0)
+        self.assertEqual(self.run_cli("deploy", "--deployment", deployment), 0)
+        self.assertEqual(self.run_cli("receipt", "--deployment", deployment), 0)
+
+    def test_an_emergency_stop_from_the_cli_closes_the_environment(self):
+        self.assertEqual(self.register("staging", "--autonomous"), 0)
+        self.assertEqual(self.run_cli("stop", "--scope", "environment",
+                                      "--environment", "shop-prod"), 0)
+        self.assertEqual(self.admit(), 1)
+
+
 if __name__ == "__main__":
     unittest.main()
