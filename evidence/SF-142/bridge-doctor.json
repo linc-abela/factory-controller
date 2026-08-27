@@ -1,0 +1,149 @@
+{
+  "capabilities": [
+    "prototype"
+  ],
+  "capability_admissions": {
+    "admissions": [],
+    "admitted_capabilities": [],
+    "digest": "a2aac8591a4af906ced05f6257e2ca5f9c4e68874cb9ca02048b7dbe9d07c959",
+    "path": "/Users/Shared/factory/bin/capabilities.json",
+    "present": false,
+    "serving": [
+      "prototype"
+    ],
+    "status": "ok"
+  },
+  "containment": {
+    "sandbox_exec_present": true
+  },
+  "dual_service": "clear: no legacy service is loaded",
+  "execution_backend": {
+    "backend": "direct",
+    "status": "available"
+  },
+  "execution_mode": "real",
+  "lanes": {
+    "checks": {
+      "git": "/opt/homebrew/bin/git",
+      "records_writable": true,
+      "root_is_symlink": false,
+      "root_realpath": "/Users/karlosabay/.factory-bridge/lanes",
+      "runs_writable": true,
+      "workspace_bytes": 0,
+      "workspace_limit_bytes": null,
+      "worktrees_writable": true
+    },
+    "policy": {
+      "global_limit": 4,
+      "lease_seconds": 900,
+      "max_events": 1024,
+      "max_project_workspace_bytes": null,
+      "max_workspace_bytes": null,
+      "per_project_limit": 2
+    },
+    "root": "/Users/karlosabay/.factory-bridge/lanes",
+    "schema_version": "factory.bridge.lanes.v1",
+    "status": "ok"
+  },
+  "legacy": {
+    "action": "detected only; unloading and removal are Owner actions",
+    "label": "com.astral.bridge",
+    "plist_path": "/Users/karlosabay/Library/LaunchAgents/com.astral.bridge.plist",
+    "plist_present": true,
+    "prefix": "/Users/Shared/astral",
+    "prefix_present": true,
+    "service_loaded": false
+  },
+  "provider": {
+    "path": "/Users/Shared/Projects/software-factory/factory-bridge/providers.json",
+    "profiles": [
+      {
+        "capabilities": [
+          "prototype"
+        ],
+        "configured_executable": "codex",
+        "priority": 10,
+        "profile_id": "codex-primary",
+        "provider": "codex",
+        "readiness": "not_probed",
+        "readiness_detail": "profile declares no readiness probe",
+        "requires_disposable": true,
+        "resolved_executable": "/Users/karlosabay/.codex/packages/standalone/releases/0.144.1-aarch64-apple-darwin/bin/codex",
+        "status": "available",
+        "timeout_seconds": 3600
+      },
+      {
+        "capabilities": [
+          "prototype"
+        ],
+        "configured_executable": "cursor-agent",
+        "priority": 15,
+        "profile_id": "cursor-secondary",
+        "provider": "cursor",
+        "readiness": "unavailable",
+        "readiness_detail": "readiness probe exited 1",
+        "requires_disposable": true,
+        "resolved_executable": "/Users/karlosabay/.local/share/cursor-agent/versions/2026.08.11-e8db854/cursor-agent",
+        "status": "available",
+        "timeout_seconds": 3600
+      },
+      {
+        "capabilities": [
+          "prototype"
+        ],
+        "configured_executable": "claude",
+        "priority": 20,
+        "profile_id": "claude-secondary",
+        "provider": "claude",
+        "readiness": "not_probed",
+        "readiness_detail": "profile declares no readiness probe",
+        "requires_disposable": true,
+        "resolved_executable": "/Users/karlosabay/.local/share/claude/versions/2.1.232",
+        "status": "available",
+        "timeout_seconds": 3600
+      }
+    ],
+    "selection_order": [
+      "codex-primary",
+      "cursor-secondary",
+      "claude-secondary"
+    ],
+    "status": "available"
+  },
+  "registry": {
+    "digest": "22415b56df9efb953b110d6a336dc3802e25fa684a7af72adc3ef68bcd06466d",
+    "path": "/Users/Shared/Projects/software-factory/factory-bridge/projects.json",
+    "projects": [
+      {
+        "capabilities": [
+          "prototype"
+        ],
+        "checkout": "/Users/Shared/Projects/software-factory/factory-prototype-lab",
+        "disposable": true,
+        "project_id": "factory-prototype-lab",
+        "repository_remote_url": "https://github.com/linc-abela/factory-prototype-lab.git",
+        "resolution": "resolved"
+      }
+    ]
+  },
+  "registry_drift": "none",
+  "service": {
+    "label": "com.softwarefactory.bridge",
+    "name": "factory-bridge",
+    "plist_path": "/Users/karlosabay/Library/LaunchAgents/com.softwarefactory.bridge.plist",
+    "plist_present": true,
+    "socket_path": "/Users/Shared/factory/run/factory.sock",
+    "socket_present": true
+  },
+  "source": {
+    "installed_sha": "a914db5f3ad6579937585a8ce7623f773f90a9b9",
+    "root": "/Users/Shared/Projects/software-factory/factory-bridge",
+    "sha": "51109bae93d2db9095a7002e78a1aea47aa54464",
+    "version_file": "a914db5f3ad6579937585a8ce7623f773f90a9b9"
+  },
+  "unresolved_projects": [],
+  "vault_root": {
+    "is_git_checkout": true,
+    "path": "/Users/Shared/Projects/software-factory/factory-vault"
+  }
+}

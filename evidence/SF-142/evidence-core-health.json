@@ -1,0 +1,9 @@
+{
+  "status": "ACCEPTED",
+  "identity": "afca6e7c54af2faed94f6471c6724ecceaa2ef02",
+  "acceptance_digest": "dffb93a77b22b357c7453f62e035902d5ac55994f7a25cf6be54c9488181dc82",
+  "tests": 399,
+  "collected_by": "SF-142",
+  "method": "git clone to a scratch directory, checkout afca6e7, ./dev check && ./dev accept && ./dev stage9",
+  "evidence_class": "rederived"
+}

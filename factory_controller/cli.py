@@ -11,6 +11,7 @@ from pathlib import Path
 
 from . import activation
 from . import advisor as advisory
+from . import dogfood
 from . import improvement as imp
 from . import maintenance as mnt
 from . import portfolio
@@ -200,6 +201,22 @@ def parser() -> argparse.ArgumentParser:
     mnt_parser.add_argument("--reason", dest="mnt_reason", default="operator")
     mnt_parser.add_argument("--policy-version", dest="mnt_policy_version",
                             default="unset")
+
+    dog = sub.add_parser("dogfood")
+    dog.add_argument("action", choices=("contract", "preflight", "gate"))
+    dog.add_argument("--contract", dest="dog_contract",
+                     default="contracts/internal-dogfood-run-contract.json")
+    dog.add_argument("--report", dest="dog_reports", action="append", default=[],
+                     metavar="NAME=PATH",
+                     help="a JSON report from another repository, e.g. "
+                          "bridge_doctor=/tmp/doctor.json; repeatable")
+    dog.add_argument("--evidence", dest="dog_evidence",
+                     help="observed values for the productization gate")
+    dog.add_argument("--label", dest="dog_label", default=activation.DEFAULT_LABEL)
+    dog.add_argument("--agents-dir", dest="dog_agents_dir",
+                     default=str(Path.home() / "Library" / "LaunchAgents"))
+    dog.add_argument("--state-dir", dest="dog_state_dir",
+                     default=str(Path.home() / ".factory-controller"))
 
     sup_parser = sub.add_parser("supervisor")
     sup_parser.add_argument("action", choices=(
@@ -608,6 +625,64 @@ def _supervisor(args, controller) -> int:
     return 0
 
 
+def _dogfood(args, controller) -> int:
+    """Read the run contract, or read the host against it.  Nothing is written.
+
+    The service state is computed here rather than taken as a report: it is the
+    one prerequisite the Controller can observe directly, and reading it from
+    the same plan the install command would write means the preflight cannot
+    disagree with the installer about what "installed" means.
+    """
+
+    try:
+        contract = dogfood.load_contract(args.dog_contract)
+    except dogfood.ContractError as exc:
+        print(json.dumps({"refused": {"code": "DOGFOOD_CONTRACT_INVALID",
+                                      "detail": str(exc)}}, sort_keys=True))
+        return 2
+    if args.action == "contract":
+        print(json.dumps(contract.as_row(), sort_keys=True))
+        return 0
+    if args.action == "gate":
+        observed = (json.loads(Path(args.dog_evidence).read_text())
+                    if args.dog_evidence else {})
+        result = dogfood.productization_gate(contract, observed)
+        print(json.dumps(result, sort_keys=True))
+        return 0 if result["verdict"] == "PROCEED_TO_PRODUCTIZATION" else 1
+
+    reports = {}
+    for pair in args.dog_reports:
+        name, _, path = pair.partition("=")
+        if not path:
+            print(json.dumps({"refused": {"code": "DOGFOOD_REPORT_MALFORMED",
+                                          "detail": "expected NAME=PATH, got %r"
+                                                    % pair}}, sort_keys=True))
+            return 2
+        try:
+            reports[name] = json.loads(Path(path).read_text())
+        except (OSError, ValueError) as exc:
+            print(json.dumps({"refused": {"code": "DOGFOOD_REPORT_UNREADABLE",
+                                          "detail": "%s: %s" % (name, exc)}},
+                             sort_keys=True))
+            return 2
+    plane = sup.OperationsSupervisor(controller)
+    try:
+        plan = activation.from_contract(
+            plane.service_contract(invocation=_service_invocation(args),
+                                   interval_seconds=300),
+            agents_dir=args.dog_agents_dir, state_dir=args.dog_state_dir,
+            working_dir=str(Path.cwd()), label=args.dog_label)
+        service = activation.doctor(plan)
+    except activation.ActivationError as exc:
+        service = {"definition_present": False, "drift": "unknown",
+                   "detail": str(exc)}
+    result = dogfood.preflight(contract, store=controller.store,
+                               supervisor_plane=plane, reports=reports,
+                               service_doctor=service).as_row()
+    print(json.dumps(result, sort_keys=True))
+    return 0 if result["ready"] else 1
+
+
 def _service_invocation(args) -> list[str]:
     return [sys.executable, "-m", "factory_controller.cli",
             "--db", args.db, "supervisor", "cycle"]
@@ -763,6 +838,8 @@ def main(argv: list[str] | None = None) -> int:
         return _improvement(args, controller)
     elif args.command == "supervisor":
         return _supervisor(args, controller)
+    elif args.command == "dogfood":
+        return _dogfood(args, controller)
     elif args.command == "harness":
         ids = []
         for index in range(args.missions):

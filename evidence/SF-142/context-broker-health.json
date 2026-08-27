@@ -1,0 +1,10 @@
+{
+  "status": "ok",
+  "identity": "02a6a373f16072d380342e288606000d5106cd21",
+  "tests": 31,
+  "skipped": 1,
+  "collected_by": "SF-142",
+  "method": "git clone to a scratch directory, checkout 02a6a37, ./dev test",
+  "evidence_class": "rederived",
+  "note": "the broker has no doctor verb; its suite is the only health signal it offers, and it still has no git remote"
+}
