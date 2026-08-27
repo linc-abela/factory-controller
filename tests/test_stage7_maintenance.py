@@ -25,6 +25,7 @@ from factory_controller.engine import Controller, RetryPolicy
 from factory_controller.store import MissionStore
 
 from tests.support import ALPHA, BETA, LayerAdapter
+from tests.test_authority_boundaries import code_text
 
 SHA = "a" * 40
 OTHER_SHA = "b" * 40
@@ -899,3 +900,114 @@ class MaintenanceCLITests(unittest.TestCase):
         self.assertEqual(len(actions), 1)
         for forbidden in ("run", "worker", "loop", "watch", "start"):
             self.assertNotIn(forbidden, actions[0].choices)
+
+
+# --------------------------------------------------------------------------- #
+# what maintenance reuses rather than restates
+# --------------------------------------------------------------------------- #
+
+class Stage5ReuseTests(PlaneCase):
+    """A repair is an ordinary mission, so Stage 5 governs it unmodified.
+
+    These are the tests that would fail if maintenance had grown a scheduler of
+    its own.  Nothing in `maintenance.py` mentions fairness, dependencies,
+    budgets, drain or emergency stop; the portfolio scheduler already inside
+    `MissionStore.claim` does all of it, and these prove the repair mission is
+    genuinely subject to it rather than routed around it.
+    """
+
+    OTHER = "warehouse"
+    OTHER_REPO = "https://example.invalid/warehouse.git"
+
+    def open_repair(self, controller):
+        trigger = self.plane.admit_trigger("production_incident", self.incident())
+        mission, _ = self.plane.create_repair_mission(
+            trigger["trigger_ref"], controller, acceptance_gate_ids=GATES,
+            provider_candidates=CANDIDATES)
+        return trigger["trigger_ref"], mission
+
+    def test_a_project_paused_after_admission_still_stops_the_repair_running(self):
+        self.policy()
+        controller = self.controller()
+        _, mission = self.open_repair(controller)
+        self.store.set_project_state(PROJECT, "paused")
+        self.assertIsNone(controller.work_once("w-1"))
+        self.assertEqual(self.store.get(mission["id"])["state"], "admitted")
+
+    def test_an_emergency_stop_after_admission_stops_the_repair_running(self):
+        self.policy()
+        controller = self.controller()
+        _, mission = self.open_repair(controller)
+        self.store.emergency_stop(True)
+        self.assertIsNone(controller.work_once("w-1"))
+        self.assertEqual(self.store.get(mission["id"])["state"], "admitted")
+
+    def test_a_repair_mission_carries_its_own_project_into_the_scheduler(self):
+        self.policy()
+        controller = self.controller()
+        _, mission = self.open_repair(controller)
+        self.assertEqual(self.store.get(mission["id"])["project_id"], PROJECT)
+        decision = self.store.schedule_preview()
+        self.assertEqual(decision["selected"], mission["id"])
+
+    def test_two_projects_repairs_are_scheduled_independently(self):
+        self.policy()
+        self.register_project(self.OTHER, self.OTHER_REPO)
+        self.plane.set_policy(maintenance.MaintenancePolicy(
+            project_id=self.OTHER, enabled=True, cooldown_seconds=0,
+            policy_version="mp-w1"))
+        other_env = production.EnvironmentPolicy(
+            environment_id="warehouse-staging", project_id=self.OTHER,
+            environment_class="staging", repository=self.OTHER_REPO,
+            service_ref="warehouse-api", approver_refs=("owner",), autonomous=True)
+        self.ledger.register_environment(other_env)
+        self.ledger.declare_incident(
+            incident_ref="INC-W1", environment_id="warehouse-staging",
+            declared_by="owner", incident_class="triaged_defect",
+            affected_release_sha=OTHER_SHA, affected_bundle_ref="rc-w0",
+            failing_behaviour="picking API 500s", blast_radius="warehouse")
+        controller = self.controller()
+        self.open_repair(controller)
+        other = self.plane.admit_trigger("production_incident", "INC-W1")
+        self.plane.create_repair_mission(
+            other["trigger_ref"], controller, acceptance_gate_ids=GATES,
+            provider_candidates=CANDIDATES)
+        while controller.work_once("w-1") is not None:
+            pass
+        self.assertEqual(self.store.counts().get("completed"), 2)
+        for row in self.plane.repairs():
+            self.assertEqual(self.store.get(row["mission_ref"])["project_id"],
+                             row["project_id"])
+
+    def test_a_closed_repair_submits_no_mission(self):
+        self.policy()
+        controller = self.controller()
+        trigger = self.plane.admit_trigger("production_incident", self.incident())
+        self.plane.close(trigger["trigger_ref"], "abandoned", reason="operator")
+        with self.assertRaises(maintenance.MaintenanceRefusal) as raised:
+            self.plane.create_repair_mission(
+                trigger["trigger_ref"], controller, acceptance_gate_ids=GATES,
+                provider_candidates=CANDIDATES)
+        self.assertEqual(raised.exception.code, "MAINTENANCE_REPAIR_CLOSED")
+        self.assertEqual(self.store.counts(), {})
+
+    def test_maintenance_names_no_runtime_and_no_model(self):
+        """Logical roles stay provider-agnostic; the palette is the caller's.
+
+        `provider_candidates` is an argument, never a value this module holds,
+        so a repair runs on whatever the Owner's palette offers and the module
+        works unchanged when a runtime is added or removed.
+
+        Scanned as *code* rather than as text, with the package's own scanner:
+        a docstring here says what the module refuses to contain, and a check
+        that cannot tell that apart from a real identifier is a check that
+        punishes the module for documenting its own boundary.
+        """
+        text = code_text(Path(maintenance.__file__).read_text())
+        for token in ("openrouter", "gateway", "advisor", "model",
+                      "provider_profile", "profile_id"):
+            self.assertNotIn(token, text, "maintenance.py names %r" % token)
+
+    def test_that_scan_would_actually_catch_a_runtime_reaching_the_module(self):
+        planted = code_text("def go(profile_id):\n    return profile_id\n")
+        self.assertIn("profile_id", planted)

@@ -655,6 +655,12 @@ class MaintenancePlane:
         """
 
         row = self._repair(trigger_ref)
+        if row["disposition"]:
+            raise MaintenanceRefusal(
+                "MAINTENANCE_REPAIR_CLOSED",
+                "repair %s is already %s; a closed repair does not submit work"
+                % (trigger_ref, row["disposition"]),
+                trigger_ref=trigger_ref, project_id=row["project_id"])
         if row["mission_ref"]:
             existing = controller.store.get(row["mission_ref"])
             if existing is not None:
