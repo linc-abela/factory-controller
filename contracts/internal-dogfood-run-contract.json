@@ -2,24 +2,51 @@
   "schema_version": "factory.controller.internal_dogfood_run_contract.v1",
   "run_ref": "SF-142-internal-dogfood-1",
   "summary": "The Software Factory as its own first customer: two disposable labs it already owns, one backlog/improvement target and one defect target, staging-only, budget-capped, Owner-stoppable.",
-  "projects": ["factory-prototype-lab", "factory-bug-lab"],
-  "work_classes": ["backlog", "maintenance", "improvement"],
-  "provider_profiles": ["codex-primary", "claude-secondary"],
-  "optional_providers": ["cursor-secondary"],
-  "environment_classes": ["local-sim", "staging"],
+  "projects": [
+    "factory-prototype-lab",
+    "factory-bug-lab"
+  ],
+  "work_classes": [
+    "backlog",
+    "maintenance",
+    "improvement"
+  ],
+  "provider_profiles": [
+    "codex-primary",
+    "claude-secondary"
+  ],
+  "optional_providers": [
+    "cursor-secondary"
+  ],
+  "environment_classes": [
+    "local-sim",
+    "staging"
+  ],
   "budget_ceiling": 25.0,
   "budget_currency": "USD",
   "window_start_hour": null,
   "window_end_hour": null,
   "evidence_cadence_cycles": 12,
-  "required_reports": ["bridge_doctor", "evidence_core", "context_broker"],
+  "required_reports": [
+    "bridge_doctor",
+    "evidence_core",
+    "context_broker"
+  ],
   "acceptance_gates": {
     "factory-prototype-lab": {
-      "acceptance_gate_ids": ["dev-check", "dev-test", "dev-evaluate"],
+      "acceptance_gate_ids": [
+        "dev-check",
+        "dev-test",
+        "dev-evaluate"
+      ],
       "acceptance_gate_source": "https://github.com/linc-abela/factory-prototype-lab.git@229b923b050fe8a4450d5597d472157bd42c8647:dev"
     },
     "factory-bug-lab": {
-      "acceptance_gate_ids": ["dev-check", "dev-test", "dev-reproduce"],
+      "acceptance_gate_ids": [
+        "dev-check",
+        "dev-test",
+        "dev-reproduce"
+      ],
       "acceptance_gate_source": "https://github.com/linc-abela/factory-bug-lab.git@961a4c97d49183b5501f244ba48773d9f50953ae:dev"
     }
   },
@@ -44,24 +71,115 @@
   ],
   "productization_gate": {
     "gate_ref": "PRODUCTIZATION-ENTRY-1",
-    "rationale": "Every threshold retires a specific risk that the current evidence does not retire, and each number is chosen from what has actually been measured rather than from a round figure. The Stage-9 campaign covered 288 cycles of virtual time, four simulated projects and zero cycles of real host time; the one real end-to-end mission on record (FLM-1) reached a provider through a path whose dispatch leg was a fixture. So the sustained-operation numbers are stated in real host cycles and real days, and the execution numbers are stated in missions that reached a provider process. 2016 cycles is seven days at the contract's 300-second interval: the shortest span that necessarily contains a host sleep/wake, a reboot and a weekly rhythm. 20 real missions is the smallest sample in which a 5% failure rate makes at least one failure expected rather than surprising, which is what makes a zero-failure result meaningful. Two projects is the minimum at which cross-project isolation is a claim about the mechanism and not about the only project there was. Zero is used only where a single instance falsifies a safety property outright -- duplicate irreversible effects, authority bypass, isolation violations, gate-provenance violations -- because for those a ratio would be a tolerance nobody decided to grant. 0.95 for cost accounting rather than 1.0 because a provider that returns no usage block is a reported-claim absence the Factory records honestly as not_measurable, and refusing to productize over a provider's telemetry gap would put the gate on the wrong party. Four Owner control acts is the whole control surface -- pause, drain, emergency stop, clear -- each proven against the real host rather than a store.",
+    "rationale": "Every threshold retires a specific risk that the current evidence does not retire, and each number is chosen from what has actually been measured rather than from a round figure. The Stage-9 campaign covered 288 cycles of virtual time, four simulated projects and zero cycles of real host time; the one real end-to-end mission on record (FLM-1) reached a provider through a path whose dispatch leg was a fixture. So the sustained-operation numbers are stated in real host cycles and real days, and the execution numbers are stated in missions that reached a provider process. 2016 cycles is seven days at the contract's 300-second interval: the shortest span that necessarily contains a host sleep/wake, a reboot and a weekly rhythm. 20 real missions is the smallest sample in which a 5% failure rate makes at least one failure expected rather than surprising, which is what makes a zero-failure result meaningful. Two projects is the minimum at which cross-project isolation is a claim about the mechanism and not about the only project there was. Zero is used only where a single instance falsifies a safety property outright -- duplicate irreversible effects, authority bypass, isolation violations, gate-provenance violations -- because for those a ratio would be a tolerance nobody decided to grant. 0.95 for cost accounting rather than 1.0 because a provider that returns no usage block is a reported-claim absence the Factory records honestly as not_measurable, and refusing to productize over a provider's telemetry gap would put the gate on the wrong party. Four Owner control acts is the whole control surface -- pause, drain, emergency stop, clear -- each proven against the real host rather than a store. Reconciled against SF-141B, which reviewed this gate independently and proposed six criteria of its own. Three of its numbers were stricter and are taken as binding: 50 real-provider missions rather than 20, and five real restarts rather than three. The 20-mission figure stays in this rationale because it is the floor below which a zero-failure result means nothing; 50 is what independent QA required above it, and the stricter of two defensible numbers wins. Its demand for 100% metered spend and this contract's 0.95 are the same requirement scoped differently and both are kept: 0.95 across all missions, because a provider that returns no usage block is an honest not_measurable absence and refusing to productize over another party's telemetry gap puts the gate on the wrong party, plus zero unmeasured legs among those that were actually priced, which is the case SF-141B was pointing at. Its sixth criterion, an explicit Owner review and ratification of the dogfood log, was missing here and is adopted outright: every other criterion can be satisfied by machinery, and a gate whose last step is also machinery has nobody in it.",
     "criteria": [
-      {"criterion": "unattended_cycles_real_host", "threshold": 2016, "comparison": "at_least", "retires": "sustained unattended operation"},
-      {"criterion": "consecutive_days_without_owner_intervention", "threshold": 7, "comparison": "at_least", "retires": "sustained unattended operation"},
-      {"criterion": "real_provider_missions_completed", "threshold": 20, "comparison": "at_least", "retires": "real-provider execution"},
-      {"criterion": "real_provider_distinct_projects", "threshold": 2, "comparison": "at_least", "retires": "multi-project execution"},
-      {"criterion": "restart_recoveries_observed", "threshold": 3, "comparison": "at_least", "retires": "restart and recovery"},
-      {"criterion": "duplicate_irreversible_effects", "threshold": 0, "comparison": "at_most", "retires": "exactly-once execution"},
-      {"criterion": "repairs_completed_end_to_end", "threshold": 3, "comparison": "at_least", "retires": "autonomous maintenance"},
-      {"criterion": "improvements_promoted_end_to_end", "threshold": 1, "comparison": "at_least", "retires": "autonomous improvement"},
-      {"criterion": "cost_accounted_mission_ratio", "threshold": 0.95, "comparison": "at_least", "retires": "cost and accounting"},
-      {"criterion": "context_measured_mission_ratio", "threshold": 0.95, "comparison": "at_least", "retires": "context accounting"},
-      {"criterion": "security_isolation_violations", "threshold": 0, "comparison": "at_most", "retires": "security and isolation"},
-      {"criterion": "authority_bypass_events", "threshold": 0, "comparison": "at_most", "retires": "zero authority bypass"},
-      {"criterion": "acceptance_gate_provenance_violations", "threshold": 0, "comparison": "at_most", "retires": "acceptance-gate provenance"},
-      {"criterion": "owner_control_acts_observed", "threshold": 4, "comparison": "at_least", "retires": "Owner controls"},
-      {"criterion": "rollback_recoveries_observed", "threshold": 1, "comparison": "at_least", "retires": "rollback and recovery"},
-      {"criterion": "evidence_digest_reproductions", "threshold": 7, "comparison": "at_least", "retires": "evidence reproducibility"}
+      {
+        "criterion": "unattended_cycles_real_host",
+        "threshold": 2016,
+        "comparison": "at_least",
+        "retires": "sustained unattended operation"
+      },
+      {
+        "criterion": "consecutive_days_without_owner_intervention",
+        "threshold": 7,
+        "comparison": "at_least",
+        "retires": "sustained unattended operation"
+      },
+      {
+        "criterion": "real_provider_missions_completed",
+        "threshold": 50,
+        "comparison": "at_least",
+        "retires": "real-provider execution"
+      },
+      {
+        "criterion": "real_provider_distinct_projects",
+        "threshold": 2,
+        "comparison": "at_least",
+        "retires": "multi-project execution"
+      },
+      {
+        "criterion": "restart_recoveries_observed",
+        "threshold": 5,
+        "comparison": "at_least",
+        "retires": "restart and recovery"
+      },
+      {
+        "criterion": "duplicate_irreversible_effects",
+        "threshold": 0,
+        "comparison": "at_most",
+        "retires": "exactly-once execution"
+      },
+      {
+        "criterion": "repairs_completed_end_to_end",
+        "threshold": 3,
+        "comparison": "at_least",
+        "retires": "autonomous maintenance"
+      },
+      {
+        "criterion": "improvements_promoted_end_to_end",
+        "threshold": 1,
+        "comparison": "at_least",
+        "retires": "autonomous improvement"
+      },
+      {
+        "criterion": "cost_accounted_mission_ratio",
+        "threshold": 0.95,
+        "comparison": "at_least",
+        "retires": "cost and accounting"
+      },
+      {
+        "criterion": "context_measured_mission_ratio",
+        "threshold": 0.95,
+        "comparison": "at_least",
+        "retires": "context accounting"
+      },
+      {
+        "criterion": "security_isolation_violations",
+        "threshold": 0,
+        "comparison": "at_most",
+        "retires": "security and isolation"
+      },
+      {
+        "criterion": "authority_bypass_events",
+        "threshold": 0,
+        "comparison": "at_most",
+        "retires": "zero authority bypass"
+      },
+      {
+        "criterion": "acceptance_gate_provenance_violations",
+        "threshold": 0,
+        "comparison": "at_most",
+        "retires": "acceptance-gate provenance"
+      },
+      {
+        "criterion": "owner_control_acts_observed",
+        "threshold": 4,
+        "comparison": "at_least",
+        "retires": "Owner controls"
+      },
+      {
+        "criterion": "rollback_recoveries_observed",
+        "threshold": 1,
+        "comparison": "at_least",
+        "retires": "rollback and recovery"
+      },
+      {
+        "criterion": "evidence_digest_reproductions",
+        "threshold": 7,
+        "comparison": "at_least",
+        "retires": "evidence reproducibility"
+      },
+      {
+        "criterion": "unmeasured_priced_leg_count",
+        "threshold": 0,
+        "comparison": "at_most",
+        "retires": "cost and accounting"
+      },
+      {
+        "criterion": "owner_signoff_recorded",
+        "threshold": true,
+        "retires": "Owner controls"
+      }
     ]
   }
 }

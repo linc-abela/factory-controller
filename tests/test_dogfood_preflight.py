@@ -282,6 +282,25 @@ class ProductizationGateTests(unittest.TestCase):
         self.assertEqual(result["verdict"], "PROCEED_TO_PRODUCTIZATION")
         self.assertEqual(result["unproven"], [])
 
+    def test_a_boolean_criterion_needs_the_observation_not_a_default(self):
+        """The Owner signoff adopted from SF-141B: machinery cannot supply it."""
+
+        result = dogfood.productization_gate(self.contract)
+        row = next(item for item in result["criteria"]
+                   if item["criterion"] == "owner_signoff_recorded")
+        self.assertEqual(row["state"], dogfood.UNKNOWN)
+        self.assertEqual(
+            dogfood.productization_gate(
+                self.contract, {"owner_signoff_recorded": False})["criteria"][-1]
+            ["state"], dogfood.UNMET)
+
+    def test_the_sibling_reconciliation_took_the_stricter_number(self):
+        thresholds = {item["criterion"]: item["threshold"]
+                      for item in self.contract.productization_gate["criteria"]}
+        self.assertEqual(thresholds["real_provider_missions_completed"], 50)
+        self.assertEqual(thresholds["restart_recoveries_observed"], 5)
+        self.assertEqual(thresholds["unmeasured_priced_leg_count"], 0)
+
     def test_the_gate_covers_every_risk_class_the_task_named(self):
         retired = {criterion["retires"] for criterion
                    in self.contract.productization_gate["criteria"]}
