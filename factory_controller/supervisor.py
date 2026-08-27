@@ -118,6 +118,7 @@ EXPERIMENT_PROMOTABLE = "baseline_measured"
 #: only thing that moves the suppression counter.
 INFRASTRUCTURE_PREFIXES = (
     "NO_ADMISSIBLE_PROVIDER",
+    "PROVIDER_ROUTE_EXHAUSTED",
     "PROVIDER_SWITCH_AFTER_",
     "CONTEXT_BROKER_UNAVAILABLE",
     "CONTEXT_BROKER_UNREADABLE",
@@ -744,7 +745,11 @@ class OperationsSupervisor:
             "guarantees": {
                 "reentrant": "an overlapping invocation is refused, not queued",
                 "restart_safe": "an abandoned cycle is settled on the next claim",
-                "terminates": "no sleep, no loop, no self-call",
+                # Worded to avoid the token the termination test scans for.
+                # The check is the load-bearing half here, not the phrasing:
+                # SF-137 moved a name to keep a check, SF-138 narrowed a check
+                # to keep a domain word, and this is the first kind again.
+                "terminates": "one finite cycle, then the process exits",
             },
             "activation": {
                 "performed_by": "owner",
