@@ -135,6 +135,66 @@ class TerminationTests(unittest.TestCase):
         self.assertIn('environment_class="staging"', self.SOURCE)
 
 
+class NeutralityRegressionTests(unittest.TestCase):
+    """The advisory service and the metered gateway are optional, and absent.
+
+    Scope 11 asks for a regression rather than an assertion: the whole dogfood
+    path must work with both switched off.  It does, and the reason is
+    structural -- neither reaches this path at all, so there is no configuration
+    under which one of them becomes required.
+    """
+
+    PACKAGE = MODULE.parent
+
+    def imported(self, name):
+        tree = ast.parse((self.PACKAGE / name).read_text())
+        names = set()
+        for node in ast.walk(tree):
+            if isinstance(node, ast.ImportFrom) and node.module is None:
+                names.update(alias.name for alias in node.names)
+            elif isinstance(node, ast.Import):
+                names.update(alias.name.split(".")[-1] for alias in node.names)
+        return names
+
+    def test_the_dogfood_path_imports_neither_seam(self):
+        for module in ("rehearsal.py", "dogfood.py", "activation.py"):
+            imported = self.imported(module)
+            self.assertNotIn("advisor", imported, module)
+            self.assertNotIn("gateway", imported, module)
+
+    def test_no_vendor_name_reaches_the_run_contract_or_the_preflight(self):
+        """A provider profile is an opaque string on both sides of the seam."""
+
+        from factory_controller import dogfood
+        source = (self.PACKAGE / "dogfood.py").read_text().lower()
+        for token in ("anthropic", "openai", "claude", "codex", "cursor",
+                      "gemini", "hermes", "openrouter"):
+            self.assertNotIn(token, source, token)
+        self.assertNotIn("hermes", str(dogfood.CONTRACT_SCHEMA).lower())
+
+    def test_the_rehearsal_runs_with_no_advisor_and_no_gateway_configured(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            result = rehearsal.run(tmp, only=("normal_backlog",
+                                              "maintenance_repair"))
+        self.assertEqual(result["failed"], [])
+
+    def test_no_evidence_artifact_carries_a_secret_shaped_value(self):
+        """A leak scan over what this task actually wrote to disk."""
+
+        import re
+        evidence = MODULE.parent.parent / "evidence" / "SF-142"
+        patterns = (re.compile(r"sk-[A-Za-z0-9]{16,}"),
+                    re.compile(r"(?i)(api[_-]?key|password|bearer)\s*[\"':=]\s*\S{8,}"),
+                    re.compile(r"gh[pous]_[A-Za-z0-9]{20,}"))
+        for path in sorted(evidence.rglob("*")):
+            if not path.is_file():
+                continue
+            text = path.read_text(errors="replace")
+            for pattern in patterns:
+                self.assertIsNone(pattern.search(text),
+                                  "%s carries a secret-shaped value" % path.name)
+
+
 class OperatorSurfaceTests(unittest.TestCase):
     def test_a_rehearsal_without_a_root_is_refused(self):
         from factory_controller.cli import main
