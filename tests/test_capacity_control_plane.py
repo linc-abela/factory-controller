@@ -565,6 +565,49 @@ class OwnerBriefTests(PortfolioTestCase, unittest.TestCase):
         self.assertEqual(brief["next_eligible"], "not_applicable")
 
 
+class CapacityCLITests(unittest.TestCase):
+    """The Owner's surface, including the two things it must not offer."""
+
+    def setUp(self) -> None:
+        import tempfile
+        from pathlib import Path
+        temp = tempfile.TemporaryDirectory()
+        self.addCleanup(temp.cleanup)
+        self.db = str(Path(temp.name) / "cli.db")
+
+    def run_cli(self, *argv) -> int:
+        from factory_controller.cli import main
+        return main(["--db", self.db, "capacity", *argv])
+
+    def test_a_registration_and_a_measurement_round_trip(self):
+        self.assertEqual(self.run_cli("policy", "--runtime", ALPHA), 0)
+        self.assertEqual(self.run_cli(
+            "observe", "--runtime", ALPHA, "--state", "constrained",
+            "--source", "execution_layer", "--source-ref", "probe",
+            "--remaining", "2", "--unit", "missions", "--precision", "exact"), 0)
+        self.assertEqual(self.run_cli("readings"), 0)
+        self.assertEqual(self.run_cli("brief"), 0)
+
+    def test_a_measurement_with_no_provenance_is_refused_at_the_surface(self):
+        self.assertEqual(self.run_cli("observe", "--runtime", ALPHA,
+                                      "--state", "cooling", "--source", "owner"), 1)
+
+    def test_the_brief_exits_non_zero_when_no_runtime_is_usable(self):
+        self.assertEqual(self.run_cli("policy", "--runtime", ALPHA), 0)
+        self.assertEqual(self.run_cli("brief"), 1)
+
+    def test_the_surface_offers_no_verb_that_declares_a_window_open(self):
+        """A window is a vendor's fact.  Declaring one open just moves the
+        refusal from the Controller to the harness, one dispatch later."""
+
+        from factory_controller.cli import parser
+        actions = [action for action in parser()._subparsers._group_actions[0].choices
+                   ["capacity"]._actions if action.dest == "action"]
+        self.assertEqual(set(actions[0].choices),
+                         {"policy", "policies", "observe", "readings",
+                          "observations", "brief", "checkpoint"})
+
+
 class AuthorityTests(unittest.TestCase):
     def test_capacity_cannot_create_work_or_widen_a_permission(self):
         """The module has no verb that admits, approves, registers or promotes."""

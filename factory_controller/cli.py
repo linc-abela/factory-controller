@@ -10,8 +10,10 @@ import time
 from pathlib import Path
 
 from . import activation
+from . import capacity
 from . import advisor as advisory
 from . import dogfood
+from . import continuity
 from . import improvement as imp
 from . import maintenance as mnt
 from . import portfolio
@@ -53,6 +55,34 @@ def parser() -> argparse.ArgumentParser:
     cancel.add_argument("mission_id")
     harness = sub.add_parser("harness")
     harness.add_argument("--missions", type=int, default=10)
+    baton = sub.add_parser("baton")
+    baton.add_argument("action", choices=("inspect",))
+    baton.add_argument("--baton-id")
+
+    cap = sub.add_parser("capacity")
+    cap.add_argument("action", choices=("policy", "policies", "observe",
+                                        "readings", "observations", "brief",
+                                        "checkpoint"))
+    cap.add_argument("--runtime", dest="cap_runtime")
+    cap.add_argument("--state", dest="cap_state", choices=capacity.CAPACITY_STATES)
+    cap.add_argument("--source", dest="cap_source")
+    cap.add_argument("--source-ref", dest="cap_source_ref")
+    cap.add_argument("--observed-at", dest="cap_observed_at", type=float)
+    cap.add_argument("--window-started-at", dest="cap_window_started_at", type=float)
+    cap.add_argument("--expected-reset-at", dest="cap_reset_at", type=float)
+    cap.add_argument("--remaining", dest="cap_remaining", type=float)
+    cap.add_argument("--unit", dest="cap_unit")
+    cap.add_argument("--precision", dest="cap_precision",
+                     choices=capacity.PRECISIONS, default="unknown")
+    cap.add_argument("--unmanaged", dest="cap_unmanaged", action="store_true")
+    cap.add_argument("--handoff", dest="cap_handoff",
+                     choices=capacity.HANDOFF_MODES, default="allowed")
+    cap.add_argument("--max-age", dest="cap_max_age", type=float,
+                     default=capacity.DEFAULT_OBSERVATION_MAX_AGE_SECONDS)
+    cap.add_argument("--backoff", dest="cap_backoff", type=float,
+                     default=capacity.DEFAULT_UNKNOWN_RESET_BACKOFF_SECONDS)
+    cap.add_argument("--policy-version", dest="cap_policy_version", default="unset")
+    cap.add_argument("--mission", dest="cap_mission")
 
     project = sub.add_parser("project")
     project.add_argument("action", choices=("register", "state", "list"))
@@ -551,6 +581,68 @@ def _improvement(args, controller) -> int:
     return 0
 
 
+def _capacity(args, controller) -> int:
+    """The Owner's surface onto Phase-1 capacity.
+
+    Two of these write and they write facts, not decisions: ``policy`` records
+    which runtimes the Owner put under management, and ``observe`` appends one
+    measurement with the provenance that makes it usable.  Everything else
+    reads.  There is deliberately no verb that marks a runtime available, moves
+    a reset time, or overrides a refusal -- a window is a fact about a vendor's
+    accounting, and a Factory that could declare one open would simply dispatch
+    into a closed one and be told so by the harness.
+    """
+
+    store = controller.store
+    try:
+        if args.action == "policy":
+            row = store.set_runtime_policy(capacity.RuntimePolicy(
+                runtime_id=args.cap_runtime, managed=not args.cap_unmanaged,
+                max_observation_age_seconds=args.cap_max_age,
+                handoff=args.cap_handoff,
+                unknown_reset_backoff_seconds=args.cap_backoff,
+                policy_version=args.cap_policy_version))
+            print(json.dumps(row, sort_keys=True))
+            return 0
+        if args.action == "policies":
+            print(json.dumps({key: value.as_row() for key, value
+                              in store.runtime_policies().items()}, sort_keys=True))
+            return 0
+        if args.action == "observe":
+            row = store.observe_capacity(capacity.CapacityObservation(
+                runtime_id=args.cap_runtime, state=args.cap_state,
+                observed_at=(args.cap_observed_at if args.cap_observed_at is not None
+                             else store.clock()),
+                source=args.cap_source or "", source_ref=args.cap_source_ref or "",
+                window_started_at=args.cap_window_started_at,
+                expected_reset_at=args.cap_reset_at,
+                remaining_units=args.cap_remaining, unit=args.cap_unit,
+                precision=args.cap_precision))
+            print(json.dumps(row, sort_keys=True))
+            return 0
+        if args.action == "readings":
+            print(json.dumps({key: value.as_row() for key, value
+                              in store.capacity_readings().items()}, sort_keys=True))
+            return 0
+        if args.action == "observations":
+            print(json.dumps(store.capacity_observations(args.cap_runtime),
+                             sort_keys=True))
+            return 0
+        if args.action == "checkpoint":
+            print(json.dumps(store.capacity_checkpoint(args.cap_mission), sort_keys=True))
+            return 0
+        brief = sup.OperationsSupervisor(controller).capacity_brief()
+        print(json.dumps(brief, sort_keys=True))
+        # A brief nobody can act on is still a true brief, so this exits 1 only
+        # when there is no usable runtime at all -- the one reading an operator
+        # or a host job wants to branch on.
+        return 0 if brief["usable_now"] else 1
+    except (capacity.PolicyError, KeyError, TypeError) as exc:
+        print(json.dumps({"refused": {"code": "CAPACITY_DECLARATION_INVALID",
+                                      "detail": str(exc)}}, sort_keys=True))
+        return 1
+
+
 def _supervisor(args, controller) -> int:
     """The Owner's own surface onto Stage 9.
 
@@ -796,6 +888,10 @@ def main(argv: list[str] | None = None) -> int:
         print(json.dumps(store.economics(args.corpus), sort_keys=True))
     elif args.command == "cancel":
         print(json.dumps({"state": store.cancel(args.mission_id)}))
+    elif args.command == "baton":
+        report = continuity.WorkBatonStore(args.db).inspect(args.baton_id)
+        print(json.dumps(report, sort_keys=True))
+        return 0 if report["count"] or args.baton_id is None else 1
     elif args.command == "project":
         if args.action == "list":
             print(json.dumps({key: value.as_row() for key, value in store.projects().items()},
@@ -852,6 +948,8 @@ def main(argv: list[str] | None = None) -> int:
         return _maintenance(args, controller)
     elif args.command == "improvement":
         return _improvement(args, controller)
+    elif args.command == "capacity":
+        return _capacity(args, controller)
     elif args.command == "supervisor":
         return _supervisor(args, controller)
     elif args.command == "dogfood":

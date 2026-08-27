@@ -1,0 +1,118 @@
+{
+  "contract_version": "factory-controller/capacity/1.0",
+  "runs": [
+    {
+      "completed": 30,
+      "duplicate_irreversible_effects": 0,
+      "label": "naive_single_runtime_wait_for_reset",
+      "lost": 0,
+      "provider_invocations_refused_for_quota": 5,
+      "provider_invocations_served": 30,
+      "runtimes_declared": [
+        "runtime-alpha"
+      ],
+      "served_per_runtime": {
+        "runtime-alpha": 30
+      }
+    },
+    {
+      "completed": 40,
+      "duplicate_irreversible_effects": 0,
+      "label": "capacity_aware_three_staggered_windows",
+      "lost": 0,
+      "provider_invocations_refused_for_quota": 5,
+      "provider_invocations_served": 40,
+      "runtimes_declared": [
+        "runtime-alpha",
+        "runtime-beta",
+        "runtime-gamma"
+      ],
+      "served_per_runtime": {
+        "runtime-alpha": 12,
+        "runtime-beta": 16,
+        "runtime-gamma": 12
+      }
+    },
+    {
+      "completed": 40,
+      "duplicate_irreversible_effects": 0,
+      "label": "capacity_aware_with_one_runtime_unavailable",
+      "lost": 0,
+      "provider_invocations_refused_for_quota": 5,
+      "provider_invocations_served": 40,
+      "runtimes_declared": [
+        "runtime-alpha",
+        "runtime-beta",
+        "runtime-gamma"
+      ],
+      "served_per_runtime": {
+        "runtime-alpha": 18,
+        "runtime-gamma": 22
+      }
+    }
+  ],
+  "saturated_backlog_comparison": {
+    "backlog": 200,
+    "capacity_aware_completed": 102,
+    "capacity_aware_lost": 0,
+    "duplicate_irreversible_effects": {
+      "capacity_aware": 0,
+      "naive": 0
+    },
+    "naive_completed": 30,
+    "naive_lost": 0,
+    "note": "200 missions, so neither run is bounded by the backlog and the ratio is the capacity gain itself",
+    "ratio": 3.4
+  },
+  "simulation": {
+    "allowance_per_window": 6,
+    "backlog": 40,
+    "clock": "virtual, hand-wound; no sleeping and no wall-clock anywhere",
+    "horizon_hours": 24.0,
+    "missions_per_project": 8,
+    "projects": 5,
+    "tick_seconds": 900.0,
+    "window_hours": 5.0,
+    "window_offsets_hours": {
+      "runtime-alpha": 0.0,
+      "runtime-beta": 1.5,
+      "runtime-gamma": 3.0
+    }
+  },
+  "throughput_gain": {
+    "backlog_cleared_by_capacity_aware": true,
+    "capacity_aware_completed": 40,
+    "naive_completed": 30,
+    "ratio": 1.3333
+  },
+  "unmanaged_vs_managed_6h": {
+    "managed": {
+      "completed": 12,
+      "duplicate_irreversible_effects": 0,
+      "label": "capacity_record_present",
+      "lost": 0,
+      "provider_invocations_refused_for_quota": 2,
+      "provider_invocations_served": 12,
+      "runtimes_declared": [
+        "runtime-alpha"
+      ],
+      "served_per_runtime": {
+        "runtime-alpha": 12
+      }
+    },
+    "unmanaged": {
+      "completed": 12,
+      "duplicate_irreversible_effects": 0,
+      "label": "no_capacity_record_at_all",
+      "lost": 0,
+      "provider_invocations_refused_for_quota": 5,
+      "provider_invocations_served": 12,
+      "runtimes_declared": [
+        "runtime-alpha"
+      ],
+      "served_per_runtime": {
+        "runtime-alpha": 12
+      }
+    }
+  }
+}

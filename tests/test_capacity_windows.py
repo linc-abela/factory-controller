@@ -308,6 +308,21 @@ class ThroughputComparisonTests(unittest.TestCase):
         self.assertEqual(naive.completed, ALLOWANCE * 5)
         self.assertEqual(aware.completed, 40)
 
+    def test_a_saturated_backlog_shows_the_gain_without_the_backlog_bounding_it(self):
+        """The comparison above clears its whole backlog, which flatters it.
+
+        With 200 missions neither run runs out of work, so the ratio is the
+        capacity effect itself: three staggered five-hour windows against one.
+        """
+
+        naive = Simulation(self, runtimes=("runtime-alpha",), per_project=40).run()
+        aware = Simulation(self, runtimes=RUNTIMES, per_project=40).run()
+        self.assertEqual(naive.completed, ALLOWANCE * 5)
+        self.assertEqual(aware.completed, 102)
+        self.assertEqual((naive.lost, aware.lost), (0, 0))
+        self.assertEqual((naive.duplicate_effects, aware.duplicate_effects), (0, 0))
+        self.assertGreater(aware.completed / naive.completed, 3.0)
+
     def test_the_deferral_protects_work_even_with_no_capacity_record_at_all(self):
         """Two separate guarantees, and it is worth being exact about which is which.
 
