@@ -29,8 +29,9 @@ def _unavailable() -> frozenset:
     )
 
 
-def dispatch(request: dict) -> dict:
+def dispatch(request: dict, unavailable: frozenset | None = None) -> dict:
     route = request["input"].get("route") or {}
+    unavailable = _unavailable() if unavailable is None else unavailable
     profile = route.get("provider_profile")
     receipt = {
         "provider_profile": profile,
@@ -43,7 +44,7 @@ def dispatch(request: dict) -> dict:
     if route.get("execution_mode") == "real":
         return {"status": "refused", "diagnostic": "FIXTURE_PROVIDER_REFUSES_REAL_MISSION",
                 "receipt": {**receipt, "process_started": False}}
-    if profile is not None and profile in _unavailable():
+    if profile is not None and profile in unavailable:
         return {"status": "provider_unavailable", "diagnostic": "PROFILE_UNAVAILABLE",
                 "receipt": {**receipt, "process_started": False,
                             "refusal_code": "PROFILE_UNAVAILABLE"}}
@@ -110,20 +111,38 @@ def build_context(request: dict) -> dict:
     }
 
 
-def main() -> int:
-    return main_with(json.load(sys.stdin))
+def main(argv: list[str] | None = None) -> int:
+    """Read one step request from stdin and answer it.
+
+    The two switches may also arrive as arguments rather than in the
+    environment.  That is not a convenience: the rehearsal harness composes an
+    adapter *command* per scenario, and reading the environment from a module
+    other than this one would put a second environment reader inside the
+    package -- which ``tests/test_authority_boundaries.py`` pins to exactly two
+    files, on purpose.
+    """
+
+    argv = sys.argv[1:] if argv is None else argv
+    overrides = {}
+    for value in argv:
+        name, _, setting = value.partition("=")
+        if name in ("--unavailable-profiles", "--failing-gates") and setting:
+            overrides[name] = frozenset(
+                item for item in setting.split(",") if item)
+    return main_with(json.load(sys.stdin), overrides)
 
 
-def main_with(request: dict) -> int:
+def main_with(request: dict, overrides: dict | None = None) -> int:
     """The fixture steps, over a request already read.  Shared with the
     reconciliation adapter, which handles ``context`` and delegates the rest."""
 
+    overrides = overrides or {}
     step = request["step"]
     operation_key = request["operation_key"]
     if step == "context":
         result = build_context(request["input"]["context_request"])
     elif step == "dispatch":
-        result = dispatch(request)
+        result = dispatch(request, overrides.get("--unavailable-profiles"))
     elif step == "verify":
         result = {"verified": True, "evaluator": "local-safe-provider", "candidate_sha": request["input"]["dispatch"]["candidate_sha"]}
     elif step == "evaluate":
@@ -136,7 +155,9 @@ def main_with(request: dict) -> int:
             result = {"passed": False, "gate_outcomes": [],
                       "diagnostic": "ACCEPTANCE_GATE_UNDECLARED"}
         else:
-            failing = _failing_gates()
+            failing = overrides.get("--failing-gates")
+            if failing is None:
+                failing = _failing_gates()
             outcomes = [{"gate_id": gate, "passed": gate not in failing,
                          "detail": "deterministic local harness"}
                         for gate in declared]

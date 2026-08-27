@@ -16,6 +16,7 @@ from . import improvement as imp
 from . import maintenance as mnt
 from . import portfolio
 from . import production
+from . import rehearsal
 from . import supervisor as sup
 from .adapter import JsonProcessAdapter
 from .engine import Controller, RetryPolicy
@@ -203,7 +204,8 @@ def parser() -> argparse.ArgumentParser:
                             default="unset")
 
     dog = sub.add_parser("dogfood")
-    dog.add_argument("action", choices=("contract", "preflight", "gate"))
+    dog.add_argument("action", choices=("contract", "preflight", "gate",
+                                       "rehearse"))
     dog.add_argument("--contract", dest="dog_contract",
                      default="contracts/internal-dogfood-run-contract.json")
     dog.add_argument("--report", dest="dog_reports", action="append", default=[],
@@ -212,6 +214,10 @@ def parser() -> argparse.ArgumentParser:
                           "bridge_doctor=/tmp/doctor.json; repeatable")
     dog.add_argument("--evidence", dest="dog_evidence",
                      help="observed values for the productization gate")
+    dog.add_argument("--root", dest="dog_root",
+                     help="a directory for the rehearsal's disposable stores")
+    dog.add_argument("--scenario", dest="dog_scenarios", action="append",
+                     default=[], help="run only this scenario; repeatable")
     dog.add_argument("--label", dest="dog_label", default=activation.DEFAULT_LABEL)
     dog.add_argument("--agents-dir", dest="dog_agents_dir",
                      default=str(Path.home() / "Library" / "LaunchAgents"))
@@ -643,6 +649,16 @@ def _dogfood(args, controller) -> int:
     if args.action == "contract":
         print(json.dumps(contract.as_row(), sort_keys=True))
         return 0
+    if args.action == "rehearse":
+        if not args.dog_root:
+            print(json.dumps({"refused": {
+                "code": "DOGFOOD_REHEARSAL_ROOT_REQUIRED",
+                "detail": "a rehearsal writes disposable stores and needs a "
+                          "directory to write them in"}}, sort_keys=True))
+            return 2
+        result = rehearsal.run(args.dog_root, only=tuple(args.dog_scenarios))
+        print(json.dumps(result, sort_keys=True))
+        return 0 if result["outcome"] == "REHEARSED" else 1
     if args.action == "gate":
         observed = (json.loads(Path(args.dog_evidence).read_text())
                     if args.dog_evidence else {})
