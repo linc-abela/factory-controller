@@ -158,6 +158,60 @@ class ReleaseBundleTests(unittest.TestCase):
                 bundle(release_sha=value)
 
 
+class HostCompatibilityTests(unittest.TestCase):
+    """The projection `factory-bridge`'s host runtime reads.
+
+    Reproduced from `src/factory_bridge/production.py::ReleaseBundle.from_mapping`
+    at `8abb9a7`, not invented here, and pinned so a change on either side is a
+    failure rather than a drift.
+    """
+
+    #: Every key that file requires, and the objects it insists on.
+    REQUIRED = ("schema_version", "release_id", "project_id", "service_id",
+                "candidate_sha", "release_policy_version", "evidence_refs")
+    OBJECTS = ("environment_schema", "rollback", "provenance")
+
+    def setUp(self):
+        self.view = bundle().compat_view(environment())
+
+    def test_every_key_the_host_requires_is_present_and_bounded(self):
+        for key in self.REQUIRED:
+            self.assertIn(key, self.view)
+        for key in self.REQUIRED:
+            if key == "evidence_refs":
+                continue
+            value = self.view[key]
+            self.assertTrue(isinstance(value, str) and 0 < len(value) <= 256, key)
+        for key in self.OBJECTS:
+            self.assertIsInstance(self.view[key], dict, key)
+
+    def test_the_host_view_carries_the_same_release_identity(self):
+        self.assertEqual(self.view["candidate_sha"], SHA)
+        self.assertEqual(self.view["release_id"], "rc-001")
+        self.assertEqual(self.view["service_id"], "shop-web")
+
+    def test_no_evidence_is_lost_in_the_projection(self):
+        """The host view has one list where this contract has two."""
+        source = bundle()
+        self.assertEqual(self.view["evidence_refs"],
+                         [*source.evidence_refs, *source.evaluator_receipts])
+
+    def test_the_projection_introduces_no_place_for_a_value(self):
+        """The host's own schema key is a config map; this one still is not."""
+        for spec in self.view["environment_schema"].values():
+            self.assertEqual(set(spec), production.ENV_SPEC_KEYS)
+
+    def test_the_rollback_strategy_is_stated_rather_than_left_to_the_host(self):
+        self.assertEqual(self.view["rollback"]["strategy"],
+                         production.ROLLBACK_STRATEGY)
+        self.assertEqual(self.view["rollback"]["reverse_ref"],
+                         "migrations/001.down.sql")
+
+    def test_the_compat_schema_name_is_the_hosts_own(self):
+        self.assertEqual(production.COMPAT_SCHEMA,
+                         "controller-release-bundle-compat-v1")
+
+
 class EnvironmentRegistryTests(LedgerCase):
 
     def test_a_production_environment_cannot_be_autonomous(self):

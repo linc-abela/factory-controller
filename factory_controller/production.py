@@ -51,6 +51,15 @@ CANONICAL_ABSENCE = frozenset({"unknown", "not_applicable", "not_run", "not_meas
 CONTRACT_VERSION = "factory-controller/production/1.0"
 BUNDLE_SCHEMA = "factory.controller.release_bundle.v1"
 
+#: The host runtime's name for the projection it reads, adopted verbatim from
+#: ``factory-bridge/fixtures/sf-138a-release-bundle.json`` rather than aliased.
+COMPAT_SCHEMA = "controller-release-bundle-compat-v1"
+
+#: The only rollback this contract performs: return to a release this ledger
+#: already recorded healthy.  Stated once, and carried into the host view so
+#: the host is not left to infer a strategy.
+ROLLBACK_STRATEGY = "previous-recorded-healthy"
+
 #: What an environment *is*.  The class is not a label: it selects the
 #: authority rule, and it is fixed at registration.
 ENVIRONMENT_CLASSES = ("local-sim", "staging", "production")
@@ -309,6 +318,39 @@ class ReleaseBundle:
                            for name, spec in sorted(self.env_schema.items())},
             "migration": dict(self.migration),
             "release_policy_version": self.release_policy_version,
+            "provenance": dict(self.provenance),
+        }
+
+    def compat_view(self, environment: "EnvironmentPolicy") -> dict[str, Any]:
+        """The projection the host runtime consumes, derived rather than forked.
+
+        ``factory-bridge``'s ``src/factory_bridge/production.py`` holds a
+        ``ReleaseBundle`` it calls *"a small compatibility view over the
+        Controller-owned Release Bundle"*, written in parallel with this file
+        and therefore against a guess at it.  Its required keys are
+        ``release_id``, ``project_id``, ``service_id``, ``candidate_sha``,
+        ``release_policy_version``, ``evidence_refs``, and objects at
+        ``environment_schema``, ``rollback`` and ``provenance``.
+
+        Rather than record five renames as a conflict and leave the host unable
+        to read a real bundle, this emits exactly that shape from the fields
+        above.  Nothing is invented: ``service_id`` comes from the environment
+        the release is being deployed to, which is where a service binding
+        actually lives, and the two evidence lists join because the host view
+        has one.  ``COMPAT_SCHEMA`` is their name for it, adopted verbatim.
+        """
+        return {
+            "schema_version": COMPAT_SCHEMA,
+            "release_id": self.bundle_ref,
+            "project_id": self.project_id,
+            "service_id": environment.service_ref,
+            "candidate_sha": self.release_sha,
+            "release_policy_version": self.release_policy_version,
+            "evidence_refs": [*self.evidence_refs, *self.evaluator_receipts],
+            "environment_schema": {name: dict(spec)
+                                   for name, spec in sorted(self.env_schema.items())},
+            "rollback": {"strategy": ROLLBACK_STRATEGY,
+                         "reverse_ref": self.migration["reverse_ref"]},
             "provenance": dict(self.provenance),
         }
 
