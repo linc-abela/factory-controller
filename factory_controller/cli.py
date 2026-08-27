@@ -10,6 +10,7 @@ import time
 from pathlib import Path
 
 from . import advisor as advisory
+from . import improvement as imp
 from . import maintenance as mnt
 from . import portfolio
 from . import production
@@ -131,6 +132,34 @@ def parser() -> argparse.ArgumentParser:
     prod.add_argument("--work-item")
     prod.add_argument("--summary")
     prod.add_argument("--policy-version", dest="prod_policy_version", default="unset")
+
+    imp_parser = sub.add_parser("improvement")
+    imp_parser.add_argument("action", choices=(
+        "policy", "enable", "disable", "objective", "objectives", "admit",
+        "baseline", "mission", "seal", "evaluate", "generation", "promote",
+        "revert", "close", "lineage", "generations", "list"))
+    imp_parser.add_argument("--project")
+    imp_parser.add_argument("--file", type=Path, dest="imp_file",
+                            help="policy, objective or measurement JSON")
+    imp_parser.add_argument("--objective", dest="imp_objective")
+    imp_parser.add_argument("--experiment")
+    imp_parser.add_argument("--lineage")
+    imp_parser.add_argument("--parent")
+    imp_parser.add_argument("--trigger-class", dest="imp_trigger_class",
+                            choices=imp.TRIGGER_CLASSES, default="owner_objective")
+    imp_parser.add_argument("--source", dest="imp_source")
+    imp_parser.add_argument("--repository", dest="imp_repository")
+    imp_parser.add_argument("--baseline-sha", dest="imp_baseline_sha")
+    imp_parser.add_argument("--isolation", dest="imp_isolation")
+    imp_parser.add_argument("--producer", dest="imp_producer")
+    imp_parser.add_argument("--evaluator", dest="imp_evaluator")
+    imp_parser.add_argument("--path", action="append", default=[],
+                            dest="imp_paths", help="a changed path; repeatable")
+    imp_parser.add_argument("--gate", action="append", default=[], dest="imp_gates")
+    imp_parser.add_argument("--environment", dest="imp_environment")
+    imp_parser.add_argument("--bundle", type=Path, dest="imp_bundle")
+    imp_parser.add_argument("--disposition", choices=imp.DISPOSITIONS)
+    imp_parser.add_argument("--reason", dest="imp_reason", default="operator")
 
     mnt_parser = sub.add_parser("maintenance")
     mnt_parser.add_argument("action", choices=(
@@ -310,6 +339,118 @@ def _maintenance(args, controller) -> int:
     return 0
 
 
+def _improvement(args, controller) -> int:
+    """The Owner's own surface onto Stage 8.
+
+    Deliberately without a ``run`` verb, on the same principle as Stage 7:
+    every command here is one act an operator asked for, so there is nothing
+    that keeps going after the command returns.  ``policy`` and ``objective``
+    read a JSON file because both carry nested declarations -- protected
+    surfaces and frozen metrics -- and squeezing either onto a flag would make
+    the two most safety-critical declarations the two hardest to review.
+    """
+
+    store = controller.store
+    plane = imp.ImprovementPlane(store, production.ProductionLedger(store))
+    try:
+        if args.action == "policy":
+            if args.imp_file is None:
+                current = plane.policy(args.project)
+                result = None if current is None else current.as_row()
+            else:
+                declared = json.loads(args.imp_file.read_text())
+                declared.setdefault("project_id", args.project)
+                result = plane.set_policy(_improvement_policy(declared))
+        elif args.action in ("enable", "disable"):
+            result = plane.set_enabled(args.project, args.action == "enable")
+        elif args.action == "objective":
+            if args.imp_file is None:
+                found = plane.objective(args.imp_objective)
+                result = None if found is None else found.as_row()
+            else:
+                declared = json.loads(args.imp_file.read_text())
+                result = plane.register_objective(imp.Objective(
+                    objective_ref=declared["objective_ref"],
+                    project_id=declared["project_id"],
+                    improvement_class=declared["improvement_class"],
+                    statement=declared["statement"],
+                    metrics=tuple(imp.Metric(**item) for item in declared["metrics"]),
+                    objective_version=declared.get("objective_version", "unset")))
+        elif args.action == "objectives":
+            result = list(plane.objectives(args.project))
+        elif args.action == "admit":
+            result = plane.admit_experiment(
+                args.imp_objective, args.imp_trigger_class,
+                args.imp_source or args.imp_objective,
+                target_repository=args.imp_repository,
+                baseline_sha=args.imp_baseline_sha,
+                isolation_ref=args.imp_isolation)
+        elif args.action == "generation":
+            result = plane.open_generation(
+                args.parent, baseline_sha=args.imp_baseline_sha,
+                isolation_ref=args.imp_isolation)
+        elif args.action == "baseline":
+            result = plane.record_baseline(
+                args.experiment, json.loads(args.imp_file.read_text()))
+        elif args.action == "mission":
+            mission, created = plane.create_candidate_mission(
+                args.experiment, controller,
+                acceptance_gate_ids=args.imp_gates or ["ACCEPTANCE"])
+            result = {"created": created, "mission": mission}
+        elif args.action == "seal":
+            row = plane.experiments()
+            mission_ref = next(item["mission_ref"] for item in row
+                               if item["experiment_ref"] == args.experiment)
+            result = plane.seal_candidate(
+                args.experiment, {"id": mission_ref,
+                                  "state": (store.get(mission_ref) or {}).get("state")},
+                producer_identity=args.imp_producer,
+                changed_paths=tuple(args.imp_paths))
+        elif args.action == "evaluate":
+            result = plane.evaluate_candidate(
+                args.experiment, evaluator_identity=args.imp_evaluator,
+                measurements=json.loads(args.imp_file.read_text()))
+        elif args.action == "promote":
+            bundle = production.ReleaseBundle.from_payload(
+                json.loads(args.imp_bundle.read_text()))
+            result = {"deployment_id": plane.stage_promotion(
+                args.experiment, bundle, args.imp_environment)}
+        elif args.action == "revert":
+            result = plane.revert(args.experiment, reason=args.imp_reason)
+        elif args.action == "close":
+            result = plane.close(args.experiment, args.disposition,
+                                 reason=args.imp_reason)
+        elif args.action == "lineage":
+            result = plane.lineage(args.experiment)
+        elif args.action == "generations":
+            result = list(plane.generations(args.lineage))
+        else:
+            result = list(plane.experiments(args.project))
+    except imp.ImprovementRefusal as refusal:
+        print(json.dumps({"refused": refusal.as_row()}, sort_keys=True))
+        return 2
+    except (imp.PolicyError, production.PolicyError) as exc:
+        print(json.dumps({"refused": {"code": "IMPROVEMENT_POLICY_INVALID",
+                                      "detail": str(exc)}}, sort_keys=True))
+        return 2
+    print(json.dumps(result, sort_keys=True, default=str))
+    return 0
+
+
+def _improvement_policy(declared: dict) -> "imp.ImprovementPolicy":
+    """Turn a declaration file into a policy, keeping the tuples tuples."""
+
+    surfaces = {name: tuple(prefixes) for name, prefixes
+                in declared.get("protected_surfaces", {}).items()}
+    values = dict(declared)
+    values["protected_surfaces"] = surfaces
+    for name in ("improvement_classes", "trigger_classes", "environment_classes",
+                 "self_target_repositories"):
+        if name in values:
+            values[name] = tuple(values[name])
+    return imp.ImprovementPolicy(**values)
+
+
 def main(argv: list[str] | None = None) -> int:
     args = parser().parse_args(argv)
     controller = _controller(args)
@@ -393,6 +534,8 @@ def main(argv: list[str] | None = None) -> int:
         return _production(args, store)
     elif args.command == "maintenance":
         return _maintenance(args, controller)
+    elif args.command == "improvement":
+        return _improvement(args, controller)
     elif args.command == "harness":
         ids = []
         for index in range(args.missions):
