@@ -582,6 +582,43 @@ class WorkSelectionTests(SupervisorCase):
         parameters = inspect.signature(supervisor.OperationsSupervisor.cycle).parameters
         self.assertEqual(list(parameters), ["self", "worker_id", "lease_seconds"])
 
+    def test_a_mission_belonging_to_no_project_is_out_of_scope(self):
+        """No Owner priority, cap or budget -- the reason `set_policy` refuses one.
+
+        The Stage-5 scheduler still runs it for an operator who asks by hand;
+        it is only the *unattended* path that will not pick up work nobody
+        placed under a policy.
+        """
+
+        self.project()
+        self.policy()
+        mission, _ = self.controller.submit(
+            {"work_item_id": "ORPHAN", "execution_mode": "fixture",
+             "acceptance_gate_ids": GATES}, "ORPHAN")
+        self.running()
+        report = self.plane.cycle("w1")
+        self.assertEqual(report["missions_advanced"], 0)
+        self.assertEqual(self.store.get(mission["id"])["state"], "admitted")
+        self.assertIsNotNone(self.store.claim("by-hand"))
+
+    def test_a_resume_survives_a_scope_its_project_is_no_longer_inside(self):
+        """Half-finished work finishes even when its window has closed."""
+
+        self.project()
+        self.policy()
+        self.running()
+        mission_id = self.backlog("W1")
+        crashing = LayerAdapter(crash_on="verify")
+        crashed = Controller(self.store, crashing,
+                             retry_policy=RetryPolicy(max_attempts=1,
+                                                      base_delay_seconds=0),
+                             lease_seconds=0)
+        with self.assertRaises(ProcessDeath):
+            crashed.work_once("dead-worker")
+        self.store.recover_stale()
+        claimed = self.store.claim("scoped", project_ids=("somewhere-else",))
+        self.assertEqual(claimed["id"], mission_id)
+
     def test_a_paused_project_receives_no_unattended_work(self):
         self.project()
         self.policy()

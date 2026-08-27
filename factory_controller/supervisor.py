@@ -1005,14 +1005,25 @@ class OperationsSupervisor:
         cycle does; the Stage-5 caps then decide which project each iteration
         lands in.  A drain claims only missions past the dispatch boundary, so
         it finishes in-flight work and starts none.
+
+        The claim is scoped to the eligible projects, so a closed execution
+        window, a hold, a disabled policy or a suppression actually holds
+        instead of merely skipping the promotion pass -- the scheduler would
+        otherwise have picked that project's backlog anyway.  A mission
+        belonging to no project is out of scope for every cycle: it has no
+        Owner priority, cap or budget, which is the same reason `set_policy`
+        refuses an unregistered project.  A resume is exempt, inside the
+        scheduler, because half-finished work has to finish.
         """
 
+        scope = tuple(policy.project_id for policy in eligible)
         budget = max([policy.missions_per_cycle for policy in eligible] or [0])
         if drain:
             budget = max(budget, DEFAULT_MISSIONS_PER_CYCLE)
         for _ in range(budget):
             mission = self._controller.work_once(
-                "%s:%s" % (report.cycle_id, report.sequence), resume_only=drain)
+                "%s:%s" % (report.cycle_id, report.sequence), resume_only=drain,
+                project_ids=scope)
             classification, code = classify_outcome(mission)
             if mission is None:
                 report.refused.append({"work_class": "backlog",
