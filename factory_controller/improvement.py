@@ -855,6 +855,17 @@ class ImprovementPlane:
                 "changed; a lineage does not continue across its own rules"
                 % parent["generation"],
                 experiment_ref=parent_ref, project_id=parent["project_id"])
+        with self._store.transaction() as db:
+            in_flight = db.execute(
+                "SELECT COUNT(*) AS n FROM experiments WHERE lineage_ref=?"
+                " AND disposition IS NULL", (parent["lineage_ref"],)).fetchone()["n"]
+        if in_flight:
+            raise ImprovementRefusal(
+                "IMPROVEMENT_GENERATION_IN_FLIGHT",
+                "lineage %s still has %d open generation(s); a generation "
+                "cannot spawn another while it is running"
+                % (parent["lineage_ref"], in_flight),
+                experiment_ref=parent_ref, project_id=parent["project_id"])
         if baseline_sha == parent["baseline_sha"]:
             raise ImprovementRefusal(
                 "IMPROVEMENT_BASELINE_NOT_ADVANCED",
@@ -868,17 +879,6 @@ class ImprovementPlane:
                 "the accepted candidate of generation %d is %s; a successor "
                 "pins that, not %s"
                 % (parent["generation"], parent["candidate_sha"], baseline_sha),
-                experiment_ref=parent_ref, project_id=parent["project_id"])
-        with self._store.transaction() as db:
-            in_flight = db.execute(
-                "SELECT COUNT(*) AS n FROM experiments WHERE lineage_ref=?"
-                " AND disposition IS NULL", (parent["lineage_ref"],)).fetchone()["n"]
-        if in_flight:
-            raise ImprovementRefusal(
-                "IMPROVEMENT_GENERATION_IN_FLIGHT",
-                "lineage %s still has %d open generation(s); a generation "
-                "cannot spawn another while it is running"
-                % (parent["lineage_ref"], in_flight),
                 experiment_ref=parent_ref, project_id=parent["project_id"])
         return self._admit(parent["objective_ref"], parent["trigger_class"],
                            parent["source_ref"],
