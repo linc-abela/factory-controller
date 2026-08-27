@@ -56,6 +56,18 @@ def dispatch(request: dict) -> dict:
     }
 
 
+FAILING_GATES_ENV = "FACTORY_CONTROLLER_FAILING_GATES"
+
+
+def _failing_gates() -> frozenset:
+    """Gate ids this harness reports as failed, so a rehearsal can exercise the
+    escalation path without a repository that is genuinely broken."""
+
+    return frozenset(
+        value for value in os.environ.get(FAILING_GATES_ENV, "").split(",") if value
+    )
+
+
 BROKER_UNAVAILABLE_ENV = "FACTORY_CONTROLLER_BROKER_UNAVAILABLE"
 
 
@@ -116,11 +128,21 @@ def main_with(request: dict) -> int:
         result = {"verified": True, "evaluator": "local-safe-provider", "candidate_sha": request["input"]["dispatch"]["candidate_sha"]}
     elif step == "evaluate":
         # Run exactly the gates the mission declared. A fixture evaluator that
-        # invents its own gate id is the placeholder result SF-134 left open.
-        declared = request["input"]["mission"].get("acceptance_gate_ids") or ["LOCAL-SAFE"]
-        outcomes = [{"gate_id": gate, "passed": True, "detail": "deterministic local harness"}
-                    for gate in declared]
-        result = {"passed": True, "gate_outcomes": outcomes}
+        # invents its own gate id is the placeholder result SF-134 left open --
+        # and `or ["LOCAL-SAFE"]` was still one, so an undeclared gate list is
+        # now the failure the rest of the stack already calls it.
+        declared = request["input"]["mission"].get("acceptance_gate_ids") or []
+        if not declared:
+            result = {"passed": False, "gate_outcomes": [],
+                      "diagnostic": "ACCEPTANCE_GATE_UNDECLARED"}
+        else:
+            failing = _failing_gates()
+            outcomes = [{"gate_id": gate, "passed": gate not in failing,
+                         "detail": "deterministic local harness"}
+                        for gate in declared]
+            passed = all(outcome["passed"] for outcome in outcomes)
+            result = {"passed": passed, "gate_outcomes": outcomes,
+                      "diagnostic": None if passed else "ACCEPTANCE_GATE_FAILED"}
     elif step == "evidence":
         result = {"accepted": True, "evidence_pointer": "local://" + operation_key, "evidence_class": "rederived"}
     else:

@@ -61,6 +61,12 @@ def parser() -> argparse.ArgumentParser:
     project.add_argument("--budget", type=float)
     project.add_argument("--currency")
     project.add_argument("--context-ceiling", type=int)
+    project.add_argument("--gate", action="append", default=[], dest="gates",
+                         help="an acceptance gate this project's repository "
+                              "declares; repeatable")
+    project.add_argument("--gate-source",
+                         help="where the gate list was read from, e.g. "
+                              "<repository>@<sha>:<path>")
     project.add_argument("--policy-version", default="unset")
 
     pf = sub.add_parser("portfolio")
@@ -237,6 +243,21 @@ def parser() -> argparse.ArgumentParser:
     return p
 
 
+def _acceptance_gates(store, project_id, repository, declared) -> tuple[list[str], str]:
+    """Gates an operator typed, or the ones the project declared.  Never both,
+    and never a literal invented here.
+
+    An operator naming gates on the command line is a person choosing, which is
+    a different act from a supervisor promoting work nobody typed -- so it is
+    allowed and it is labelled ``operator`` in the mission payload rather than
+    borrowing the registry's provenance.
+    """
+
+    if declared:
+        return list(declared), "operator"
+    return store.declared_acceptance_gates(project_id, repository)
+
+
 def _controller(args) -> Controller:
     return Controller(MissionStore(args.db), JsonProcessAdapter(shlex.split(args.adapter)), retry_policy=RetryPolicy())
 
@@ -359,9 +380,12 @@ def _maintenance(args, controller) -> int:
         elif args.action == "trigger":
             result = plane.admit_trigger(args.trigger_class, args.source)
         elif args.action == "repair":
+            lineage = plane.lineage(args.trigger)
+            gates, source = _acceptance_gates(
+                store, lineage["project_id"], lineage["repository"], args.mnt_gates)
             mission, created = plane.create_repair_mission(
-                args.trigger, controller,
-                acceptance_gate_ids=args.mnt_gates or ["ACCEPTANCE"])
+                args.trigger, controller, acceptance_gate_ids=gates,
+                extra={"acceptance_gate_source": source})
             result = {"created": created, "mission": mission}
         elif args.action == "lineage":
             result = plane.lineage(args.trigger)
@@ -371,6 +395,9 @@ def _maintenance(args, controller) -> int:
         else:
             result = list(plane.repairs(args.project))
     except mnt.MaintenanceRefusal as refusal:
+        print(json.dumps({"refused": refusal.as_row()}, sort_keys=True))
+        return 2
+    except portfolio.GateProvenanceError as refusal:
         print(json.dumps({"refused": refusal.as_row()}, sort_keys=True))
         return 2
     except mnt.PolicyError as exc:
@@ -435,9 +462,13 @@ def _improvement(args, controller) -> int:
             result = plane.record_baseline(
                 args.experiment, json.loads(args.imp_file.read_text()))
         elif args.action == "mission":
+            lineage = plane.lineage(args.experiment)
+            gates, source = _acceptance_gates(
+                store, lineage["project_id"], lineage["target_repository"],
+                args.imp_gates)
             mission, created = plane.create_candidate_mission(
-                args.experiment, controller,
-                acceptance_gate_ids=args.imp_gates or ["ACCEPTANCE"])
+                args.experiment, controller, acceptance_gate_ids=gates,
+                extra={"acceptance_gate_source": source})
             result = {"created": created, "mission": mission}
         elif args.action == "seal":
             row = plane.experiments()
@@ -468,6 +499,9 @@ def _improvement(args, controller) -> int:
             result = list(plane.generations(args.lineage))
         else:
             result = list(plane.experiments(args.project))
+    except portfolio.GateProvenanceError as refusal:
+        print(json.dumps({"refused": refusal.as_row()}, sort_keys=True))
+        return 2
     except imp.ImprovementRefusal as refusal:
         print(json.dumps({"refused": refusal.as_row()}, sort_keys=True))
         return 2
@@ -613,6 +647,8 @@ def main(argv: list[str] | None = None) -> int:
                 state=args.state or "enabled", priority=args.priority,
                 concurrency_cap=args.cap, budget_ceiling=args.budget,
                 budget_currency=args.currency, context_ceiling_bytes=args.context_ceiling,
+                acceptance_gate_ids=tuple(args.gates),
+                acceptance_gate_source=args.gate_source,
                 policy_version=args.policy_version)), sort_keys=True))
     elif args.command == "portfolio":
         current = store.portfolio_policy()

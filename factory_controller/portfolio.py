@@ -56,6 +56,24 @@ class PolicyError(ValueError):
     """A registry or dependency declaration the Controller will not store."""
 
 
+class GateProvenanceError(ValueError):
+    """No lawful acceptance gate can be sourced for a piece of work.
+
+    Carried rather than raised through a cycle: a project whose gates are
+    undeclared is a recorded refusal for that project, not a failed cycle for
+    the whole portfolio.  One type, one owner -- the supervisor, the CLI and the
+    two planes all read the same declaration, so a second resolution rule cannot
+    disagree with the first.
+    """
+
+    def __init__(self, code: str, detail: dict[str, Any]) -> None:
+        super().__init__(code)
+        self.code, self.detail = code, detail
+
+    def as_row(self) -> dict[str, Any]:
+        return {"code": self.code, "detail": dict(self.detail)}
+
+
 # --------------------------------------------------------------------------- #
 # policy
 # --------------------------------------------------------------------------- #
@@ -73,6 +91,18 @@ class ProjectPolicy:
     purpose: ``tests/test_authority_boundaries.py`` matches ``glob`` as a
     substring to catch a directory scan, and "global" contains it.  The check is
     right to be blunt, so the name moved rather than the check.
+
+    ``acceptance_gate_ids`` is the project's *declared* acceptance gates and the
+    only lawful source of a gate identifier for work nobody typed.  It carries
+    ``acceptance_gate_source`` for the same reason a budget carries a currency:
+    a gate list with no provenance is indistinguishable from an invented one,
+    and SF-141 found the supervisor promoting repairs against a literal
+    ``ACCEPTANCE`` that no repository declares.  The Controller cannot read the
+    target repository -- that is the Context Broker's authority and
+    ``tests/test_authority_boundaries.py`` enforces it -- so the declaration
+    reaches durable state through the Owner's registry act, which names where it
+    was copied from.  Neither field may be defaulted: an empty list means the
+    project has declared none, and unattended promotion fails closed on it.
     """
 
     project_id: str
@@ -83,6 +113,8 @@ class ProjectPolicy:
     budget_ceiling: float | None = None
     budget_currency: str | None = None
     context_ceiling_bytes: int | None = None
+    acceptance_gate_ids: tuple[str, ...] = ()
+    acceptance_gate_source: str | None = None
     policy_version: str = "unset"
 
     def __post_init__(self) -> None:
@@ -106,6 +138,21 @@ class ProjectPolicy:
                 raise PolicyError("a budget ceiling requires a currency")
         if self.context_ceiling_bytes is not None and self.context_ceiling_bytes < 0:
             raise PolicyError("context_ceiling_bytes must not be negative")
+        if not isinstance(self.acceptance_gate_ids, tuple):
+            raise PolicyError("acceptance_gate_ids must be a tuple of gate ids")
+        for gate in self.acceptance_gate_ids:
+            if not isinstance(gate, str) or not gate.strip():
+                raise PolicyError("an acceptance gate id is a non-empty string")
+        if len(set(self.acceptance_gate_ids)) != len(self.acceptance_gate_ids):
+            raise PolicyError("acceptance gate ids are declared once each")
+        if bool(self.acceptance_gate_ids) != bool(self.acceptance_gate_source):
+            # Exactly the budget/currency rule, for exactly the same reason: a
+            # declaration nobody can trace back to the target repository is the
+            # invented gate this field exists to replace.
+            raise PolicyError(
+                "declared acceptance gates require an acceptance_gate_source "
+                "naming where they were read from, and a source without gates "
+                "declares nothing")
 
     @property
     def admits_new_work(self) -> bool:
@@ -119,6 +166,8 @@ class ProjectPolicy:
             "budget_ceiling": self.budget_ceiling,
             "budget_currency": self.budget_currency,
             "context_ceiling_bytes": self.context_ceiling_bytes,
+            "acceptance_gate_ids": list(self.acceptance_gate_ids),
+            "acceptance_gate_source": self.acceptance_gate_source or "not_applicable",
             "policy_version": self.policy_version,
         }
 

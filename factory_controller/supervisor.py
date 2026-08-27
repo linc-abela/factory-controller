@@ -105,6 +105,16 @@ CYCLE_OUTCOMES = ("completed", "idle", "refused")
 #: cannot prove what happened and is recorded as uncertain.
 RECOVERY_OUTCOMES = ("recovered_replayable", "recovered_uncertain")
 
+
+def _row_value(row: Mapping[str, Any], key: str) -> Any:
+    """One column out of a sqlite3.Row or a mapping, absent if it has none."""
+
+    try:
+        return row[key]
+    except (IndexError, KeyError):
+        return None
+
+
 #: A repair is promotable exactly once, from the state its admission left it in.
 REPAIR_PROMOTABLE = "admitted"
 
@@ -946,9 +956,10 @@ class OperationsSupervisor:
                and not row["mission_ref"]]
         return self._promote_each(
             report, policy, "maintenance", policy.maintenance_admissions,
-            [(row["trigger_ref"], row) for row in due],
-            lambda ref: self._maintenance.create_repair_mission(
-                ref, self._controller, acceptance_gate_ids=["ACCEPTANCE"]))
+            [(row["trigger_ref"], row) for row in due], "repository",
+            lambda ref, gates, source: self._maintenance.create_repair_mission(
+                ref, self._controller, acceptance_gate_ids=gates,
+                extra={"acceptance_gate_source": source}))
 
     def _promote_experiments(self, report: CycleReport,
                              policy: SupervisorPolicy) -> int:
@@ -957,22 +968,36 @@ class OperationsSupervisor:
                and not row["mission_ref"]]
         return self._promote_each(
             report, policy, "improvement", policy.improvement_admissions,
-            [(row["experiment_ref"], row) for row in due],
-            lambda ref: self._improvement.create_candidate_mission(
-                ref, self._controller, acceptance_gate_ids=["ACCEPTANCE"]))
+            [(row["experiment_ref"], row) for row in due], "target_repository",
+            lambda ref, gates, source: self._improvement.create_candidate_mission(
+                ref, self._controller, acceptance_gate_ids=gates,
+                extra={"acceptance_gate_source": source}))
 
     def _promote_each(self, report: CycleReport, policy: SupervisorPolicy,
                       work_class: str, ceiling: int,
-                      due: list[tuple[str, Mapping[str, Any]]], create) -> int:
+                      due: list[tuple[str, Mapping[str, Any]]],
+                      repository_key: str, create) -> int:
         promoted = 0
-        for work_ref, _row in due:
+        for work_ref, row in due:
+            # Gate provenance is checked before the ceiling on purpose: whether
+            # the project declared gates is true independently of how many items
+            # this cycle already promoted, and SF-140 found that refusing on the
+            # more fundamental condition first is what keeps a refusal readable.
+            try:
+                gates, source = self._store.declared_acceptance_gates(
+                    policy.project_id, _row_value(row, repository_key))
+            except portfolio_policy.GateProvenanceError as refusal:
+                self._record_selection(
+                    report, policy.project_id, work_class, work_ref, False,
+                    refusal.code, refusal.detail)
+                continue
             if promoted >= ceiling:
                 self._record_selection(
                     report, policy.project_id, work_class, work_ref, False,
                     "SUPERVISOR_CLASS_ADMISSION_CEILING", {"ceiling": ceiling})
                 continue
             try:
-                mission, created = create(work_ref)
+                mission, created = create(work_ref, gates, source)
             except (maintenance_plane.MaintenanceRefusal,
                     improvement_plane.ImprovementRefusal) as refusal:
                 self._record_selection(
@@ -993,7 +1018,9 @@ class OperationsSupervisor:
                 mission_ref=mission["id"])
             report.promoted.append({"project_id": policy.project_id,
                                     "work_class": work_class, "work_ref": work_ref,
-                                    "mission_ref": mission["id"], "created": created})
+                                    "mission_ref": mission["id"], "created": created,
+                                    "acceptance_gate_ids": list(gates),
+                                    "acceptance_gate_source": source})
         return promoted
 
     def _advance(self, report: CycleReport, eligible: tuple[SupervisorPolicy, ...],

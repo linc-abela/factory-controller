@@ -29,7 +29,8 @@ class ControllerCLITests(unittest.TestCase):
     def test_submit_and_work_once_lifecycle(self) -> None:
         # 1. Submit via JSON file
         file_path = Path(self.temp_dir.name) / "payload.json"
-        file_path.write_text(json.dumps({"task": "cli-test"}))
+        file_path.write_text(json.dumps(
+            {"task": "cli-test", "acceptance_gate_ids": ["cli-suite"]}))
         rc_submit = main(["--db", self.db_path, "submit", "--key", "cli-key-1", "--file", str(file_path)])
         self.assertEqual(rc_submit, 0)
 

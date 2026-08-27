@@ -177,6 +177,8 @@ class MissionStore:
                   budget_ceiling REAL,
                   budget_currency TEXT,
                   context_ceiling_bytes INTEGER,
+                  acceptance_gate_ids TEXT,
+                  acceptance_gate_source TEXT,
                   policy_version TEXT NOT NULL,
                   created_at REAL NOT NULL,
                   updated_at REAL NOT NULL
@@ -225,6 +227,15 @@ class MissionStore:
             for column, ddl in (("project_id", "TEXT"), ("priority", "INTEGER")):
                 if column not in present:
                     db.execute("ALTER TABLE missions ADD COLUMN %s %s" % (column, ddl))
+            # Same reasoning one stage later: a Stage-5..8 database predates the
+            # declared acceptance gates.  NULL is the honest value -- the
+            # project has declared none -- and unattended promotion refuses on
+            # it rather than inventing a gate name, which is the whole point.
+            present = {row["name"] for row in db.execute("PRAGMA table_info(projects)")}
+            for column, ddl in (("acceptance_gate_ids", "TEXT"),
+                                ("acceptance_gate_source", "TEXT")):
+                if column not in present:
+                    db.execute("ALTER TABLE projects ADD COLUMN %s %s" % (column, ddl))
             db.execute(
                 "INSERT OR IGNORE INTO portfolio VALUES (1,?,0,?,'unset',?)",
                 (portfolio.DEFAULT_PORTFOLIO_CONCURRENCY, portfolio.DEFAULT_AGING_SECONDS,
@@ -820,17 +831,22 @@ class MissionStore:
                                   (policy.project_id,)).fetchone()
             db.execute(
                 "INSERT INTO projects(project_id,repository,state,priority,concurrency_cap,"
-                "budget_ceiling,budget_currency,context_ceiling_bytes,policy_version,created_at,updated_at)"
-                " VALUES(?,?,?,?,?,?,?,?,?,?,?)"
+                "budget_ceiling,budget_currency,context_ceiling_bytes,acceptance_gate_ids,"
+                "acceptance_gate_source,policy_version,created_at,updated_at)"
+                " VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)"
                 " ON CONFLICT(project_id) DO UPDATE SET repository=excluded.repository,"
                 " state=excluded.state, priority=excluded.priority,"
                 " concurrency_cap=excluded.concurrency_cap, budget_ceiling=excluded.budget_ceiling,"
                 " budget_currency=excluded.budget_currency,"
                 " context_ceiling_bytes=excluded.context_ceiling_bytes,"
+                " acceptance_gate_ids=excluded.acceptance_gate_ids,"
+                " acceptance_gate_source=excluded.acceptance_gate_source,"
                 " policy_version=excluded.policy_version, updated_at=excluded.updated_at",
                 (policy.project_id, policy.repository, policy.state, policy.priority,
                  policy.concurrency_cap, policy.budget_ceiling, policy.budget_currency,
-                 policy.context_ceiling_bytes, policy.policy_version, now, now),
+                 policy.context_ceiling_bytes,
+                 canonical_json(list(policy.acceptance_gate_ids)),
+                 policy.acceptance_gate_source, policy.policy_version, now, now),
             )
             self._coordination_locked(db, None, policy.project_id, "registry",
                                       "PROJECT_UPDATED" if existing else "PROJECT_REGISTERED", row)
@@ -860,6 +876,46 @@ class MissionStore:
                       "drained": in_flight == 0, "reason": reason}
             self._coordination_locked(db, None, project_id, "registry", "PROJECT_STATE_CHANGED", detail)
         return detail
+
+    def declared_acceptance_gates(self, project_id: str | None,
+                                  repository: str | None = None
+                                  ) -> tuple[list[str], str]:
+        """The acceptance gates the Owner declared for one project.
+
+        This is the whole of SF-141 finding SR-F6, in the one place every caller
+        reaches.  Unattended promotion used to pass a literal ``["ACCEPTANCE"]``,
+        which no repository declares and no evaluator can run: the stage-1
+        adapter returns ``not_run`` for a gate with no command, ``not_run`` is a
+        failure, so every unattended repair was on a path to escalate for a
+        reason that said nothing about the work.  Gates now come from the
+        registry -- an Owner act that names where they were copied from -- or
+        the work is not promoted at all.
+
+        The repository equality is the second half.  Gates are declared against
+        one repository; applying them to a mission targeting another would let
+        one project's registry act quietly govern work it never admitted.
+        """
+
+        project = self.project(project_id) if project_id else None
+        if project is None:
+            raise portfolio.GateProvenanceError(
+                "ACCEPTANCE_GATE_PROJECT_UNREGISTERED",
+                {"project_id": project_id or "unknown",
+                 "detail": "no registered project declares acceptance gates"})
+        if not project.acceptance_gate_ids:
+            raise portfolio.GateProvenanceError(
+                "ACCEPTANCE_GATES_UNDECLARED",
+                {"project_id": project.project_id,
+                 "acceptance_gate_ids": "not_applicable",
+                 "detail": "the project declares no acceptance gates; work "
+                           "nobody typed may not invent one"})
+        if repository and repository != project.repository:
+            raise portfolio.GateProvenanceError(
+                "ACCEPTANCE_GATE_REPOSITORY_NOT_ADMITTED",
+                {"project_id": project.project_id,
+                 "declared_for": project.repository, "work_targets": repository,
+                 "detail": "acceptance gates are declared against one repository"})
+        return list(project.acceptance_gate_ids), project.acceptance_gate_source
 
     def project(self, project_id: str) -> portfolio.ProjectPolicy | None:
         with self.connect() as db:
@@ -1212,7 +1268,10 @@ def _project_policy(row: sqlite3.Row) -> portfolio.ProjectPolicy:
         project_id=row["project_id"], repository=row["repository"], state=row["state"],
         priority=row["priority"], concurrency_cap=row["concurrency_cap"],
         budget_ceiling=row["budget_ceiling"], budget_currency=row["budget_currency"],
-        context_ceiling_bytes=row["context_ceiling_bytes"], policy_version=row["policy_version"])
+        context_ceiling_bytes=row["context_ceiling_bytes"],
+        acceptance_gate_ids=tuple(json.loads(row["acceptance_gate_ids"] or "[]")),
+        acceptance_gate_source=row["acceptance_gate_source"],
+        policy_version=row["policy_version"])
 
 
 def _portfolio_policy(row: sqlite3.Row | None) -> portfolio.PortfolioPolicy:

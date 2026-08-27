@@ -32,6 +32,7 @@ class TenMissionCampaignTests(unittest.TestCase):
                 "work_item_id": f"CAMPAIGN-MISSION-{i}",
                 "capability": "prototype",
                 "repository": f"disposable-lab-{i}",
+                "acceptance_gate_ids": ["campaign-suite"],
                 "iteration": i,
             }
             m, created = self.controller.submit(payload, f"campaign:key:{i}")

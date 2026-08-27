@@ -114,6 +114,9 @@ class SupervisorCase(unittest.TestCase):
         self.store.register_project(portfolio.ProjectPolicy(
             project_id=project_id, repository=repository or ("repo://" + project_id),
             state=state, priority=priority, concurrency_cap=4,
+            acceptance_gate_ids=extra.pop("acceptance_gate_ids", ("suite", "evaluate")),
+            acceptance_gate_source=extra.pop(
+                "acceptance_gate_source", "repo://%s@baseline:dev" % project_id),
             policy_version="1.0", **extra))
         return project_id
 

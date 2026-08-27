@@ -244,6 +244,8 @@ class LongHorizonSimulation(unittest.TestCase):
                 priority=values["priority"], concurrency_cap=values["cap"],
                 budget_ceiling=values.get("budget_ceiling"),
                 budget_currency=values.get("budget_currency"),
+                acceptance_gate_ids=("suite", "evaluate"),
+                acceptance_gate_source="%s@baseline:dev" % repository(project_id),
                 policy_version="1.0"))
             window = QUIET_WINDOW if project_id == "gamma" else (None, None)
             plane.set_policy(supervisor.SupervisorPolicy(
