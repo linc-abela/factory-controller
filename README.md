@@ -298,3 +298,86 @@ A leg's cost is counted once -- the provider-neutral `usage` figure is preferred
 and a gateway's own priced figure is used only where `usage` reported none, since
 they describe the same money.  Unpriced legs are counted and contribute nothing.
 Two currencies are reported side by side and never converted.
+
+## Recursive improvement
+
+Stage 8 is a separate contract from Stage 7 because a repair and an improvement
+are different acts.  A repair restores an intended behaviour that already
+existed.  An improvement changes what "intended" means, so it has to be measured
+against a baseline pinned before it ran, by an identity that did not produce it.
+
+```sh
+./dev --db controller.db improvement policy --project P --file policy.json
+./dev --db controller.db improvement objective --file objective.json
+./dev --db controller.db improvement admit --objective OBJ --source OBJ \
+    --repository repo://P --baseline-sha SHA --isolation lane://P/1
+./dev --db controller.db improvement baseline --experiment IMP --file baseline.json
+./dev --db controller.db improvement mission --experiment IMP --gate G
+./dev --db controller.db improvement seal --experiment IMP \
+    --producer NAME --path src/a.py --path tests/test_a.py
+./dev --db controller.db improvement evaluate --experiment IMP \
+    --evaluator OTHER --file candidate.json
+./dev --db controller.db improvement promote --experiment IMP \
+    --bundle bundle.json --environment P-staging
+./dev --db controller.db improvement close --experiment IMP --disposition accepted
+./dev --db controller.db improvement generation --parent IMP \
+    --baseline-sha CANDIDATE --isolation lane://P/2
+./dev --db controller.db improvement lineage --experiment IMP
+./dev --db controller.db improvement generations --lineage IMP
+```
+
+There is no `run` verb, and nothing polls: generation N+1 exists because
+somebody asked for it, never because generation N finished.
+
+A policy declares the whole envelope, and the two safety-critical parts of it --
+the protected surfaces and the frozen metrics -- are read from files rather than
+squeezed onto flags, so the two hardest things to get right are not the two
+hardest things to review:
+
+```json
+{
+  "enabled": true,
+  "improvement_classes": ["performance", "cost", "reliability"],
+  "trigger_classes": ["owner_objective", "maintenance_history"],
+  "environment_classes": ["local-sim", "staging"],
+  "protected_surfaces": {
+    "governance": ["standards/", "agents/"],
+    "production_authority": ["factory_controller/production.py"],
+    "admission_integrity": ["factory_controller/store.py"],
+    "evaluator_independence": ["tests/test_authority_boundaries.py"],
+    "improvement_policy": ["factory_controller/improvement.py"],
+    "secret_handling": [".env", "secrets/"],
+    "emergency_stop": ["factory_controller/portfolio.py"],
+    "release_authority": [".github/", "dev"]
+  },
+  "self_target_repositories": ["repo://factory-controller"],
+  "generation_ceiling": 2,
+  "experiment_budget": 2,
+  "concurrent_experiments": 1,
+  "risk_class": "low",
+  "policy_version": "sf140-1"
+}
+```
+
+Every name in `MANDATORY_SURFACES` must be present *and* cover at least one path
+prefix, so a policy that leaves a surface unprotected is not stored rather than
+being stored and checked later.  A policy may add surfaces; it may not drop one.
+
+An objective is the only container in Stage 8 that holds a human sentence, and
+registering one is an explicit Owner act.  Its digest is pinned into every
+experiment admitted under it, so revising the objective ends that lineage
+instead of retargeting a running experiment: metrics frozen before execution
+cannot be revised after.
+
+A candidate reaches a verdict only through a comparison it cannot influence.  It
+must pass its own ordinary acceptance gates, then clear each objective metric's
+declared relative threshold, and a regression on any non-regression metric ends
+it whatever the objective metrics did.  An unmeasurable reading is
+`not_measurable` and is never read as improvement.
+
+Promotion goes through the Stage-6 ledger, so autonomous improvement inherits
+emergency stop, drain, concurrency and the gated-class refusal rather than
+restating any of them.  A self-target experiment -- the Factory improving itself
+-- is refused a promotion outright: an accepted self-improvement candidate is a
+commit in an isolated lane and an evidence record, and installing it is an Owner
+act with no representation in this package.

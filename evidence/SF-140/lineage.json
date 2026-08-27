@@ -1,0 +1,286 @@
+{
+  "comparison": {
+    "metrics": [
+      {
+        "baseline": 26.73,
+        "candidate": 25.95,
+        "delta_ratio": 0.029180695847362555,
+        "direction": "decrease",
+        "metric_id": "suite_wall_clock_seconds",
+        "role": "objective",
+        "verdict": "improved"
+      },
+      {
+        "baseline": 667.0,
+        "candidate": 667.0,
+        "delta_ratio": 0.0,
+        "direction": "increase",
+        "metric_id": "passing_tests",
+        "role": "non_regression",
+        "verdict": "improved"
+      }
+    ],
+    "objective_digest": "ccd88496ff5d94656df3694a3fd4ee42ab408dd18af02db31c474cacd33ecc7c",
+    "regressed": [],
+    "unmeasured": [],
+    "unmet": [],
+    "verdict": "improved"
+  },
+  "experiment": {
+    "experiment_ref": "imp_664759fb5091a1cffa647e63",
+    "mission_created": true,
+    "mission_ref": "fm_a05f7704776c1a2c739ab474",
+    "mission_state": "completed",
+    "self_target": true
+  },
+  "generations": [
+    {
+      "baseline_sha": "40fc8e3eebe96708866f1cf5b056124dc39f289b",
+      "candidate_sha": "038c07ea2e1bc03a94f6542e1c20df5b667bac64",
+      "disposition": "accepted",
+      "experiment_ref": "imp_664759fb5091a1cffa647e63",
+      "generation": 1,
+      "objective_digest": "ccd88496ff5d94656df3694a3fd4ee42ab408dd18af02db31c474cacd33ecc7c",
+      "parent_ref": "not_applicable",
+      "policy_digest": "db85534410605bcd50b744e52e35827bbdd2a8dcc609e845b0548a6b4badaa18",
+      "policy_version": "sf140-1",
+      "verdict": "improved"
+    }
+  ],
+  "lineage": {
+    "baseline": {
+      "passing_tests": 667,
+      "suite_wall_clock_seconds": 26.73
+    },
+    "baseline_sha": "40fc8e3eebe96708866f1cf5b056124dc39f289b",
+    "bundle_ref": "not_applicable",
+    "candidate_measurements": {
+      "passing_tests": 667,
+      "suite_wall_clock_seconds": 25.95
+    },
+    "candidate_sha": "038c07ea2e1bc03a94f6542e1c20df5b667bac64",
+    "change_set": [
+      "factory_controller/engine.py"
+    ],
+    "comparison": {
+      "metrics": [
+        {
+          "baseline": 26.73,
+          "candidate": 25.95,
+          "delta_ratio": 0.029180695847362555,
+          "direction": "decrease",
+          "metric_id": "suite_wall_clock_seconds",
+          "role": "objective",
+          "verdict": "improved"
+        },
+        {
+          "baseline": 667.0,
+          "candidate": 667.0,
+          "delta_ratio": 0.0,
+          "direction": "increase",
+          "metric_id": "passing_tests",
+          "role": "non_regression",
+          "verdict": "improved"
+        }
+      ],
+      "objective_digest": "ccd88496ff5d94656df3694a3fd4ee42ab408dd18af02db31c474cacd33ecc7c",
+      "regressed": [],
+      "unmeasured": [],
+      "unmet": [],
+      "verdict": "improved"
+    },
+    "contract_version": "factory-controller/improvement/1.0",
+    "disposition": "accepted",
+    "evaluator_identity": "sf140-sealed-commit-harness",
+    "experiment_ref": "imp_664759fb5091a1cffa647e63",
+    "generation": 1,
+    "idempotency_key": "imp_664759fb5091a1cffa647e63",
+    "improvement_class": "performance",
+    "isolation_ref": "lane://factory-controller/sf140-lane",
+    "lineage_ref": "imp_664759fb5091a1cffa647e63",
+    "mission_ref": "fm_a05f7704776c1a2c739ab474",
+    "objective_digest": "ccd88496ff5d94656df3694a3fd4ee42ab408dd18af02db31c474cacd33ecc7c",
+    "objective_ref": "OBJ-SF140-SUITE",
+    "parent_ref": "not_applicable",
+    "policy_digest": "db85534410605bcd50b744e52e35827bbdd2a8dcc609e845b0548a6b4badaa18",
+    "policy_version": "sf140-1",
+    "producer_identity": "sf140-lane-author",
+    "project_id": "factory-controller",
+    "promotion_deployment_id": "not_applicable",
+    "promotion_environment_id": "not_applicable",
+    "reverted_to": "not_applicable",
+    "risk_class": "low",
+    "rollback_target": "40fc8e3eebe96708866f1cf5b056124dc39f289b",
+    "self_target": true,
+    "source_kind": "objectives",
+    "source_ref": "OBJ-SF140-SUITE",
+    "state": "closed",
+    "target_repository": "repo://factory-controller",
+    "transitions": [
+      {
+        "created_at": 1787818103.8372421,
+        "from_state": null,
+        "kind": "experiment_admitted",
+        "to_state": "admitted"
+      },
+      {
+        "created_at": 1787818103.840131,
+        "from_state": "admitted",
+        "kind": "baseline_measured",
+        "to_state": "baseline_measured"
+      },
+      {
+        "created_at": 1787818103.845786,
+        "from_state": "baseline_measured",
+        "kind": "candidate_mission_created",
+        "to_state": "mission_created"
+      },
+      {
+        "created_at": 1787818103.8853052,
+        "from_state": "mission_created",
+        "kind": "candidate_sealed",
+        "to_state": "candidate_sealed"
+      },
+      {
+        "created_at": 1787818103.888447,
+        "from_state": "candidate_sealed",
+        "kind": "candidate_evaluated",
+        "to_state": "evaluated"
+      },
+      {
+        "created_at": 1787818103.890636,
+        "from_state": "evaluated",
+        "kind": "experiment_closed",
+        "to_state": "closed"
+      }
+    ],
+    "trigger_class": "owner_objective",
+    "verdict": "improved"
+  },
+  "objective": {
+    "authority": "owner",
+    "improvement_class": "performance",
+    "metrics": [
+      {
+        "direction": "decrease",
+        "metric_id": "suite_wall_clock_seconds",
+        "min_delta_ratio": 0.02,
+        "role": "objective",
+        "tolerance_ratio": 0.0
+      },
+      {
+        "direction": "increase",
+        "metric_id": "passing_tests",
+        "min_delta_ratio": 0.0,
+        "role": "non_regression",
+        "tolerance_ratio": 0.0
+      }
+    ],
+    "objective_digest": "ccd88496ff5d94656df3694a3fd4ee42ab408dd18af02db31c474cacd33ecc7c",
+    "objective_ref": "OBJ-SF140-SUITE",
+    "objective_version": "1.0",
+    "project_id": "factory-controller",
+    "statement": "the Controller's own suite should run measurably faster without losing a passing test"
+  },
+  "policy": {
+    "concurrent_experiments": 1,
+    "cooldown_seconds": 0,
+    "cost_pressure_ratio": 0.75,
+    "enabled": true,
+    "environment_classes": [
+      "local-sim",
+      "staging"
+    ],
+    "execution_mode": "fixture",
+    "experiment_budget": 2,
+    "generation_ceiling": 2,
+    "improvement_classes": [
+      "capability",
+      "quality",
+      "cost",
+      "performance",
+      "reliability",
+      "maintainability",
+      "operability"
+    ],
+    "incident_pressure": 3,
+    "maintenance_pressure": 3,
+    "policy_version": "sf140-1",
+    "project_id": "factory-controller",
+    "protected_surfaces": {
+      "admission_integrity": [
+        "factory_controller/store.py"
+      ],
+      "emergency_stop": [
+        "factory_controller/portfolio.py"
+      ],
+      "evaluator_independence": [
+        "tests/test_authority_boundaries.py"
+      ],
+      "governance": [
+        "standards/",
+        "agents/",
+        "CONSTITUTION.md"
+      ],
+      "improvement_policy": [
+        "factory_controller/improvement.py",
+        "tests/test_stage8_improvement.py"
+      ],
+      "production_authority": [
+        "factory_controller/production.py"
+      ],
+      "release_authority": [
+        ".github/",
+        "dev",
+        "Dockerfile",
+        "compose.yaml"
+      ],
+      "secret_handling": [
+        ".env",
+        "secrets/"
+      ]
+    },
+    "risk_class": "low",
+    "self_target_repositories": [
+      "repo://factory-controller"
+    ],
+    "trigger_classes": [
+      "owner_objective",
+      "maintenance_history",
+      "operational_pain",
+      "cost_inefficiency"
+    ]
+  },
+  "refusals": {
+    "evaluator_not_independent": {
+      "code": "IMPROVEMENT_EVALUATOR_NOT_INDEPENDENT",
+      "detail": "sf140-lane-author produced the candidate and cannot also judge it",
+      "experiment_ref": "imp_664759fb5091a1cffa647e63",
+      "project_id": "factory-controller"
+    },
+    "generation_needs_advanced_baseline": {
+      "code": "IMPROVEMENT_BASELINE_NOT_ADVANCED",
+      "detail": "generation 1 already ran against 40fc8e3eebe96708866f1cf5b056124dc39f289b; a new generation pins the baseline its parent produced",
+      "experiment_ref": "imp_664759fb5091a1cffa647e63",
+      "project_id": "factory-controller"
+    },
+    "protected_surface": {
+      "code": "IMPROVEMENT_PROTECTED_SURFACE_TOUCHED",
+      "detail": "candidate touches protected surface(s): factory_controller/store.py (admission_integrity); changing these is an Owner act with a stronger gate and has no autonomous path",
+      "experiment_ref": "imp_664759fb5091a1cffa647e63",
+      "project_id": "factory-controller"
+    },
+    "self_promotion": {
+      "code": "IMPROVEMENT_SELF_PROMOTION_REQUIRES_OWNER",
+      "detail": "imp_664759fb5091a1cffa647e63 targets the Factory itself; an accepted self-improvement candidate is a commit in an isolated lane and an evidence record, and installing it is an Owner act",
+      "experiment_ref": "imp_664759fb5091a1cffa647e63",
+      "project_id": "factory-controller"
+    },
+    "unknown_change_set": {
+      "code": "IMPROVEMENT_CHANGE_SET_UNKNOWN",
+      "detail": "no change set is recorded for imp_664759fb5091a1cffa647e63; an unknown change set is refused rather than assumed harmless",
+      "experiment_ref": "imp_664759fb5091a1cffa647e63",
+      "project_id": "factory-controller"
+    }
+  }
+}
