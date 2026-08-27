@@ -55,6 +55,7 @@ import time
 from dataclasses import dataclass, field
 from typing import Any, Mapping
 
+from . import capacity as capacity_plane
 from . import improvement as improvement_plane
 from . import maintenance as maintenance_plane
 from . import portfolio as portfolio_policy
@@ -710,6 +711,93 @@ class OperationsSupervisor:
             "budget": self._store.portfolio_economics(),
             "policies": [policy.as_row() for policy in self.policies()],
         }
+
+    def capacity_brief(self) -> dict[str, Any]:
+        """Which runtimes are usable now, and what is waiting on which window.
+
+        Observability only, and structurally so: every value below is read from
+        durable state and nothing here is an input to any later decision.  The
+        supervisor gained no capacity code beyond this method -- capacity is a
+        scheduler verdict, so a cycle is already capacity-aware and a cooling
+        provider already ends a cycle cleanly rather than polling.
+        """
+
+        readings = self._store.capacity_readings()
+        preview = self._store.schedule_preview()
+        missions = self._mission_lines()
+        assigned: dict[str, list[str]] = {}
+        at_risk: list[dict[str, Any]] = []
+        resumable: list[dict[str, Any]] = []
+        for mission in missions:
+            payload = mission["payload"]
+            declared = tuple(
+                entry if isinstance(entry, str) else entry.get("profile")
+                for entry in (payload.get("provider_candidates") or ()))
+            declared = tuple(name for name in declared if isinstance(name, str) and name)
+            if mission["leased"]:
+                for runtime_id in declared:
+                    assigned.setdefault(runtime_id, []).append(mission["id"])
+            if mission["state"] in portfolio_policy.TERMINAL or not declared:
+                continue
+            try:
+                estimate = capacity_plane.WorkEstimate.from_payload(payload)
+            except capacity_plane.PolicyError:
+                estimate = capacity_plane.WorkEstimate()
+            plan = capacity_plane.plan(declared, readings, estimate)
+            if plan.exhausted:
+                at_risk.append({"mission_id": mission["id"],
+                                "project_id": _absent(mission["project_id"], "not_applicable"),
+                                "reason": plan.reason,
+                                "resume_at": _absent(plan.resume_at, "unknown"),
+                                "size_class": estimate.size_class})
+            elif plan.denied:
+                at_risk.append({"mission_id": mission["id"],
+                                "project_id": _absent(mission["project_id"], "not_applicable"),
+                                "reason": "CAPACITY_PARTIALLY_NARROWED",
+                                "resume_at": "not_applicable",
+                                "size_class": estimate.size_class})
+        for row in self._deferred_missions():
+            resumable.append(row)
+        grouped: dict[str, list[dict[str, Any]]] = {}
+        for reading in readings.values():
+            grouped.setdefault("usable" if reading.usable else reading.state, []).append({
+                **reading.as_row(), "assigned": sorted(assigned.get(reading.runtime_id, ()))})
+        return {
+            "contract_version": capacity_plane.CONTRACT_VERSION,
+            "runtimes": {key: sorted(value, key=lambda row: row["runtime_id"])
+                         for key, value in sorted(grouped.items())},
+            "usable_now": sorted(reading.runtime_id for reading in readings.values()
+                                 if reading.usable),
+            "unusable": sorted((reading.runtime_id, reading.reason)
+                               for reading in readings.values() if not reading.usable),
+            "resumable": resumable,
+            "at_risk": at_risk,
+            "next_eligible": preview.get("selected") or "not_applicable",
+            "next_eligible_reason": preview.get("reason", "unknown"),
+            "policies": [policy.as_row() for policy in
+                         self._store.runtime_policies().values()],
+        }
+
+    def _deferred_missions(self) -> list[dict[str, Any]]:
+        """Missions a closed window put back, with the checkpoint each resumes from."""
+
+        with self._store.transaction() as db:
+            rows = db.execute(
+                "SELECT id,project_id,next_run_at,deferrals FROM missions"
+                " WHERE deferrals>0 AND state NOT IN"
+                " ('completed','refused','failed','cancelled')"
+                " ORDER BY next_run_at,id").fetchall()
+        out = []
+        for row in rows:
+            checkpoint = self._store.capacity_checkpoint(row["id"])
+            out.append({"mission_id": row["id"],
+                        "project_id": _absent(row["project_id"], "not_applicable"),
+                        "resume_at": row["next_run_at"],
+                        "deferrals": row["deferrals"],
+                        "safe_boundary": checkpoint["safe_boundary"],
+                        "next_safe_step": checkpoint["next_safe_step"],
+                        "compatible_profiles": checkpoint["compatible_profiles"]})
+        return out
 
     def _mission_lines(self) -> list[dict[str, Any]]:
         """Every mission, with only the columns a brief reads.

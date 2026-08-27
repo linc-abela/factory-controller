@@ -351,7 +351,8 @@ def read(policy: RuntimePolicy | None, observation: CapacityObservation | None,
     undeclared constraint must never behave like a closed gate.
     """
 
-    if policy is not None and not policy.managed:
+    registered = policy is not None
+    if registered and not policy.managed:
         return RuntimeReading(
             runtime_id=policy.runtime_id,
             state="capacity_unmeasurable" if observation is None else observation.state,
@@ -359,7 +360,7 @@ def read(policy: RuntimePolicy | None, observation: CapacityObservation | None,
             observed_at=None if observation is None else observation.observed_at,
             handoff=policy.handoff)
 
-    if policy is None and observation is None:
+    if not registered and observation is None:
         return RuntimeReading(runtime_id="unknown", state="capacity_unmeasurable",
                               usable=True, reason="CAPACITY_NOT_MANAGED")
 
@@ -375,6 +376,23 @@ def read(policy: RuntimePolicy | None, observation: CapacityObservation | None,
 
     age = now - observation.observed_at
     if age > policy.max_observation_age_seconds:
+        # An expired reading means "we no longer know", and who that refuses
+        # depends entirely on who asked for the runtime to be managed.
+        #
+        # For a *registered* runtime it refuses, because registering is the act
+        # that makes "nobody measured this" a refusal, and the Owner undertook
+        # to keep it observed.  For an unregistered one it must not, and the
+        # simulation found out why: a single provider quota refusal writes an
+        # observation, and if that lone reading kept the runtime out forever
+        # after it expired, one refusal would silently stop a Factory that
+        # never adopted capacity at all.  Nothing would ever re-observe it.
+        if not registered:
+            return RuntimeReading(
+                runtime_id=policy.runtime_id, state="capacity_unmeasurable",
+                usable=True, reason="CAPACITY_NOT_MANAGED",
+                observed_at=observation.observed_at, source=observation.source,
+                source_ref=observation.source_ref, handoff=policy.handoff,
+                detail={"age_seconds": round(age, 6), "expired": True})
         return RuntimeReading(
             runtime_id=policy.runtime_id, state="capacity_unmeasurable", usable=False,
             reason="CAPACITY_OBSERVATION_STALE", reset_state="reset_unknown",
@@ -642,8 +660,14 @@ def checkpoint_facts(mission: Mapping[str, Any], payload: Mapping[str, Any],
 
     committed = [leg for leg in legs if leg.get("process_started") is not False]
     safe = not committed
-    completed = tuple(name for name in MISSION_STEPS if steps.get(name) == "COMPLETED")
-    remaining = [name for name in MISSION_STEPS if steps.get(name) != "COMPLETED"]
+    # A mission that declared no context request never runs a context step, so
+    # asking for its status would leave every checkpoint pointing at a step
+    # that will never happen.  The applicable steps are derived from the
+    # mission's own declaration, exactly as the engine derives them.
+    applicable = tuple(name for name in MISSION_STEPS
+                       if name != "context" or payload.get("context_request"))
+    completed = tuple(name for name in applicable if steps.get(name) == "COMPLETED")
+    remaining = [name for name in applicable if steps.get(name) != "COMPLETED"]
     served = committed[-1] if committed else (legs[-1] if legs else None)
     blockers: list[str] = []
     if not safe:

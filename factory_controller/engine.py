@@ -435,20 +435,27 @@ class Controller:
         boundary -- where a deferral would be exactly the duplicate irreversible
         effect this design exists to make impossible.
 
+        Only legs a *profile* was chosen for are examined.  The Controller's
+        own refusals -- the budget gate, the capacity gate, "no admissible
+        provider" -- are recorded as legs with no profile, and counting one of
+        those would make a deferred mission un-deferrable on its second pass,
+        because its own previous refusal would be sitting in the history.
+
         The resume time comes from the readings the refusals themselves just
         wrote, so it is the provider's own statement rather than a guess.
         """
 
-        if not spent:
+        served = [receipt for receipt in spent if receipt.provider_profile is not None]
+        if not served:
             return (False, None)
-        for receipt in spent:
+        for receipt in served:
             if receipt.process_started is not False:
                 return (False, None)
             if receipt.refusal_code not in capacity.QUOTA_REFUSAL_CODES:
                 return (False, None)
         readings = self.store.capacity_readings()
         times = [readings[receipt.provider_profile].resume_at
-                 for receipt in spent
+                 for receipt in served
                  if receipt.provider_profile in readings
                  and readings[receipt.provider_profile].resume_at is not None]
         return (True, min(times) if times else None)
