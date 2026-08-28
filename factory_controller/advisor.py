@@ -41,7 +41,10 @@ PROPOSAL_KINDS = ("decompose", "dependency_edge", "project_priority",
 #: before the allowlist is even consulted.
 FORBIDDEN_KINDS = ("create_project", "set_budget", "set_acceptance_gates",
                    "seal_evidence", "admit_execution", "set_execution_mode",
-                   "set_context_manifest", "cancel_portfolio")
+                   "set_context_manifest", "cancel_portfolio",
+                   "activate_shift", "revoke_shift", "resume_shift",
+                   "clear_blocker", "assert_readiness", "assert_capacity",
+                   "widen_capability", "approve_production")
 
 
 @dataclass(frozen=True)

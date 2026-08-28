@@ -18,7 +18,8 @@ import json
 import unittest
 from pathlib import Path
 
-from factory_controller import dogfood, portfolio, supervisor
+from factory_controller import (capacity, dogfood, improvement, portfolio,
+                                production, supervisor)
 
 from tests.test_stage9_supervisor import SupervisorCase
 
@@ -110,8 +111,21 @@ class PreflightCase(SupervisorCase):
     def setUp(self):
         super().setUp()
         self.contract = dogfood.load_contract(str(CONTRACT_PATH))
+        self.improvement = improvement.ImprovementPlane(
+            self.store, production.ProductionLedger(self.store))
 
-    def provision(self, *, gates=True, budgets=True, policies=True):
+    def provision(self, *, gates=True, budgets=True, policies=True,
+                  capacity_records=True, surfaces=True):
+        """A host with every prerequisite the run contract implies.
+
+        ``capacity_records`` and ``surfaces`` join the fixture with SF-144:
+        capacity was previously only read by the scheduler and protected
+        surfaces only at promotion, so a run could be authorized against
+        runtimes that were all cooling, or against a project where the Stage-8
+        surface check could never fire.  Both are provisioned here so that
+        "fully provisioned" keeps meaning what this class says it means.
+        """
+
         sources = {
             "factory-prototype-lab": ("dev-check", "dev-test", "dev-evaluate"),
             "factory-bug-lab": ("dev-check", "dev-test", "dev-reproduce"),
@@ -130,11 +144,25 @@ class PreflightCase(SupervisorCase):
                     project_id=name, work_classes=("backlog", "maintenance",
                                                    "improvement"),
                     policy_version="dogfood-1"))
+            if surfaces:
+                self.improvement.set_policy(improvement.ImprovementPolicy(
+                    project_id=name, enabled=True,
+                    protected_surfaces={surface: ("factory_controller/",)
+                                        for surface in improvement.MANDATORY_SURFACES},
+                    policy_version="dogfood-1"))
+        if capacity_records:
+            for runtime_id in self.contract.provider_profiles:
+                self.store.set_runtime_policy(
+                    capacity.RuntimePolicy(runtime_id=runtime_id))
+                self.store.observe_capacity(capacity.CapacityObservation(
+                    runtime_id=runtime_id, state="available", source="operator",
+                    source_ref="preflight-fixture", observed_at=self.clock()))
 
-    def run_preflight(self, *, reports=None, service=None):
-        return dogfood.preflight(self.contract, store=self.store,
-                                 supervisor_plane=self.plane,
-                                 reports=reports, service_doctor=service).as_row()
+    def run_preflight(self, *, reports=None, service=None, plane=True):
+        return dogfood.preflight(
+            self.contract, store=self.store, supervisor_plane=self.plane,
+            reports=reports, service_doctor=service,
+            improvement_plane=self.improvement if plane else None).as_row()
 
     def state(self, row, check):
         return next(item["state"] for item in row["checks"]

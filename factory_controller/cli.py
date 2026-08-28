@@ -19,6 +19,7 @@ from . import maintenance as mnt
 from . import portfolio
 from . import production
 from . import rehearsal
+from . import shift as shift_plane
 from . import supervisor as sup
 from .adapter import JsonProcessAdapter
 from .engine import Controller, RetryPolicy
@@ -257,6 +258,36 @@ def parser() -> argparse.ArgumentParser:
                      default=str(Path.home() / "Library" / "LaunchAgents"))
     dog.add_argument("--state-dir", dest="dog_state_dir",
                      default=str(Path.home() / ".factory-controller"))
+
+    sh = sub.add_parser("shift")
+    sh.add_argument("action", choices=("portfolio", "gate", "preview", "apply",
+                                       "revoke", "suspend", "resume", "status",
+                                       "brief", "admit", "grants", "events"))
+    sh.add_argument("--contract", dest="sh_contract",
+                    default="contracts/internal-dogfood-run-contract.json")
+    sh.add_argument("--portfolio", dest="sh_portfolio",
+                    default="contracts/first-dogfood-mission-portfolio.json")
+    sh.add_argument("--request", dest="sh_request",
+                    default="SF-144-first-internal-dogfood-1")
+    sh.add_argument("--approval", dest="sh_approval",
+                    help="path to the Owner's durable shift approval record")
+    sh.add_argument("--missions", type=int, dest="sh_missions", default=4)
+    sh.add_argument("--duration-seconds", type=float, dest="sh_duration",
+                    default=4 * 3600.0)
+    sh.add_argument("--budget", type=float, dest="sh_budget", default=25.0)
+    sh.add_argument("--currency", dest="sh_currency", default="USD")
+    sh.add_argument("--reason", dest="sh_reason", default="operator")
+    sh.add_argument("--actor", dest="sh_actor", default="owner")
+    sh.add_argument("--resume-ref", dest="sh_resume_ref",
+                    help="where the durable state a resume would read is recorded")
+    sh.add_argument("--report", dest="sh_reports", action="append", default=[],
+                    metavar="NAME=PATH",
+                    help="a JSON report from another repository; repeatable")
+    sh.add_argument("--reachable", dest="sh_reachable",
+                    metavar="PATH",
+                    help="JSON mapping each project to the commits an operator "
+                         "confirmed its remote can serve")
+    sh.add_argument("--limit", type=int, dest="sh_limit", default=50)
 
     sup_parser = sub.add_parser("supervisor")
     sup_parser.add_argument("action", choices=(
@@ -810,6 +841,184 @@ def _dogfood(args, controller) -> int:
     return 0 if result["ready"] else 1
 
 
+def _shift_facts(args, controller, contract, entry):
+    """Gather what the gate reads, from the planes that own each fact.
+
+    The preflight is the one the Factory already had, run here rather than
+    re-implemented, so the shift gate cannot disagree with ``dogfood preflight``
+    about whether the host is ready.
+    """
+
+    reports = {}
+    for pair in args.sh_reports:
+        name, _, path = pair.partition("=")
+        if not path:
+            raise shift_plane.ShiftRefusal("SHIFT_REPORT_MALFORMED",
+                                           "expected NAME=PATH, got %r" % pair)
+        try:
+            reports[name] = json.loads(Path(path).read_text())
+        except (OSError, ValueError) as exc:
+            raise shift_plane.ShiftRefusal("SHIFT_REPORT_UNREADABLE",
+                                           "%s: %s" % (name, exc))
+    reachable = None
+    if args.sh_reachable:
+        try:
+            reachable = json.loads(Path(args.sh_reachable).read_text())
+        except (OSError, ValueError) as exc:
+            raise shift_plane.ShiftRefusal("SHIFT_REACHABILITY_UNREADABLE",
+                                           str(exc))
+    plane = sup.OperationsSupervisor(controller)
+    ledger = production.ProductionLedger(controller.store)
+    try:
+        plan = activation.from_contract(
+            plane.service_contract(invocation=_service_invocation(args),
+                                   interval_seconds=300),
+            agents_dir=str(Path.home() / "Library" / "LaunchAgents"),
+            state_dir=str(Path.home() / ".factory-controller"),
+            working_dir=str(Path.cwd()))
+        service = activation.doctor(plan)
+    except activation.ActivationError as exc:
+        service = {"definition_present": False, "drift": "unknown",
+                   "detail": str(exc)}
+    pre = dogfood.preflight(contract, store=controller.store,
+                            supervisor_plane=plane, reports=reports,
+                            service_doctor=service,
+                            improvement_plane=imp.ImprovementPlane(
+                                controller.store, ledger)).as_row()
+    declared = {}
+    for name in contract.projects:
+        try:
+            gates, source = controller.store.declared_acceptance_gates(name)
+        except Exception:                                 # noqa: BLE001
+            continue
+        declared[name] = {"acceptance_gate_ids": list(gates), "source": source}
+    readings = {name: reading.as_row() for name, reading
+                in controller.store.capacity_readings().items()}
+    denied = controller.store.portfolio_policy().as_row().get("denied_profiles", ())
+    usable = shift_plane.eligible(contract.provider_profiles, readings, denied)
+    request = shift_plane.ActivationRequest(
+        request_ref=args.sh_request, run_ref=contract.run_ref,
+        portfolio_ref=entry.portfolio_ref, mission_ceiling=args.sh_missions,
+        duration_seconds=args.sh_duration, budget_ceiling=args.sh_budget,
+        budget_currency=args.sh_currency)
+    facts = shift_plane.GateFacts(
+        preflight=pre, portfolio=entry, request=request,
+        contract_projects=contract.projects,
+        contract_work_classes=contract.work_classes,
+        contract_environment_classes=contract.environment_classes,
+        contract_budget_ceiling=contract.budget_ceiling,
+        contract_budget_currency=contract.budget_currency,
+        declared_gates=declared, capacity_readings=readings,
+        eligible_profiles=usable, fetchable_shas=reachable)
+    return facts, plane, readings, usable, denied
+
+
+def _shift(args, controller) -> int:
+    """The Owner's four acts and the readings behind them.  Nothing is started.
+
+    ``apply`` writes a grant and no more: it loads no service, starts no
+    process and admits no mission by itself.  A shift becomes work only when
+    the ordinary execution path reads the grant and finds it active, which is
+    the separation scope 5 of SF-144 asks for -- preparing a host and
+    authorizing missions are different acts with different records.
+    """
+
+    try:
+        entry = shift_plane.load_portfolio(args.sh_portfolio)
+        contract = dogfood.load_contract(args.sh_contract)
+    except (shift_plane.ShiftError, dogfood.ContractError) as exc:
+        print(json.dumps({"refused": {"code": "SHIFT_CONTRACT_INVALID",
+                                      "detail": str(exc)}}, sort_keys=True))
+        return 2
+    if args.action == "portfolio":
+        print(json.dumps(entry.as_row(), sort_keys=True))
+        return 0
+    plane = shift_plane.ShiftPlane(controller.store)
+    if args.action == "grants":
+        print(json.dumps({"grants": plane.grants(args.sh_limit)}, sort_keys=True))
+        return 0
+    if args.action == "events":
+        print(json.dumps({"events": plane.events(limit=args.sh_limit)},
+                         sort_keys=True))
+        return 0
+    if args.action in ("revoke", "suspend", "resume"):
+        try:
+            if args.action == "revoke":
+                result = plane.revoke(args.sh_request, reason=args.sh_reason,
+                                      actor=args.sh_actor)
+            elif args.action == "resume":
+                result = plane.resume(args.sh_request, actor=args.sh_actor)
+            else:
+                outcomes = plane.outcomes(entry)
+                in_flight = sum(
+                    1 for ref, value in outcomes.items()
+                    if value not in shift_plane.TERMINAL_MISSION_STATES)
+                result = plane.suspend(args.sh_request,
+                                       resume_ref=args.sh_resume_ref or "",
+                                       missions_in_flight=in_flight,
+                                       actor=args.sh_actor)
+        except shift_plane.ShiftRefusal as refusal:
+            print(json.dumps(refusal.as_row(), sort_keys=True))
+            return 2
+        print(json.dumps(result, sort_keys=True))
+        return 0
+    try:
+        facts, ops, readings, usable, denied = _shift_facts(
+            args, controller, contract, entry)
+    except shift_plane.ShiftRefusal as refusal:
+        print(json.dumps(refusal.as_row(), sort_keys=True))
+        return 2
+    reading = shift_plane.gate(facts)
+    if args.action == "gate":
+        print(json.dumps(reading, sort_keys=True))
+        return 0 if reading["ready"] else 1
+    approval = shift_plane.approval_record(args.sh_approval,
+                                           request_ref=args.sh_request)
+    if args.action == "preview":
+        print(json.dumps(plane.preview(facts, approval=approval), sort_keys=True))
+        return 0 if reading["ready"] else 1
+    if args.action == "apply":
+        try:
+            result = plane.apply(facts, approval, actor=args.sh_actor)
+        except shift_plane.ShiftRefusal as refusal:
+            print(json.dumps(refusal.as_row(), sort_keys=True))
+            return 2
+        print(json.dumps(result, sort_keys=True))
+        return 0
+    control = ops.control()
+    observed = plane.observe(
+        entry, control_state=control.get("state", "stopped"),
+        gate_ready=reading["ready"], capacity_readings=readings,
+        profiles=contract.provider_profiles, denied=denied,
+        emergency_stop=controller.store.portfolio_policy().emergency_stop)
+    grant = plane.grant(args.sh_request) or plane.grant()
+    now = time.time()
+    if args.action == "status":
+        print(json.dumps({
+            "contract_version": shift_plane.CONTRACT_VERSION,
+            "state": shift_plane.state(grant, observed, now),
+            "drain_reasons": list(shift_plane.drain_reasons(grant, observed, now)),
+            "grant": None if grant is None else grant.as_row(),
+            "gate_ready": reading["ready"], "blockers": reading["blockers"],
+            "control_state": control.get("state", "unknown"),
+            "eligible_profiles": list(usable),
+        }, sort_keys=True, default=str))
+        return 0
+    if args.action == "admit":
+        print(json.dumps(shift_plane.admission(grant, entry, observed,
+                                               plane.outcomes(entry), now),
+                         sort_keys=True))
+        return 0
+    owner_actions = [{"check": row["check"], "detail": row["detail"]}
+                     for row in reading["blockers"]]
+    print(json.dumps(shift_plane.brief(
+        grant, observed, reading, entry, plane.outcomes(entry), now,
+        admitted_projects=sorted(controller.store.projects()),
+        admitted_capabilities=sorted(contract.work_classes),
+        owner_actions=owner_actions), sort_keys=True, default=str))
+    return 0
+
+
 def _service_invocation(args) -> list[str]:
     return [sys.executable, "-m", "factory_controller.cli",
             "--db", args.db, "supervisor", "cycle"]
@@ -973,6 +1182,8 @@ def main(argv: list[str] | None = None) -> int:
         return _supervisor(args, controller)
     elif args.command == "dogfood":
         return _dogfood(args, controller)
+    elif args.command == "shift":
+        return _shift(args, controller)
     elif args.command == "harness":
         ids = []
         for index in range(args.missions):

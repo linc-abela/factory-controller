@@ -1,0 +1,104 @@
+{
+  "schema_version": "factory.controller.internal_dogfood_mission_portfolio.v1",
+  "portfolio_ref": "SF-144-first-internal-dogfood-1",
+  "rationale": "Four missions, strictly serial, ordered so that the Factory proves the path before it is allowed to change anything with it. The ordering is not a preference, it follows three measurements taken on 2026-08-28 against the two labs the run contract already admits. First: at factory-prototype-lab 229b923b, dev check, dev test and dev evaluate all exit 0, so M3 is implemented and there is no open lab work there to dogfood. Second: at factory-bug-lab 961a4c97, dev reproduce exits 0 -- the seat-overbooking defect is already fixed in that commit -- while at the pushed baseline 4072bfd7 it exits 1 and reproduces. Third: 961a4c97 and 34d3fb7 exist only in this host's working copy and are not on the remote, so the run contract's own acceptance_gate_source for factory-bug-lab names a commit no second host can fetch. Together those three facts say the first portfolio cannot be a list of lab problems to solve, because the labs are solved; what has never been done is the Factory itself carrying one declared mission from context through a real provider to a re-derived acceptance gate and a sealed evidence record. So DF-1 and DF-2 mutate nothing and exist to produce that record, DF-2 specifically against a gate that is known to fail so that a failing gate is proved to be reported as a failure rather than smoothed into a pass, and only then does DF-3 change a repository -- against 4072bfd7, where a defect genuinely reproduces, and where an independent human fix already exists off the mission's baseline as a comparison the Factory's output can be checked against. DF-4 is last because promoting an improvement is the only mission here that changes a project's own quality bar. Every mission names its own rollback boundary because the run contract's rollback criteria are about the run: 'stop the run' is not something a first mission can act on. The portfolio is four rather than ten because each mission must be read by a person before the next begins, and a first portfolio nobody finishes reading is a portfolio that produced no evidence.",
+  "missions": [
+    {
+      "mission_ref": "DF-1",
+      "project_id": "factory-prototype-lab",
+      "work_class": "backlog",
+      "environment_class": "local-sim",
+      "objective": "Carry one declared mission end to end -- context binding, provider dispatch, verification, acceptance-gate re-derivation and evidence sealing -- against a repository state the Factory does not change, and record the resulting mission, receipt and cost/context accounting.",
+      "baseline_sha": "229b923b050fe8a4450d5597d472157bd42c8647",
+      "acceptance_gate_ids": ["dev-check", "dev-test"],
+      "acceptance_gate_source": "https://github.com/linc-abela/factory-prototype-lab.git@229b923b050fe8a4450d5597d472157bd42c8647:dev",
+      "mutates_repository": false,
+      "stop_conditions": [
+        "the dispatch leg completes with execution_mode fixture rather than reaching a provider process",
+        "any acceptance gate id resolves from anywhere other than the project registry",
+        "the mission writes to the lab working tree"
+      ],
+      "rollback_boundary": "None is required and that is the point: the mission produces only Controller state and evidence records, so abandoning it leaves the lab byte-identical.",
+      "evidence_required": [
+        "mission record with every step terminal",
+        "provider receipt naming the profile actually selected",
+        "re-derived exit status for each declared gate",
+        "cost accounting, or a typed absence where the provider returned no usage",
+        "context accounting for the bound package"
+      ]
+    },
+    {
+      "mission_ref": "DF-2",
+      "project_id": "factory-bug-lab",
+      "work_class": "maintenance",
+      "environment_class": "local-sim",
+      "objective": "Run the same path against a declared gate that is known to fail, and prove the failure is recorded as a failure. At baseline 4072bfd7 dev reproduce exits 1 by design; the mission succeeds when the Factory reports that non-zero exit as an unmet gate with the exit status preserved, and fails if the run is reported healthy.",
+      "baseline_sha": "4072bfd7c008d3b227e2e164ecbe6f58013c2733",
+      "acceptance_gate_ids": ["dev-check", "dev-test", "dev-reproduce"],
+      "acceptance_gate_source": "https://github.com/linc-abela/factory-bug-lab.git@961a4c97d49183b5501f244ba48773d9f50953ae:dev",
+      "mutates_repository": false,
+      "stop_conditions": [
+        "a non-zero gate exit is recorded as met, or as any absence word",
+        "the mission is reported complete without the failing gate appearing in its evidence",
+        "the mission writes to the lab working tree"
+      ],
+      "rollback_boundary": "None is required; the mission produces only Controller state and evidence records.",
+      "evidence_required": [
+        "mission record showing dev-reproduce unmet with exit status 1 preserved",
+        "the two passing gates recorded separately from the failing one",
+        "provider receipt naming the profile actually selected",
+        "cost accounting, or a typed absence"
+      ]
+    },
+    {
+      "mission_ref": "DF-3",
+      "project_id": "factory-bug-lab",
+      "work_class": "maintenance",
+      "environment_class": "staging",
+      "objective": "Diagnose and fix the seat-overbooking defect the lab's frozen report describes, from baseline 4072bfd7, adding a regression that fails at the baseline and passes at the fix. This is the first mission that changes a repository. It is checkable in a way no other first mutating mission would be: an independent human fix for the same defect exists off this baseline, so the Factory's diagnosis and patch can be compared against a known-good one rather than only against a green suite.",
+      "baseline_sha": "4072bfd7c008d3b227e2e164ecbe6f58013c2733",
+      "acceptance_gate_ids": ["dev-check", "dev-test", "dev-reproduce"],
+      "acceptance_gate_source": "https://github.com/linc-abela/factory-bug-lab.git@961a4c97d49183b5501f244ba48773d9f50953ae:dev",
+      "mutates_repository": true,
+      "stop_conditions": [
+        "the fix commit does not move dev-reproduce from exit 1 to exit 0",
+        "the added regression passes at the baseline commit",
+        "any change lands outside the lab package and its tests",
+        "the mission force-updates or rewrites any published ref"
+      ],
+      "rollback_boundary": "A single branch off 4072bfd7, never main. Rollback is deleting that branch; nothing the mission does is visible to another host until a person merges it.",
+      "evidence_required": [
+        "the root cause stated in writing",
+        "before and after exit statuses for all three gates, with exact SHAs",
+        "the regression's own failing result at the baseline commit",
+        "diff confined to the lab package and its tests",
+        "cost and context accounting for the whole mission"
+      ]
+    },
+    {
+      "mission_ref": "DF-4",
+      "project_id": "factory-prototype-lab",
+      "work_class": "improvement",
+      "environment_class": "staging",
+      "objective": "Carry one improvement candidate through baseline measurement and promotion without regressing the lab's own decision boundary. This is last because it is the only mission that changes a project's quality bar rather than its behaviour, and it is the only one whose failure mode is silent.",
+      "baseline_sha": "229b923b050fe8a4450d5597d472157bd42c8647",
+      "acceptance_gate_ids": ["dev-check", "dev-test", "dev-evaluate"],
+      "acceptance_gate_source": "https://github.com/linc-abela/factory-prototype-lab.git@229b923b050fe8a4450d5597d472157bd42c8647:dev",
+      "mutates_repository": true,
+      "stop_conditions": [
+        "dev-evaluate moves from exit 0 to any non-zero status",
+        "the candidate is promoted without a baseline measurement recorded first",
+        "any protected surface declared for the project is touched",
+        "the mission changes the evaluator or the fixture rather than the implementation"
+      ],
+      "rollback_boundary": "A single branch off 229b923b, never main, plus the improvement plane's own demotion path. Rollback is demote-then-delete-branch, in that order, so the promotion record and the code go together.",
+      "evidence_required": [
+        "baseline measurement recorded before the candidate ran",
+        "post-change measurement for the same metric",
+        "dev-evaluate exit 0 preserved at the fix commit",
+        "the promotion decision with its approval reference",
+        "cost and context accounting"
+      ]
+    }
+  ]
+}

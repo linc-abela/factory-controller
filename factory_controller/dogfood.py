@@ -205,13 +205,19 @@ def _report(reports: Mapping[str, Any], name: str) -> Any:
 
 def preflight(contract: RunContract, *, store, supervisor_plane,
               reports: Mapping[str, Any] | None = None,
-              service_doctor: Mapping[str, Any] | None = None) -> Preflight:
+              service_doctor: Mapping[str, Any] | None = None,
+              improvement_plane=None) -> Preflight:
     """Every prerequisite the contract implies, and nothing mutated.
 
     Each check answers with what it could actually read.  A check whose input
     was not supplied is ``unknown``: it is a different fact from ``unmet``, and
     collapsing the two would make an operator who forgot a report look exactly
     like a host that is not ready.
+
+    ``improvement_plane`` is optional for the same reason every report is:
+    without one the protected-surface question is ``unknown`` rather than
+    assumed clear, and a caller that cannot reach the plane is told so instead
+    of being told the surfaces are fine.
     """
 
     reports = reports or {}
@@ -222,7 +228,77 @@ def preflight(contract: RunContract, *, store, supervisor_plane,
     _check_bridge(out, contract, _report(reports, "bridge_doctor"),
                   _report(reports, "capability_preview"))
     _check_service_reports(out, contract, reports)
+    _check_capacity(out, contract, store)
+    _check_protected_surfaces(out, contract, improvement_plane)
     return out
+
+
+def _check_capacity(out: Preflight, contract: RunContract, store) -> None:
+    """Capacity as a prerequisite, read the only way capacity may be read.
+
+    SF-143 put capacity in the scheduler, where it narrows a selection.  It was
+    never asked *before* a run, and a run authorized against runtimes that are
+    all cooling is a run with nothing able to take a mission.  The asymmetry is
+    the contract: an unregistered runtime is not narrowed at all -- capacity is
+    opt-in, and switching it on for the first time must not read as a closed
+    gate -- while a registered runtime whose reading says it cannot work is
+    refused.  So absence of readings is ``unknown``, not ``met``.
+    """
+
+    try:
+        readings = store.capacity_readings()
+    except Exception as refusal:                          # noqa: BLE001
+        out.record("PROVIDER_CAPACITY", UNKNOWN,
+                   "capacity readings are unreadable: %s" % refusal,
+                   evidence_class="unknown")
+        return
+    declared = tuple(contract.provider_profiles)
+    if not readings:
+        out.record("PROVIDER_CAPACITY", UNKNOWN,
+                   "no runtime carries a capacity record, so no profile's "
+                   "capacity could be read",
+                   evidence_class="not_run", usable=list(declared))
+        return
+    states = {name: reading.state for name, reading in readings.items()}
+    usable = [name for name in declared
+              if name not in readings or readings[name].usable]
+    out.record("PROVIDER_CAPACITY", MET if usable else UNMET,
+               "usable declared runtimes: %s" % usable if usable else
+               "every declared runtime is unusable: %s"
+               % {name: states.get(name) for name in declared},
+               usable=usable, states=states)
+
+
+def _check_protected_surfaces(out: Preflight, contract: RunContract,
+                              plane) -> None:
+    """That every declared project has surfaces nothing may touch unattended.
+
+    Stage 8 made ``protected_surfaces`` unshortenable by policy.  What was
+    never asked is whether a project entering a dogfood run has any, and a
+    project with none is not "safe by default" -- it is a project where the
+    protection check can never fire, which is the ``[x]``-for-``not_run``
+    failure wearing a different name.
+    """
+
+    if plane is None:
+        out.record("PROTECTED_SURFACES_DECLARED", UNKNOWN,
+                   "no improvement plane was supplied, so no project's "
+                   "protected surfaces could be read",
+                   evidence_class="not_run")
+        return
+    undeclared, declared = [], {}
+    for name in contract.projects:
+        policy = plane.policy(name)
+        surfaces = {} if policy is None else dict(policy.protected_surfaces)
+        if not surfaces:
+            undeclared.append(name)
+        declared[name] = sorted(surfaces)
+    out.record("PROTECTED_SURFACES_DECLARED", UNMET if undeclared else MET,
+               "no protected surface is declared for %s, so the Stage-8 check "
+               "could never fire there" % undeclared if undeclared
+               else "every declared project names surfaces unattended work "
+                    "may not touch",
+               declared=declared)
 
 
 def _check_projects(out: Preflight, contract: RunContract, store) -> None:

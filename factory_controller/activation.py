@@ -318,12 +318,21 @@ def uninstall(plan: ServicePlan, *, apply: bool = False) -> dict[str, Any]:
 APPROVAL_SCHEMA = "factory-controller/supervisor-activation-approval/1.0"
 
 
-def approval(path: str | None, *, label: str = DEFAULT_LABEL) -> dict[str, Any]:
+def approval(path: str | None, *, label: str = DEFAULT_LABEL,
+             schema: str = APPROVAL_SCHEMA,
+             subject_key: str = "label") -> dict[str, Any]:
     """Read the Owner's recorded activation decision, or report its absence.
 
     Absence is the normal state and is reported in the shared vocabulary, never
     as a refusal to be argued with.  Nothing in this package can produce one of
     these records, which is what makes the check worth making.
+
+    ``schema`` and ``subject_key`` exist so a second kind of Owner decision can
+    reuse this reader without the record becoming interchangeable.  SF-144 adds
+    one -- opening a bounded shift -- and installing a host service is a
+    different act from admitting missions, so a record written for one must not
+    satisfy the other.  Widening the reader is the small change; letting the
+    two share a schema would have been the dangerous one.
     """
 
     if not path:
@@ -337,13 +346,13 @@ def approval(path: str | None, *, label: str = DEFAULT_LABEL) -> dict[str, Any]:
     except (OSError, ValueError) as exc:
         return {"state": "unknown", "approved": False, "source": path,
                 "detail": "activation approval record is unreadable: %s" % exc}
-    if not isinstance(body, dict) or body.get("schema_version") != APPROVAL_SCHEMA:
+    if not isinstance(body, dict) or body.get("schema_version") != schema:
         return {"state": "unknown", "approved": False, "source": path,
-                "detail": "approval schema_version must be %s" % APPROVAL_SCHEMA}
-    if body.get("label") != label:
+                "detail": "approval schema_version must be %s" % schema}
+    if body.get(subject_key) != label:
         return {"state": "not_applicable", "approved": False, "source": path,
                 "detail": "the record approves %r, not %r"
-                          % (body.get("label"), label)}
+                          % (body.get(subject_key), label)}
     missing = [key for key in ("approved_by", "approval_ref")
                if not isinstance(body.get(key), str) or not body[key]]
     if missing or body.get("approved") is not True:
@@ -352,4 +361,4 @@ def approval(path: str | None, *, label: str = DEFAULT_LABEL) -> dict[str, Any]:
                           "recorded; missing %s" % (missing or ["approved"])}
     return {"state": "granted", "approved": True, "source": path,
             "approved_by": body["approved_by"],
-            "approval_ref": body["approval_ref"], "label": label}
+            "approval_ref": body["approval_ref"], subject_key: label}
