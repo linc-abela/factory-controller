@@ -26,6 +26,7 @@ from pathlib import Path
 
 from factory_controller import (activation, advisor, capacity, dogfood,
                                 improvement, production, shift, supervisor)
+from factory_controller import store as ledger
 
 from tests.test_stage9_supervisor import SupervisorCase
 
@@ -183,6 +184,20 @@ class PortfolioTests(unittest.TestCase):
 
         self.assertEqual(
             PORTFOLIO.next_mission({"DF-1": "refused"}).mission_ref, "DF-2")
+
+    def test_the_settled_set_comes_from_the_ledger_that_owns_it(self):
+        """The first draft invented ``blocked`` and omitted ``escalated``."""
+
+        self.assertTrue(set(ledger.TERMINAL) <= shift.TERMINAL_MISSION_STATES)
+        self.assertNotIn("blocked", shift.TERMINAL_MISSION_STATES)
+        self.assertIn("escalated", shift.TERMINAL_MISSION_STATES)
+        self.assertNotIn("completed", shift.UNSUCCESSFUL_MISSION_STATES)
+
+    def test_an_escalated_mission_does_not_stall_the_sequence(self):
+        """A person owns it now; the portfolio must not offer it forever."""
+
+        self.assertEqual(
+            PORTFOLIO.next_mission({"DF-1": "escalated"}).mission_ref, "DF-2")
 
     def test_a_portfolio_missing_a_required_field_is_refused(self):
         body = json.loads(PORTFOLIO_PATH.read_text())
@@ -877,6 +892,20 @@ class ObservationTests(PlaneCase):
         self.assertFalse(observed.capacity_measured)
         self.assertEqual(tuple(observed.eligible_profiles),
                          tuple(CONTRACT.provider_profiles))
+
+    def test_three_unsuccessful_missions_are_counted_from_durable_state(self):
+        """A threshold no caller can reach from the store never fires."""
+
+        self.project("factory-prototype-lab")
+        for ref in ("DF-1", "DF-2", "DF-3"):
+            mission, _ = self.controller.submit(
+                {"work_item_id": ref, "project_id": "factory-prototype-lab",
+                 "execution_mode": "fixture",
+                 "acceptance_gate_ids": ["dev-check"]}, ref)
+            self.assertEqual(self.store.cancel(mission["id"]), "cancelled")
+        observed = self.shift.observe(PORTFOLIO, control_state="running",
+                                      gate_ready=True)
+        self.assertGreaterEqual(observed.consecutive_failures, 3)
 
     def test_a_cooling_runtime_narrows_eligibility(self):
         name = CONTRACT.provider_profiles[0]

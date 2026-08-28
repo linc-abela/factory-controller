@@ -57,7 +57,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Mapping, Sequence
 
-from factory_controller import activation, dogfood
+from factory_controller import activation, dogfood, store as ledger
 
 CONTRACT_VERSION = "factory-controller/shift/1.0"
 
@@ -170,8 +170,22 @@ class ShiftRefusal(Exception):
 # the mission portfolio
 # --------------------------------------------------------------------------- #
 
-TERMINAL_MISSION_STATES = frozenset({"completed", "refused", "cancelled",
-                                     "failed", "blocked"})
+#: Settled, for the purpose of walking a portfolio.  Taken from the ledger that
+#: owns the vocabulary rather than restated: the first draft of this set
+#: invented ``blocked``, which is not a mission state this store writes, and
+#: omitted ``escalated``, which is.
+#:
+#: ``escalated`` is added deliberately.  The store keeps it out of ``TERMINAL``
+#: because the mission is not finished; for a *portfolio* it is settled all the
+#: same, because escalation is the point at which a person owns the mission and
+#: the sequence would otherwise offer the same one forever with no signal that
+#: it had stalled.  It is counted as a failure instead, so three of them reach
+#: ``REPEATED_MISSION_FAILURE`` and drain the shift.
+TERMINAL_MISSION_STATES = frozenset(ledger.TERMINAL) | {"escalated"}
+
+#: Settled without succeeding.  Consecutive members of this set are what
+#: ``REPEATED_MISSION_FAILURE`` counts.
+UNSUCCESSFUL_MISSION_STATES = TERMINAL_MISSION_STATES - {"completed"}
 
 #: A portfolio mission carries its own stop and rollback rules because the run
 #: contract's are about the *run*.  "Roll back the whole run" is not a boundary
@@ -1001,6 +1015,16 @@ class ShiftPlane:
                         if ref in refs and state_ not in TERMINAL_MISSION_STATES)
         total = self._store.portfolio_economics()["portfolio"]
         spend = total.get("known_spend")
+        # Counted from the portfolio's own order, not supplied by a caller: a
+        # threshold nobody can reach from durable state is a stop condition
+        # that can never fire.
+        streak = 0
+        for mission in portfolio_.missions:
+            outcome = settled.get(mission.mission_ref)
+            if outcome in UNSUCCESSFUL_MISSION_STATES:
+                streak += 1
+            elif outcome is not None:
+                streak = 0
         return ShiftFacts(
             gate_ready=gate_ready, control_state=control_state,
             missions_in_flight=in_flight, missions_admitted=len(settled),
@@ -1009,7 +1033,7 @@ class ShiftPlane:
             portfolio_complete=portfolio_.complete(settled),
             protected_surface_conflict=protected_surface_conflict,
             unresolved_uncertain_dispatches=unresolved_uncertain_dispatches,
-            consecutive_failures=consecutive_failures,
+            consecutive_failures=max(streak, consecutive_failures),
             failure_threshold=failure_threshold,
             eligible_profiles=eligible(profiles, readings, denied),
             capacity_measured=bool(readings),
