@@ -139,7 +139,8 @@ class Controller:
     # ------------------------------------------------------------------ #
 
     def _step(self, mission: dict[str, Any], name: str, value: dict[str, Any],
-              *, memo_value: dict[str, Any] | None = None) -> dict[str, Any]:
+              *, memo_value: dict[str, Any] | None = None,
+              replay_input: bool = False) -> dict[str, Any]:
         """Run one durable step, or return the output a previous run recorded.
 
         ``memo_value`` is the step's durable identity; ``value`` is what the
@@ -147,10 +148,15 @@ class Controller:
         between fallback legs while the step itself stays the same operation.
         """
 
-        started = self.store.begin_step(mission["id"], mission["lease_token"], name,
-                                        value if memo_value is None else memo_value)
+        started = self.store.begin_step(
+            mission["id"], mission["lease_token"], name,
+            value if memo_value is None else memo_value,
+            recorded_input=value)
         if started["status"] == "COMPLETED":
             return started["output"]
+        adapter_value = value
+        if replay_input and isinstance(started.get("input"), dict):
+            adapter_value = started["input"]
         self.store.renew(mission["id"], mission["lease_token"], self.lease_seconds)
         stopped = threading.Event()
         heartbeat_error: list[BaseException] = []
@@ -168,7 +174,7 @@ class Controller:
         if self.lease_seconds > 0:
             thread.start()
         try:
-            output = self.adapter.execute(name, started["operation_key"], value)
+            output = self.adapter.execute(name, started["operation_key"], adapter_value)
         finally:
             stopped.set()
             if thread.is_alive():
@@ -307,6 +313,47 @@ class Controller:
 
         if resume_state != "dispatching" or committed:
             return self._recover(mission, committed, prior)
+
+        # A lost lease can leave the provider call between its durable STARTED
+        # marker and its receipt. Reuse the exact route recorded before that
+        # call. Selecting again here would turn an unresolved effect into a
+        # second provider leg, even when the operation key is unchanged.
+        started = self.store.step_record(mission["id"], "dispatch")
+        # A STARTED marker with no run leg is the only unresolved case here.
+        # When every prior leg proved ``process_started=False``, the same
+        # marker is a safe pre-boundary capacity deferral; it must return to
+        # ordinary selection so a reset or another declared runtime can serve
+        # the mission instead of pinning it to the old refusal.
+        if (started is not None and started.get("status") == "STARTED"
+                and not prior):
+            recorded = started.get("input")
+            route = recorded.get("route") if isinstance(recorded, dict) else None
+            if not isinstance(route, dict) or route.get("idempotency_key") != mission["idempotency_key"]:
+                raise NonRetryableFailure("UNCERTAIN_DISPATCH_ROUTE_INVALID")
+            recovery_route = {**route, "recover_only": True}
+            response = self._step(
+                mission, "dispatch",
+                {"mission": payload, "route": recovery_route},
+                memo_value={"mission": payload})
+            receipt = _with_gateway(
+                routing.receipt_from_response(response, Selection(
+                    route.get("provider_profile"),
+                    "reconcile_uncertain_dispatch", ()), ()),
+                response, gateways.get(route.get("provider_profile")))
+            self._record(
+                mission,
+                Selection(route.get("provider_profile"),
+                          "reconcile_uncertain_dispatch", ()),
+                receipt)
+            self._observe_refusal(receipt)
+            if response.get("status") == routing.PROVIDER_UNAVAILABLE:
+                if receipt.process_started is False:
+                    raise RetryableFailure(
+                        "UNCERTAIN_DISPATCH_RETRYABLE_UNAVAILABLE")
+                raise NonRetryableFailure(
+                    "UNCERTAIN_DISPATCH_OUTCOME_UNRESOLVED")
+            self._verify_receipt(mission, receipt, response)
+            return response
 
         # Capacity narrows, and narrows through the Owner's own mechanism: the
         # profiles a closed window rules out are added to `denied_profiles`, so

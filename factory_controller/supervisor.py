@@ -922,7 +922,13 @@ class OperationsSupervisor:
         row = db.execute(
             "SELECT COUNT(*) AS n FROM missions"
             " WHERE state IN ('dispatched','candidate_verified','evaluated',"
-            "'evidence_sealed')").fetchone()
+            "'evidence_sealed') OR (state='dispatching' AND EXISTS ("
+            "SELECT 1 FROM steps s WHERE s.mission_id=missions.id"
+            " AND s.name='dispatch' AND s.status='STARTED'"
+            ") AND (NOT EXISTS (SELECT 1 FROM runs r0"
+            " WHERE r0.mission_id=missions.id) OR EXISTS ("
+            "SELECT 1 FROM runs r1 WHERE r1.mission_id=missions.id"
+            " AND (r1.process_started IS NULL OR r1.process_started=1))))").fetchone()
         return RECOVERY_OUTCOMES[1] if row["n"] else RECOVERY_OUTCOMES[0]
 
     def _close_cycle(self, report: CycleReport, *, outcome: str | None = None,
@@ -945,6 +951,13 @@ class OperationsSupervisor:
             rows = db.execute(
                 "SELECT id FROM missions WHERE lease_token IS NULL AND state IN"
                 " ('dispatched','candidate_verified','evaluated','evidence_sealed')"
+                " OR (lease_token IS NULL AND state='dispatching' AND EXISTS ("
+                "SELECT 1 FROM steps s WHERE s.mission_id=missions.id"
+                " AND s.name='dispatch' AND s.status='STARTED'"
+                ") AND (NOT EXISTS (SELECT 1 FROM runs r0"
+                " WHERE r0.mission_id=missions.id) OR EXISTS ("
+                "SELECT 1 FROM runs r1 WHERE r1.mission_id=missions.id"
+                " AND (r1.process_started IS NULL OR r1.process_started=1))))"
                 " ORDER BY id").fetchall()
         return tuple(row["id"] for row in rows)
 

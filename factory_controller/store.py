@@ -134,6 +134,7 @@ class MissionStore:
                   input_hash TEXT NOT NULL,
                   output_json TEXT,
                   updated_at REAL NOT NULL,
+                  input_json TEXT,
                   PRIMARY KEY(mission_id, name)
                 );
                 CREATE TABLE IF NOT EXISTS events (
@@ -272,6 +273,13 @@ class MissionStore:
                                 ("acceptance_gate_source", "TEXT")):
                 if column not in present:
                     db.execute("ALTER TABLE projects ADD COLUMN %s %s" % (column, ddl))
+            step_columns = {row["name"] for row in db.execute("PRAGMA table_info(steps)")}
+            if "input_json" not in step_columns:
+                # The memo hash was always durable.  SF-144A also needs the
+                # selected route at the point the provider call starts, so a
+                # replacement worker can reconcile the exact operation instead
+                # of selecting a new profile after a lost lease.
+                db.execute("ALTER TABLE steps ADD COLUMN input_json TEXT")
             db.execute(
                 "INSERT OR IGNORE INTO portfolio VALUES (1,?,0,?,'unset',?)",
                 (portfolio.DEFAULT_PORTFOLIO_CONCURRENCY, portfolio.DEFAULT_AGING_SECONDS,
@@ -280,6 +288,7 @@ class MissionStore:
             db.execute("INSERT OR IGNORE INTO schema_meta VALUES (1, ?)", (self.clock(),))
             db.execute("INSERT OR IGNORE INTO schema_meta VALUES (2, ?)", (self.clock(),))
             db.execute("INSERT OR IGNORE INTO schema_meta VALUES (3, ?)", (self.clock(),))
+            db.execute("INSERT OR IGNORE INTO schema_meta VALUES (4, ?)", (self.clock(),))
 
     @staticmethod
     def _row(row: sqlite3.Row | None) -> dict[str, Any] | None:
@@ -637,7 +646,20 @@ class MissionStore:
             self._event(db, mission_id, "CANCELLATION_REQUESTED", row["state"], row["state"], {})
             return row["state"]
 
-    def recover_stale(self) -> int:
+    def recover_stale(self, *, preserve_uncertain: bool = True) -> int:
+        """Recover expired leases without laundering uncertain dispatches.
+
+        A lease that expired before a dispatch step began is returned to
+        admitted. A lease that expired after the dispatch operation was
+        durably started but before its outcome was settled stays in
+        dispatching and is scheduled only as a resume. That distinction is
+        the difference between a safe replay of an operation key and a new
+        provider selection that could duplicate an irreversible effect.
+
+        The explicit false value remains available for compatibility with
+        callers that need the historical projection. Normal Controller and
+        shift recovery use the safe default.
+        """
         now = self.clock()
         with self.transaction() as db:
             rows = db.execute(
@@ -645,14 +667,46 @@ class MissionStore:
                 (now,),
             ).fetchall()
             for row in rows:
-                state = "cancelled" if row["cancel_requested"] else (row["state"] if row["state"] in RECOVERABLE else "admitted")
+                uncertain = bool(
+                    preserve_uncertain
+                    and not row["cancel_requested"]
+                    and row["state"] == "dispatching"
+                    and self._uncertain_dispatch_locked(db, row["id"]))
+                state = (
+                    "cancelled" if row["cancel_requested"] else
+                    ("dispatching" if uncertain else
+                     (row["state"] if row["state"] in RECOVERABLE else "admitted"))
+                )
                 db.execute("UPDATE missions SET state=?,lease_owner=NULL,lease_token=NULL,lease_expires_at=NULL,terminal_reason=?,updated_at=? WHERE id=?", (state, "OPERATOR_CANCELLED" if state == "cancelled" else None, now, row["id"]))
                 db.execute("UPDATE attempts SET ended_at=?,outcome='STALE_LEASE',diagnostic='lease expired' WHERE mission_id=? AND number=?", (now, row["id"], row["attempt_count"]))
-                self._event(db, row["id"], "STALE_LEASE_RECOVERED", row["state"], state, {"prior_worker": row["lease_owner"]})
+                self._event(db, row["id"], "STALE_LEASE_RECOVERED", row["state"], state, {
+                    "prior_worker": row["lease_owner"],
+                    "recovery_class": "uncertain_dispatch" if uncertain else
+                    ("replayable" if state in RECOVERABLE else "pre_dispatch"),
+                    "resume_target": "reconcile_uncertain_dispatch" if uncertain else
+                    "resume_next_step",
+                })
             return len(rows)
 
+    @staticmethod
+    def _uncertain_dispatch_locked(db: sqlite3.Connection, mission_id: str) -> bool:
+        """Whether a started dispatch has no durable proof it was harmless."""
+
+        step = db.execute(
+            "SELECT status FROM steps WHERE mission_id=? AND name='dispatch'",
+            (mission_id,)).fetchone()
+        if step is None or step["status"] != "STARTED":
+            return False
+        legs = db.execute(
+            "SELECT process_started FROM runs WHERE mission_id=? ORDER BY id",
+            (mission_id,)).fetchall()
+        if not legs:
+            return True
+        return any(leg["process_started"] in (None, 1) for leg in legs)
+
     def begin_step(self, mission_id: str, lease_token: str, name: str,
-                   input_value: Any, compatibility_input: Any = None) -> dict[str, Any]:
+                   input_value: Any, compatibility_input: Any = None,
+                   *, recorded_input: Any = None) -> dict[str, Any]:
         # Compatibility with the landed boundary's provisional call shape;
         # the Controller still derives the durable operation key itself.
         if compatibility_input is not None:
@@ -669,10 +723,19 @@ class MissionStore:
                 value = dict(row)
                 if value.get("output_json"):
                     value["output"] = json.loads(value["output_json"])
+                if value.get("input_json"):
+                    value["input"] = json.loads(value["input_json"])
                 return value
             operation_key = f"{mission['idempotency_key']}:{name}"
-            db.execute("INSERT INTO steps VALUES(?,?,?,?,?,?,?)", (mission_id, name, "STARTED", operation_key, digest, None, self.clock()))
-            self._event(db, mission_id, "STEP_STARTED", mission["state"], mission["state"], {"step": name, "operation_key": operation_key})
+            durable_input = input_value if recorded_input is None else recorded_input
+            db.execute(
+                "INSERT INTO steps(mission_id,name,status,operation_key,input_hash,"
+                "output_json,updated_at,input_json) VALUES(?,?,?,?,?,?,?,?)",
+                (mission_id, name, "STARTED", operation_key, digest, None,
+                 self.clock(), canonical_json(durable_input)))
+            self._event(db, mission_id, "STEP_STARTED", mission["state"], mission["state"], {
+                "step": name, "operation_key": operation_key, "input_hash": digest,
+            })
             return {"mission_id": mission_id, "name": name, "status": "STARTED", "operation_key": operation_key, "input_hash": digest}
 
     def complete_step(self, mission_id: str, lease_token: str, name: str, output: Any) -> None:
@@ -694,6 +757,33 @@ class MissionStore:
                 (mission_id, name),
             ).fetchone()
             return None if row is None or row["output_json"] is None else json.loads(row["output_json"])
+
+    def step_records(self, mission_id: str) -> list[dict[str, Any]]:
+        """All durable step records, including an in-flight operation input."""
+
+        with self.connect() as db:
+            rows = db.execute(
+                "SELECT * FROM steps WHERE mission_id=? ORDER BY updated_at,name",
+                (mission_id,)).fetchall()
+        out = []
+        for row in rows:
+            value = dict(row)
+            for key in ("input_json", "output_json"):
+                raw = value.get(key)
+                if raw is not None:
+                    try:
+                        value[key.removesuffix("_json")] = json.loads(raw)
+                    except (TypeError, ValueError):
+                        value[key.removesuffix("_json")] = None
+                        value["corrupt_%s" % key.removesuffix("_json")] = True
+            out.append(value)
+        return out
+
+    def step_record(self, mission_id: str, name: str) -> dict[str, Any] | None:
+        """One durable step record, or None when the step never started."""
+
+        return next((row for row in self.step_records(mission_id)
+                     if row["name"] == name), None)
 
     def history(self, mission_id: str) -> list[dict[str, Any]]:
         with self.connect() as db:
@@ -1299,7 +1389,13 @@ class MissionStore:
                          ) -> portfolio.ScheduleDecision:
         rows = db.execute(
             "SELECT id,project_id,priority,state,created_at,next_run_at,payload_json FROM missions"
-            " WHERE state IN ('admitted','dispatched','candidate_verified','evaluated','evidence_sealed')"
+            " WHERE (state IN ('admitted','dispatched','candidate_verified','evaluated','evidence_sealed')"
+            " OR (state='dispatching' AND EXISTS ("
+            "   SELECT 1 FROM steps s WHERE s.mission_id=missions.id"
+            "   AND s.name='dispatch' AND s.status='STARTED'"
+            " ) AND (NOT EXISTS (SELECT 1 FROM runs r0 WHERE r0.mission_id=missions.id)"
+            "   OR EXISTS (SELECT 1 FROM runs r1 WHERE r1.mission_id=missions.id"
+            "      AND (r1.process_started IS NULL OR r1.process_started=1)))))"
             " AND lease_token IS NULL AND cancel_requested=0 ORDER BY created_at,id").fetchall()
         if not rows:
             return portfolio.ScheduleDecision(None, "NO_RUNNABLE_MISSION", ())
@@ -1343,6 +1439,15 @@ class MissionStore:
             candidates = tuple(item for item in candidates if item.resume)
             if not candidates:
                 return portfolio.ScheduleDecision(None, "DRAINED_NO_RESUMABLE_MISSION", ())
+        elif any(item.resume for item in candidates):
+            # A recovered mission past the dispatch boundary takes precedence
+            # over fresh admission. This is a scheduler gate, not shift-local
+            # state: every caller sees the same fail-closed ordering until the
+            # existing operation is reconciled.
+            candidates = tuple(item for item in candidates if item.resume)
+            if not candidates:
+                return portfolio.ScheduleDecision(
+                    None, "RECOVERY_REQUIRED_BEFORE_NEW_DISPATCH", ())
         snapshot = portfolio.Snapshot(
             portfolio=_portfolio_policy(db.execute("SELECT * FROM portfolio WHERE id=1").fetchone()),
             projects={row["project_id"]: _project_policy(row)
