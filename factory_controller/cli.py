@@ -267,8 +267,10 @@ def parser() -> argparse.ArgumentParser:
                     default="contracts/internal-dogfood-run-contract.json")
     sh.add_argument("--portfolio", dest="sh_portfolio",
                     default="contracts/first-dogfood-mission-portfolio.json")
-    sh.add_argument("--request", dest="sh_request",
-                    default="SF-144-first-internal-dogfood-1")
+    sh.add_argument("--request", dest="sh_request", default="SF-144-shift-1",
+                    help="the Owner's activation request; a second apply of "
+                         "the same one is the same act, and a new decision "
+                         "needs a new name")
     sh.add_argument("--approval", dest="sh_approval",
                     help="path to the Owner's durable shift approval record")
     sh.add_argument("--missions", type=int, dest="sh_missions", default=4)
@@ -288,6 +290,11 @@ def parser() -> argparse.ArgumentParser:
                     help="JSON mapping each project to the commits an operator "
                          "confirmed its remote can serve")
     sh.add_argument("--limit", type=int, dest="sh_limit", default=50)
+    sh.add_argument("--label", dest="sh_label", default=activation.DEFAULT_LABEL)
+    sh.add_argument("--agents-dir", dest="sh_agents_dir",
+                    default=str(Path.home() / "Library" / "LaunchAgents"))
+    sh.add_argument("--state-dir", dest="sh_state_dir",
+                    default=str(Path.home() / ".factory-controller"))
 
     sup_parser = sub.add_parser("supervisor")
     sup_parser.add_argument("action", choices=(
@@ -867,15 +874,18 @@ def _shift_facts(args, controller, contract, entry):
         except (OSError, ValueError) as exc:
             raise shift_plane.ShiftRefusal("SHIFT_REACHABILITY_UNREADABLE",
                                            str(exc))
+    registry = reports.get("project_registry")
+    registry = (registry or {}).get("projects") if isinstance(registry, dict) else None
+    doctor = reports.get("bridge_doctor")
+    offered = doctor.get("capabilities") if isinstance(doctor, dict) else None
     plane = sup.OperationsSupervisor(controller)
     ledger = production.ProductionLedger(controller.store)
     try:
         plan = activation.from_contract(
             plane.service_contract(invocation=_service_invocation(args),
                                    interval_seconds=300),
-            agents_dir=str(Path.home() / "Library" / "LaunchAgents"),
-            state_dir=str(Path.home() / ".factory-controller"),
-            working_dir=str(Path.cwd()))
+            agents_dir=args.sh_agents_dir, state_dir=args.sh_state_dir,
+            working_dir=str(Path.cwd()), label=args.sh_label)
         service = activation.doctor(plan)
     except activation.ActivationError as exc:
         service = {"definition_present": False, "drift": "unknown",
@@ -909,7 +919,8 @@ def _shift_facts(args, controller, contract, entry):
         contract_budget_ceiling=contract.budget_ceiling,
         contract_budget_currency=contract.budget_currency,
         declared_gates=declared, capacity_readings=readings,
-        eligible_profiles=usable, fetchable_shas=reachable)
+        eligible_profiles=usable, fetchable_shas=reachable,
+        project_registry=registry, offered_capabilities=offered)
     return facts, plane, readings, usable, denied
 
 

@@ -428,6 +428,16 @@ class GateFacts:
     #: Absent means unmeasured; an empty list for a named project means it was
     #: measured and nothing was reachable.
     fetchable_shas: Mapping[str, Sequence[str]] | None = None
+    #: The execution layer's own project registry, as the operator read it.
+    #: Absent means unmeasured; a mapping present but missing a project means
+    #: the layer was asked and does not know that project.
+    project_registry: Mapping[str, Mapping[str, Any]] | None = None
+    #: The capabilities the admitted provider profiles actually offer, as the
+    #: operator read them from the execution layer.  Kept apart from the
+    #: project registry on purpose: deriving what is offered from what is
+    #: requested would make the comparison circular, and a circular check can
+    #: never fire.
+    offered_capabilities: Sequence[str] | None = None
     capacity_readings: Mapping[str, Any] = field(default_factory=dict)
     eligible_profiles: Sequence[str] = ()
 
@@ -448,6 +458,7 @@ def gate(facts: GateFacts) -> dict[str, Any]:
     out = _GateChecks(checks)
     _check_portfolio(out, facts)
     _check_sources(out, facts)
+    _check_dispatchable(out, facts)
     _check_eligibility(out, facts)
     _check_finite(out, facts)
     unmet = [row for row in checks if row.get("required", True)
@@ -586,6 +597,69 @@ def _check_sources(out: _GateChecks, facts: GateFacts) -> None:
                if unreachable else
                "every baseline and gate source the portfolio names is "
                "reachable from the project's remote")
+
+
+def _check_dispatchable(out: _GateChecks, facts: GateFacts) -> None:
+    """That the execution layer knows the projects the portfolio names.
+
+    Registration in the Controller and registration at the execution layer are
+    two different facts, and until SF-144 nothing compared them: a run contract
+    could admit a project, a supervisor policy could exist for it, and the
+    layer would still refuse every dispatch because it had never heard of the
+    repository.  Measured on this host on 2026-08-28, that is not hypothetical
+    -- one of the two admitted labs is absent from the layer's registry.
+    """
+
+    if facts.project_registry is None:
+        out.record("PORTFOLIO_PROJECTS_DISPATCHABLE", UNKNOWN,
+                   "no execution-layer project registry was supplied, so no "
+                   "mission could be confirmed dispatchable",
+                   evidence_class="not_run")
+    else:
+        absent = [{"mission_ref": mission.mission_ref,
+                   "project_id": mission.project_id}
+                  for mission in facts.portfolio.missions
+                  if mission.project_id not in facts.project_registry]
+        out.record("PORTFOLIO_PROJECTS_DISPATCHABLE", UNMET if absent else MET,
+                   "the execution layer has no registration for: %s" % absent
+                   if absent else
+                   "every project the portfolio names is registered with the "
+                   "execution layer",
+                   registered=sorted(facts.project_registry))
+    _check_capabilities(out, facts)
+
+
+def _check_capabilities(out: _GateChecks, facts: GateFacts) -> None:
+    """That something can actually be selected for each project's capability.
+
+    A registered project whose declared capability no admitted profile offers
+    is a project nothing can be chosen for, and the refusal arrives at dispatch
+    rather than at the gate.  The two sides are read from different places so
+    the comparison is a comparison: what a project asks for comes from the
+    layer's project registry, what is available comes from its profiles.
+    """
+
+    if facts.offered_capabilities is None or facts.project_registry is None:
+        out.record("PORTFOLIO_CAPABILITIES_OFFERED", UNKNOWN,
+                   "the capabilities the admitted profiles offer were not "
+                   "supplied, so no project's capability could be matched",
+                   evidence_class="not_run")
+        return
+    offered = set(facts.offered_capabilities)
+    uncovered = []
+    for mission in facts.portfolio.missions:
+        entry = facts.project_registry.get(mission.project_id)
+        wanted = tuple((entry or {}).get("capabilities") or ())
+        if wanted and not set(wanted) & offered:
+            uncovered.append({"mission_ref": mission.mission_ref,
+                              "project_id": mission.project_id,
+                              "wants": list(wanted)})
+    out.record("PORTFOLIO_CAPABILITIES_OFFERED", UNMET if uncovered else MET,
+               "no admitted profile offers what these need: %s" % uncovered
+               if uncovered else
+               "every project's declared capability is offered by an admitted "
+               "profile",
+               offered=sorted(offered))
 
 
 def _check_eligibility(out: _GateChecks, facts: GateFacts) -> None:

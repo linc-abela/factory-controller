@@ -1,0 +1,1702 @@
+{
+  "admit": {
+    "admitted": true,
+    "code": "SHIFT_ADMITTED",
+    "detail": "mission 1 of 4",
+    "drain_reasons": [],
+    "eligible_profiles": [
+      "codex-primary"
+    ],
+    "mission": {
+      "acceptance_gate_ids": [
+        "dev-check",
+        "dev-test"
+      ],
+      "acceptance_gate_source": "https://github.com/linc-abela/factory-prototype-lab.git@229b923b050fe8a4450d5597d472157bd42c8647:dev",
+      "baseline_sha": "229b923b050fe8a4450d5597d472157bd42c8647",
+      "environment_class": "local-sim",
+      "evidence_required": [
+        "mission record with every step terminal",
+        "provider receipt naming the profile actually selected",
+        "re-derived exit status for each declared gate",
+        "cost accounting, or a typed absence where the provider returned no usage",
+        "context accounting for the bound package"
+      ],
+      "mission_ref": "DF-1",
+      "mutates_repository": false,
+      "objective": "Carry one declared mission end to end -- context binding, provider dispatch, verification, acceptance-gate re-derivation and evidence sealing -- against a repository state the Factory does not change, and record the resulting mission, receipt and cost/context accounting.",
+      "order": 1,
+      "project_id": "factory-prototype-lab",
+      "rollback_boundary": "None is required and that is the point: the mission produces only Controller state and evidence records, so abandoning it leaves the lab byte-identical.",
+      "stop_conditions": [
+        "the dispatch leg completes with execution_mode fixture rather than reaching a provider process",
+        "any acceptance gate id resolves from anywhere other than the project registry",
+        "the mission writes to the lab working tree"
+      ],
+      "work_class": "backlog"
+    },
+    "remaining_missions": 4,
+    "state": "active"
+  },
+  "apply": {
+    "action": "apply",
+    "created": true,
+    "detail": "shift authorized until 1787927146",
+    "grant": {
+      "approval_ref": "notion://SF-144#dogfood-activation",
+      "approved_by": "owner",
+      "budget_ceiling": 25.0,
+      "budget_currency": "USD",
+      "contract_version": "factory-controller/shift/1.0",
+      "expires_at": 1787927145.535178,
+      "gate_digest": "a18a01c9bab91ea90c5e9b9aff303e7df2629bbb920d534110eb268c05f74545",
+      "granted_at": 1787912745.535178,
+      "mission_ceiling": 4,
+      "portfolio_ref": "SF-144-first-internal-dogfood-1",
+      "request_ref": "SF-144-shift-1",
+      "resume_ref": "not_applicable",
+      "revoke_reason": "not_applicable",
+      "revoked_at": "not_applicable",
+      "run_ref": "SF-142-internal-dogfood-1",
+      "suspended_at": "not_applicable"
+    }
+  },
+  "apply-after-revoke": {
+    "refused": {
+      "code": "SHIFT_GRANT_REVOKED",
+      "detail": "request 'SF-144-shift-1' was revoked at 1787912777 and cannot be re-applied; a new decision needs a new request_ref"
+    }
+  },
+  "apply-again": {
+    "action": "apply",
+    "created": false,
+    "detail": "this request already holds a grant",
+    "grant": {
+      "approval_ref": "notion://SF-144#dogfood-activation",
+      "approved_by": "owner",
+      "budget_ceiling": 25.0,
+      "budget_currency": "USD",
+      "contract_version": "factory-controller/shift/1.0",
+      "expires_at": 1787927145.535178,
+      "gate_digest": "a18a01c9bab91ea90c5e9b9aff303e7df2629bbb920d534110eb268c05f74545",
+      "granted_at": 1787912745.535178,
+      "mission_ceiling": 4,
+      "portfolio_ref": "SF-144-first-internal-dogfood-1",
+      "request_ref": "SF-144-shift-1",
+      "resume_ref": "not_applicable",
+      "revoke_reason": "not_applicable",
+      "revoked_at": "not_applicable",
+      "run_ref": "SF-142-internal-dogfood-1",
+      "suspended_at": "not_applicable"
+    }
+  },
+  "apply-unapproved": {
+    "refused": {
+      "approval": {
+        "approved": false,
+        "detail": "no activation approval record was named",
+        "source": "not_applicable",
+        "state": "not_run"
+      },
+      "code": "SHIFT_UNAPPROVED",
+      "detail": "opening a shift needs a durable Owner approval; no activation approval record was named"
+    }
+  },
+  "brief": {
+    "activation_readiness": {
+      "gate": "DOGFOOD-ACTIVATION-GATE",
+      "ready": true,
+      "states": {
+        "met": 37,
+        "unknown": 0,
+        "unmet": 0
+      }
+    },
+    "admitted_capabilities": [
+      "backlog",
+      "improvement",
+      "maintenance"
+    ],
+    "admitted_projects": [
+      "factory-bug-lab",
+      "factory-prototype-lab"
+    ],
+    "blockers": [],
+    "brief": "OWNER-DOGFOOD-BRIEF",
+    "capacity": {
+      "eligible": [
+        "codex-primary"
+      ],
+      "measured": true
+    },
+    "checkpoints": [],
+    "contract_version": "factory-controller/shift/1.0",
+    "grant": {
+      "approval_ref": "notion://SF-144#dogfood-activation",
+      "approved_by": "owner",
+      "budget_ceiling": 25.0,
+      "budget_currency": "USD",
+      "contract_version": "factory-controller/shift/1.0",
+      "expires_at": 1787927145.535178,
+      "gate_digest": "a18a01c9bab91ea90c5e9b9aff303e7df2629bbb920d534110eb268c05f74545",
+      "granted_at": 1787912745.535178,
+      "mission_ceiling": 4,
+      "portfolio_ref": "SF-144-first-internal-dogfood-1",
+      "request_ref": "SF-144-shift-1",
+      "resume_ref": "not_applicable",
+      "revoke_reason": "not_applicable",
+      "revoked_at": "not_applicable",
+      "run_ref": "SF-142-internal-dogfood-1",
+      "suspended_at": "not_applicable"
+    },
+    "next_mission": {
+      "acceptance_gate_ids": [
+        "dev-check",
+        "dev-test"
+      ],
+      "acceptance_gate_source": "https://github.com/linc-abela/factory-prototype-lab.git@229b923b050fe8a4450d5597d472157bd42c8647:dev",
+      "baseline_sha": "229b923b050fe8a4450d5597d472157bd42c8647",
+      "environment_class": "local-sim",
+      "evidence_required": [
+        "mission record with every step terminal",
+        "provider receipt naming the profile actually selected",
+        "re-derived exit status for each declared gate",
+        "cost accounting, or a typed absence where the provider returned no usage",
+        "context accounting for the bound package"
+      ],
+      "mission_ref": "DF-1",
+      "mutates_repository": false,
+      "objective": "Carry one declared mission end to end -- context binding, provider dispatch, verification, acceptance-gate re-derivation and evidence sealing -- against a repository state the Factory does not change, and record the resulting mission, receipt and cost/context accounting.",
+      "order": 1,
+      "project_id": "factory-prototype-lab",
+      "rollback_boundary": "None is required and that is the point: the mission produces only Controller state and evidence records, so abandoning it leaves the lab byte-identical.",
+      "stop_conditions": [
+        "the dispatch leg completes with execution_mode fixture rather than reaching a provider process",
+        "any acceptance gate id resolves from anywhere other than the project registry",
+        "the mission writes to the lab working tree"
+      ],
+      "work_class": "backlog"
+    },
+    "next_owner_action": {
+      "act": "none",
+      "detail": "the shift is active and bounded"
+    },
+    "phase": "internal dogfood, on-demand",
+    "proposed_missions": [
+      {
+        "acceptance_gate_ids": [
+          "dev-check",
+          "dev-test"
+        ],
+        "acceptance_gate_source": "https://github.com/linc-abela/factory-prototype-lab.git@229b923b050fe8a4450d5597d472157bd42c8647:dev",
+        "baseline_sha": "229b923b050fe8a4450d5597d472157bd42c8647",
+        "environment_class": "local-sim",
+        "evidence_required": [
+          "mission record with every step terminal",
+          "provider receipt naming the profile actually selected",
+          "re-derived exit status for each declared gate",
+          "cost accounting, or a typed absence where the provider returned no usage",
+          "context accounting for the bound package"
+        ],
+        "mission_ref": "DF-1",
+        "mutates_repository": false,
+        "objective": "Carry one declared mission end to end -- context binding, provider dispatch, verification, acceptance-gate re-derivation and evidence sealing -- against a repository state the Factory does not change, and record the resulting mission, receipt and cost/context accounting.",
+        "order": 1,
+        "outcome": "not_run",
+        "project_id": "factory-prototype-lab",
+        "rollback_boundary": "None is required and that is the point: the mission produces only Controller state and evidence records, so abandoning it leaves the lab byte-identical.",
+        "stop_conditions": [
+          "the dispatch leg completes with execution_mode fixture rather than reaching a provider process",
+          "any acceptance gate id resolves from anywhere other than the project registry",
+          "the mission writes to the lab working tree"
+        ],
+        "work_class": "backlog"
+      },
+      {
+        "acceptance_gate_ids": [
+          "dev-check",
+          "dev-test",
+          "dev-reproduce"
+        ],
+        "acceptance_gate_source": "https://github.com/linc-abela/factory-bug-lab.git@961a4c97d49183b5501f244ba48773d9f50953ae:dev",
+        "baseline_sha": "4072bfd7c008d3b227e2e164ecbe6f58013c2733",
+        "environment_class": "local-sim",
+        "evidence_required": [
+          "mission record showing dev-reproduce unmet with exit status 1 preserved",
+          "the two passing gates recorded separately from the failing one",
+          "provider receipt naming the profile actually selected",
+          "cost accounting, or a typed absence"
+        ],
+        "mission_ref": "DF-2",
+        "mutates_repository": false,
+        "objective": "Run the same path against a declared gate that is known to fail, and prove the failure is recorded as a failure. At baseline 4072bfd7 dev reproduce exits 1 by design; the mission succeeds when the Factory reports that non-zero exit as an unmet gate with the exit status preserved, and fails if the run is reported healthy.",
+        "order": 2,
+        "outcome": "not_run",
+        "project_id": "factory-bug-lab",
+        "rollback_boundary": "None is required; the mission produces only Controller state and evidence records.",
+        "stop_conditions": [
+          "a non-zero gate exit is recorded as met, or as any absence word",
+          "the mission is reported complete without the failing gate appearing in its evidence",
+          "the mission writes to the lab working tree"
+        ],
+        "work_class": "maintenance"
+      },
+      {
+        "acceptance_gate_ids": [
+          "dev-check",
+          "dev-test",
+          "dev-reproduce"
+        ],
+        "acceptance_gate_source": "https://github.com/linc-abela/factory-bug-lab.git@961a4c97d49183b5501f244ba48773d9f50953ae:dev",
+        "baseline_sha": "4072bfd7c008d3b227e2e164ecbe6f58013c2733",
+        "environment_class": "staging",
+        "evidence_required": [
+          "the root cause stated in writing",
+          "before and after exit statuses for all three gates, with exact SHAs",
+          "the regression's own failing result at the baseline commit",
+          "diff confined to the lab package and its tests",
+          "cost and context accounting for the whole mission"
+        ],
+        "mission_ref": "DF-3",
+        "mutates_repository": true,
+        "objective": "Diagnose and fix the seat-overbooking defect the lab's frozen report describes, from baseline 4072bfd7, adding a regression that fails at the baseline and passes at the fix. This is the first mission that changes a repository. It is checkable in a way no other first mutating mission would be: an independent human fix for the same defect exists off this baseline, so the Factory's diagnosis and patch can be compared against a known-good one rather than only against a green suite.",
+        "order": 3,
+        "outcome": "not_run",
+        "project_id": "factory-bug-lab",
+        "rollback_boundary": "A single branch off 4072bfd7, never main. Rollback is deleting that branch; nothing the mission does is visible to another host until a person merges it.",
+        "stop_conditions": [
+          "the fix commit does not move dev-reproduce from exit 1 to exit 0",
+          "the added regression passes at the baseline commit",
+          "any change lands outside the lab package and its tests",
+          "the mission force-updates or rewrites any published ref"
+        ],
+        "work_class": "maintenance"
+      },
+      {
+        "acceptance_gate_ids": [
+          "dev-check",
+          "dev-test",
+          "dev-evaluate"
+        ],
+        "acceptance_gate_source": "https://github.com/linc-abela/factory-prototype-lab.git@229b923b050fe8a4450d5597d472157bd42c8647:dev",
+        "baseline_sha": "229b923b050fe8a4450d5597d472157bd42c8647",
+        "environment_class": "staging",
+        "evidence_required": [
+          "baseline measurement recorded before the candidate ran",
+          "post-change measurement for the same metric",
+          "dev-evaluate exit 0 preserved at the fix commit",
+          "the promotion decision with its approval reference",
+          "cost and context accounting"
+        ],
+        "mission_ref": "DF-4",
+        "mutates_repository": true,
+        "objective": "Carry one improvement candidate through baseline measurement and promotion without regressing the lab's own decision boundary. This is last because it is the only mission that changes a project's quality bar rather than its behaviour, and it is the only one whose failure mode is silent.",
+        "order": 4,
+        "outcome": "not_run",
+        "project_id": "factory-prototype-lab",
+        "rollback_boundary": "A single branch off 229b923b, never main, plus the improvement plane's own demotion path. Rollback is demote-then-delete-branch, in that order, so the promotion record and the code go together.",
+        "stop_conditions": [
+          "dev-evaluate moves from exit 0 to any non-zero status",
+          "the candidate is promoted without a baseline measurement recorded first",
+          "any protected surface declared for the project is touched",
+          "the mission changes the evaluator or the fixture rather than the implementation"
+        ],
+        "work_class": "improvement"
+      }
+    ],
+    "risk": {
+      "drain_reasons": [],
+      "stop_conditions_armed": [
+        "OWNER_STOP",
+        "EMERGENCY_STOP",
+        "PORTFOLIO_COMPLETE",
+        "MISSION_CEILING_REACHED",
+        "SHIFT_WINDOW_EXPIRED",
+        "BUDGET_CEILING_REACHED",
+        "READINESS_LOST",
+        "CAPACITY_EXHAUSTED_NO_ELIGIBLE_RUNTIME",
+        "PROTECTED_SURFACE_CONFLICT",
+        "PROVIDER_UNCERTAINTY_UNRESOLVED",
+        "REPEATED_MISSION_FAILURE",
+        "ACCEPTANCE_GATE_UNAVAILABLE"
+      ]
+    },
+    "shift_state": "active",
+    "unresolved_owner_actions": [],
+    "usable_runtimes": [
+      "codex-primary"
+    ]
+  },
+  "events": {
+    "events": [
+      {
+        "actor": "owner",
+        "created_at": 1787912777.065155,
+        "detail": {
+          "reason": "SF-144 evidence run complete"
+        },
+        "event": "revoked",
+        "request_ref": "SF-144-shift-1",
+        "sequence": 4
+      },
+      {
+        "actor": "owner",
+        "created_at": 1787912776.971888,
+        "detail": {
+          "expires_at": 1787927145.535178,
+          "resume_ref": "vault://active/software-factory/implementation/SF-144#checkpoint"
+        },
+        "event": "resumed",
+        "request_ref": "SF-144-shift-1",
+        "sequence": 3
+      },
+      {
+        "actor": "owner",
+        "created_at": 1787912776.771449,
+        "detail": {
+          "resume_ref": "vault://active/software-factory/implementation/SF-144#checkpoint"
+        },
+        "event": "suspended",
+        "request_ref": "SF-144-shift-1",
+        "sequence": 2
+      },
+      {
+        "actor": "owner",
+        "created_at": 1787912745.535588,
+        "detail": {
+          "approval_ref": "notion://SF-144#dogfood-activation",
+          "expires_at": 1787927145.535178,
+          "gate_digest": "a18a01c9bab91ea90c5e9b9aff303e7df2629bbb920d534110eb268c05f74545",
+          "mission_ceiling": 4
+        },
+        "event": "granted",
+        "request_ref": "SF-144-shift-1",
+        "sequence": 1
+      }
+    ]
+  },
+  "gate-fixture": {
+    "blockers": [],
+    "checks": [
+      {
+        "check": "PROJECTS_REGISTERED",
+        "detail": "all 2 declared projects are registered",
+        "evidence_class": "rederived",
+        "required": true,
+        "source": "preflight",
+        "state": "met"
+      },
+      {
+        "check": "PROJECT_ISOLATION",
+        "detail": "every declared project binds its own repository",
+        "evidence_class": "rederived",
+        "required": true,
+        "source": "preflight",
+        "state": "met"
+      },
+      {
+        "check": "PROJECT_BUDGETS",
+        "detail": "every declared project carries a ceiling in USD",
+        "evidence_class": "rederived",
+        "required": true,
+        "source": "preflight",
+        "state": "met"
+      },
+      {
+        "check": "BUDGETS_WITHIN_RUN_CEILING",
+        "detail": "no project ceiling exceeds the run's 25.00 USD",
+        "evidence_class": "rederived",
+        "required": true,
+        "source": "preflight",
+        "state": "met"
+      },
+      {
+        "check": "EMERGENCY_STOP_CLEAR",
+        "detail": "no portfolio emergency stop is engaged",
+        "evidence_class": "rederived",
+        "required": true,
+        "source": "preflight",
+        "state": "met"
+      },
+      {
+        "check": "ACCEPTANCE_GATES_DECLARED",
+        "declared": {
+          "factory-bug-lab": {
+            "acceptance_gate_ids": [
+              "dev-check",
+              "dev-test",
+              "dev-reproduce"
+            ],
+            "source": "https://github.com/linc-abela/factory-bug-lab.git@961a4c97d49183b5501f244ba48773d9f50953ae:dev"
+          },
+          "factory-prototype-lab": {
+            "acceptance_gate_ids": [
+              "dev-check",
+              "dev-test",
+              "dev-evaluate"
+            ],
+            "source": "https://github.com/linc-abela/factory-prototype-lab.git@229b923b050fe8a4450d5597d472157bd42c8647:dev"
+          }
+        },
+        "detail": "every declared project sources its gates from the registry",
+        "evidence_class": "rederived",
+        "required": true,
+        "source": "preflight",
+        "state": "met"
+      },
+      {
+        "check": "SUPERVISOR_CONTROL_STATE",
+        "control_state": "running",
+        "detail": "supervisor control state is 'running'",
+        "evidence_class": "rederived",
+        "required": true,
+        "source": "preflight",
+        "state": "met"
+      },
+      {
+        "check": "SUPERVISOR_POLICIES",
+        "detail": "every declared project has a supervisor policy",
+        "evidence_class": "rederived",
+        "required": true,
+        "source": "preflight",
+        "state": "met"
+      },
+      {
+        "check": "WORK_CLASSES_WITHIN_CONTRACT",
+        "detail": "no project admits a class the run contract does not name",
+        "evidence_class": "rederived",
+        "required": true,
+        "source": "preflight",
+        "state": "met"
+      },
+      {
+        "check": "EXECUTION_WINDOWS",
+        "detail": "the run declares no window, so none is required",
+        "evidence_class": "rederived",
+        "required": true,
+        "source": "preflight",
+        "state": "met"
+      },
+      {
+        "check": "SUPERVISOR_SERVICE_INSTALLED",
+        "detail": "the host service definition is installed",
+        "drift": "none",
+        "evidence_class": "rederived",
+        "required": true,
+        "service_loaded": "unknown",
+        "source": "preflight",
+        "state": "met"
+      },
+      {
+        "check": "SUPERVISOR_SERVICE_NO_DRIFT",
+        "detail": "service drift: none",
+        "evidence_class": "rederived",
+        "required": true,
+        "source": "preflight",
+        "state": "met"
+      },
+      {
+        "check": "BRIDGE_REPORT_SCHEMA",
+        "detail": "bridge doctor schema is 'factory.bridge.doctor.v1'",
+        "evidence_class": "reported_claim",
+        "expected_schema": "factory.bridge.doctor.v1",
+        "required": true,
+        "source": "preflight",
+        "state": "met"
+      },
+      {
+        "check": "BRIDGE_COMPATIBILITY",
+        "compatibility": {
+          "capability_registry_drift": "none",
+          "code_drift": "none",
+          "expected_schemas": {
+            "capability_admissions": "factory.bridge.capability_admissions.v1",
+            "install_receipt": "factory.bridge.install_receipt.v1",
+            "lifecycle": "factory.bridge.lifecycle.v1",
+            "project_registry": "factory.bridge.project_registry.v1",
+            "provider_profiles": "factory.bridge.provider_profiles.v3",
+            "request_protocol": "1.0"
+          },
+          "fail_closed": false,
+          "installed_schemas": {
+            "capability_admissions": "factory.bridge.capability_admissions.v1",
+            "install_receipt": "factory.bridge.install_receipt.v1",
+            "lifecycle": "factory.bridge.lifecycle.v1",
+            "project_registry": "factory.bridge.project_registry.v1",
+            "provider_profiles": "factory.bridge.provider_profiles.v3",
+            "request_protocol": "1.0"
+          },
+          "provider_registry_drift": "none",
+          "schema_drift": "none",
+          "source_code_drift": "none",
+          "source_drift": "none",
+          "status": "compatible",
+          "version_drift": "none"
+        },
+        "detail": "bridge compatibility is 'compatible'",
+        "evidence_class": "reported_claim",
+        "required": true,
+        "source": "preflight",
+        "state": "met"
+      },
+      {
+        "check": "BRIDGE_SOURCE_COMPATIBLE",
+        "detail": "installed Bridge source '01867e6bdf04533fd510c7c562145fc2a59fc398'; report source '01867e6bdf04533fd510c7c562145fc2a59fc398'; version file '01867e6bdf04533fd510c7c562145fc2a59fc398'",
+        "evidence_class": "reported_claim",
+        "installed_sha": "01867e6bdf04533fd510c7c562145fc2a59fc398",
+        "required": true,
+        "source": "preflight",
+        "source_sha": "01867e6bdf04533fd510c7c562145fc2a59fc398",
+        "state": "met",
+        "version_file": "01867e6bdf04533fd510c7c562145fc2a59fc398"
+      },
+      {
+        "check": "BRIDGE_NO_DRIFT",
+        "detail": "bridge registry drift: none",
+        "evidence_class": "reported_claim",
+        "installed_sha": "01867e6bdf04533fd510c7c562145fc2a59fc398",
+        "required": true,
+        "source": "preflight",
+        "state": "met"
+      },
+      {
+        "check": "PROVIDER_CAPABILITIES_ADMITTED",
+        "detail": "the bridge serves every capability this run needs",
+        "evidence_class": "reported_claim",
+        "required": true,
+        "serving": [
+          "bug",
+          "prototype"
+        ],
+        "source": "preflight",
+        "state": "met"
+      },
+      {
+        "admissible": true,
+        "applied": false,
+        "approval_ref": "notion://SF-144",
+        "check": "CAPABILITY_PREVIEW_COMPATIBLE",
+        "detail": "capability preview matches the run's projects, profiles and capabilities",
+        "evidence_class": "reported_claim",
+        "request_ref": "SF-144-bug",
+        "required": true,
+        "schema_version": "factory.bridge.capability_admission_request.v1",
+        "source": "preflight",
+        "state": "met"
+      },
+      {
+        "check": "PROVIDER_PROFILES_PRESENT",
+        "detail": "every declared profile is configured",
+        "evidence_class": "reported_claim",
+        "required": true,
+        "source": "preflight",
+        "state": "met"
+      },
+      {
+        "check": "PROVIDER_RUNTIMES_RESOLVE",
+        "detail": "every declared profile resolves an executable",
+        "evidence_class": "reported_claim",
+        "required": true,
+        "source": "preflight",
+        "state": "met"
+      },
+      {
+        "check": "REQUIRED_PROVIDER_READINESS",
+        "detail": "every required provider profile is measurably ready",
+        "evidence_class": "reported_claim",
+        "required": true,
+        "required_profiles": [
+          "codex-primary",
+          "claude-secondary"
+        ],
+        "source": "preflight",
+        "state": "met"
+      },
+      {
+        "check": "LIVE_PROVIDER_PALETTE",
+        "detail": "proven ready: ['claude-secondary', 'codex-primary', 'cursor-secondary']",
+        "evidence_class": "reported_claim",
+        "optional": [
+          "cursor-secondary"
+        ],
+        "palette": {
+          "claude-secondary": {
+            "detail": "readiness probe exited 0 (FIXTURE)",
+            "readiness": "available"
+          },
+          "codex-primary": {
+            "detail": "readiness probe exited 0 (FIXTURE)",
+            "readiness": "available"
+          },
+          "cursor-secondary": {
+            "detail": "readiness probe exited 0 (FIXTURE)",
+            "readiness": "available"
+          }
+        },
+        "required": false,
+        "source": "preflight",
+        "state": "met"
+      },
+      {
+        "check": "EVIDENCE_CORE_HEALTH",
+        "detail": "evidence_core reports 'ACCEPTED'",
+        "evidence_class": "reported_claim",
+        "identity": "unknown",
+        "required": true,
+        "source": "preflight",
+        "state": "met"
+      },
+      {
+        "check": "CONTEXT_BROKER_HEALTH",
+        "detail": "context_broker reports 'ok'",
+        "evidence_class": "reported_claim",
+        "identity": "unknown",
+        "required": true,
+        "source": "preflight",
+        "state": "met"
+      },
+      {
+        "check": "PROVIDER_CAPACITY",
+        "detail": "usable declared runtimes: ['codex-primary']",
+        "evidence_class": "rederived",
+        "required": true,
+        "source": "preflight",
+        "state": "met",
+        "states": {
+          "claude-secondary": "readiness_unavailable",
+          "codex-primary": "available"
+        },
+        "usable": [
+          "codex-primary"
+        ]
+      },
+      {
+        "check": "PROTECTED_SURFACES_DECLARED",
+        "declared": {
+          "factory-bug-lab": [
+            "admission_integrity",
+            "emergency_stop",
+            "evaluator_independence",
+            "governance",
+            "improvement_policy",
+            "production_authority",
+            "release_authority",
+            "secret_handling"
+          ],
+          "factory-prototype-lab": [
+            "admission_integrity",
+            "emergency_stop",
+            "evaluator_independence",
+            "governance",
+            "improvement_policy",
+            "production_authority",
+            "release_authority",
+            "secret_handling"
+          ]
+        },
+        "detail": "every declared project names surfaces unattended work may not touch",
+        "evidence_class": "rederived",
+        "required": true,
+        "source": "preflight",
+        "state": "met"
+      },
+      {
+        "check": "PORTFOLIO_WITHIN_RUN_CONTRACT",
+        "detail": "all 4 missions name projects, classes and environments the run contract admits",
+        "evidence_class": "rederived",
+        "required": true,
+        "source": "shift",
+        "state": "met"
+      },
+      {
+        "check": "PORTFOLIO_GATES_DECLARED",
+        "detail": "every mission's gates come from the project registry at the source the registry names",
+        "evidence_class": "rederived",
+        "required": true,
+        "source": "shift",
+        "state": "met"
+      },
+      {
+        "check": "PORTFOLIO_STARTS_NON_MUTATING",
+        "detail": "the first mission produces evidence without mutating a repository, so the path is proved before it can damage anything",
+        "evidence_class": "rederived",
+        "required": true,
+        "source": "shift",
+        "state": "met"
+      },
+      {
+        "check": "PORTFOLIO_SOURCES_FETCHABLE",
+        "detail": "every baseline and gate source the portfolio names is reachable from the project's remote",
+        "evidence_class": "rederived",
+        "required": true,
+        "source": "shift",
+        "state": "met"
+      },
+      {
+        "check": "PORTFOLIO_PROJECTS_DISPATCHABLE",
+        "detail": "every project the portfolio names is registered with the execution layer",
+        "evidence_class": "rederived",
+        "registered": [
+          "factory-bug-lab",
+          "factory-prototype-lab"
+        ],
+        "required": true,
+        "source": "shift",
+        "state": "met"
+      },
+      {
+        "check": "PORTFOLIO_CAPABILITIES_OFFERED",
+        "detail": "every project's declared capability is offered by an admitted profile",
+        "evidence_class": "rederived",
+        "offered": [
+          "bug",
+          "prototype"
+        ],
+        "required": true,
+        "source": "shift",
+        "state": "met"
+      },
+      {
+        "check": "RUNTIME_ELIGIBILITY",
+        "detail": "eligible runtimes: ['codex-primary']",
+        "eligible": [
+          "codex-primary"
+        ],
+        "evidence_class": "rederived",
+        "readings": {
+          "claude-secondary": "readiness_unavailable",
+          "codex-primary": "available"
+        },
+        "required": true,
+        "source": "shift",
+        "state": "met"
+      },
+      {
+        "check": "ACTIVATION_IS_FINITE",
+        "detail": "at most 4 missions, at most 14400 seconds, at most 25.00 USD",
+        "evidence_class": "rederived",
+        "required": true,
+        "source": "shift",
+        "state": "met"
+      },
+      {
+        "check": "CEILING_COVERS_PORTFOLIO",
+        "detail": "the mission ceiling covers the whole portfolio",
+        "evidence_class": "rederived",
+        "required": false,
+        "source": "shift",
+        "state": "met"
+      },
+      {
+        "check": "BUDGET_WITHIN_RUN_CONTRACT",
+        "detail": "the request asks for 25.00 USD against a run ceiling of 25.00 USD",
+        "evidence_class": "rederived",
+        "required": true,
+        "source": "shift",
+        "state": "met"
+      },
+      {
+        "check": "PORTFOLIO_MATCHES_REQUEST",
+        "detail": "the request authorizes 'SF-144-first-internal-dogfood-1' and the portfolio supplied is 'SF-144-first-internal-dogfood-1'",
+        "evidence_class": "rederived",
+        "required": true,
+        "source": "shift",
+        "state": "met"
+      }
+    ],
+    "contract_version": "factory-controller/shift/1.0",
+    "digest": "a18a01c9bab91ea90c5e9b9aff303e7df2629bbb920d534110eb268c05f74545",
+    "gate": "DOGFOOD-ACTIVATION-GATE",
+    "portfolio_ref": "SF-144-first-internal-dogfood-1",
+    "ready": true,
+    "request_ref": "SF-144-first-internal-dogfood-1",
+    "run_ref": "SF-142-internal-dogfood-1",
+    "states": {
+      "met": 37,
+      "unknown": 0,
+      "unmet": 0
+    }
+  },
+  "preview": {
+    "action": "preview",
+    "already_granted": false,
+    "approval": {
+      "approved": false,
+      "detail": "no activation approval record was named",
+      "source": "not_applicable",
+      "state": "not_run"
+    },
+    "blockers": [],
+    "contract_version": "factory-controller/shift/1.0",
+    "gate": {
+      "blockers": [],
+      "checks": [
+        {
+          "check": "PROJECTS_REGISTERED",
+          "detail": "all 2 declared projects are registered",
+          "evidence_class": "rederived",
+          "required": true,
+          "source": "preflight",
+          "state": "met"
+        },
+        {
+          "check": "PROJECT_ISOLATION",
+          "detail": "every declared project binds its own repository",
+          "evidence_class": "rederived",
+          "required": true,
+          "source": "preflight",
+          "state": "met"
+        },
+        {
+          "check": "PROJECT_BUDGETS",
+          "detail": "every declared project carries a ceiling in USD",
+          "evidence_class": "rederived",
+          "required": true,
+          "source": "preflight",
+          "state": "met"
+        },
+        {
+          "check": "BUDGETS_WITHIN_RUN_CEILING",
+          "detail": "no project ceiling exceeds the run's 25.00 USD",
+          "evidence_class": "rederived",
+          "required": true,
+          "source": "preflight",
+          "state": "met"
+        },
+        {
+          "check": "EMERGENCY_STOP_CLEAR",
+          "detail": "no portfolio emergency stop is engaged",
+          "evidence_class": "rederived",
+          "required": true,
+          "source": "preflight",
+          "state": "met"
+        },
+        {
+          "check": "ACCEPTANCE_GATES_DECLARED",
+          "declared": {
+            "factory-bug-lab": {
+              "acceptance_gate_ids": [
+                "dev-check",
+                "dev-test",
+                "dev-reproduce"
+              ],
+              "source": "https://github.com/linc-abela/factory-bug-lab.git@961a4c97d49183b5501f244ba48773d9f50953ae:dev"
+            },
+            "factory-prototype-lab": {
+              "acceptance_gate_ids": [
+                "dev-check",
+                "dev-test",
+                "dev-evaluate"
+              ],
+              "source": "https://github.com/linc-abela/factory-prototype-lab.git@229b923b050fe8a4450d5597d472157bd42c8647:dev"
+            }
+          },
+          "detail": "every declared project sources its gates from the registry",
+          "evidence_class": "rederived",
+          "required": true,
+          "source": "preflight",
+          "state": "met"
+        },
+        {
+          "check": "SUPERVISOR_CONTROL_STATE",
+          "control_state": "running",
+          "detail": "supervisor control state is 'running'",
+          "evidence_class": "rederived",
+          "required": true,
+          "source": "preflight",
+          "state": "met"
+        },
+        {
+          "check": "SUPERVISOR_POLICIES",
+          "detail": "every declared project has a supervisor policy",
+          "evidence_class": "rederived",
+          "required": true,
+          "source": "preflight",
+          "state": "met"
+        },
+        {
+          "check": "WORK_CLASSES_WITHIN_CONTRACT",
+          "detail": "no project admits a class the run contract does not name",
+          "evidence_class": "rederived",
+          "required": true,
+          "source": "preflight",
+          "state": "met"
+        },
+        {
+          "check": "EXECUTION_WINDOWS",
+          "detail": "the run declares no window, so none is required",
+          "evidence_class": "rederived",
+          "required": true,
+          "source": "preflight",
+          "state": "met"
+        },
+        {
+          "check": "SUPERVISOR_SERVICE_INSTALLED",
+          "detail": "the host service definition is installed",
+          "drift": "none",
+          "evidence_class": "rederived",
+          "required": true,
+          "service_loaded": "unknown",
+          "source": "preflight",
+          "state": "met"
+        },
+        {
+          "check": "SUPERVISOR_SERVICE_NO_DRIFT",
+          "detail": "service drift: none",
+          "evidence_class": "rederived",
+          "required": true,
+          "source": "preflight",
+          "state": "met"
+        },
+        {
+          "check": "BRIDGE_REPORT_SCHEMA",
+          "detail": "bridge doctor schema is 'factory.bridge.doctor.v1'",
+          "evidence_class": "reported_claim",
+          "expected_schema": "factory.bridge.doctor.v1",
+          "required": true,
+          "source": "preflight",
+          "state": "met"
+        },
+        {
+          "check": "BRIDGE_COMPATIBILITY",
+          "compatibility": {
+            "capability_registry_drift": "none",
+            "code_drift": "none",
+            "expected_schemas": {
+              "capability_admissions": "factory.bridge.capability_admissions.v1",
+              "install_receipt": "factory.bridge.install_receipt.v1",
+              "lifecycle": "factory.bridge.lifecycle.v1",
+              "project_registry": "factory.bridge.project_registry.v1",
+              "provider_profiles": "factory.bridge.provider_profiles.v3",
+              "request_protocol": "1.0"
+            },
+            "fail_closed": false,
+            "installed_schemas": {
+              "capability_admissions": "factory.bridge.capability_admissions.v1",
+              "install_receipt": "factory.bridge.install_receipt.v1",
+              "lifecycle": "factory.bridge.lifecycle.v1",
+              "project_registry": "factory.bridge.project_registry.v1",
+              "provider_profiles": "factory.bridge.provider_profiles.v3",
+              "request_protocol": "1.0"
+            },
+            "provider_registry_drift": "none",
+            "schema_drift": "none",
+            "source_code_drift": "none",
+            "source_drift": "none",
+            "status": "compatible",
+            "version_drift": "none"
+          },
+          "detail": "bridge compatibility is 'compatible'",
+          "evidence_class": "reported_claim",
+          "required": true,
+          "source": "preflight",
+          "state": "met"
+        },
+        {
+          "check": "BRIDGE_SOURCE_COMPATIBLE",
+          "detail": "installed Bridge source '01867e6bdf04533fd510c7c562145fc2a59fc398'; report source '01867e6bdf04533fd510c7c562145fc2a59fc398'; version file '01867e6bdf04533fd510c7c562145fc2a59fc398'",
+          "evidence_class": "reported_claim",
+          "installed_sha": "01867e6bdf04533fd510c7c562145fc2a59fc398",
+          "required": true,
+          "source": "preflight",
+          "source_sha": "01867e6bdf04533fd510c7c562145fc2a59fc398",
+          "state": "met",
+          "version_file": "01867e6bdf04533fd510c7c562145fc2a59fc398"
+        },
+        {
+          "check": "BRIDGE_NO_DRIFT",
+          "detail": "bridge registry drift: none",
+          "evidence_class": "reported_claim",
+          "installed_sha": "01867e6bdf04533fd510c7c562145fc2a59fc398",
+          "required": true,
+          "source": "preflight",
+          "state": "met"
+        },
+        {
+          "check": "PROVIDER_CAPABILITIES_ADMITTED",
+          "detail": "the bridge serves every capability this run needs",
+          "evidence_class": "reported_claim",
+          "required": true,
+          "serving": [
+            "bug",
+            "prototype"
+          ],
+          "source": "preflight",
+          "state": "met"
+        },
+        {
+          "admissible": true,
+          "applied": false,
+          "approval_ref": "notion://SF-144",
+          "check": "CAPABILITY_PREVIEW_COMPATIBLE",
+          "detail": "capability preview matches the run's projects, profiles and capabilities",
+          "evidence_class": "reported_claim",
+          "request_ref": "SF-144-bug",
+          "required": true,
+          "schema_version": "factory.bridge.capability_admission_request.v1",
+          "source": "preflight",
+          "state": "met"
+        },
+        {
+          "check": "PROVIDER_PROFILES_PRESENT",
+          "detail": "every declared profile is configured",
+          "evidence_class": "reported_claim",
+          "required": true,
+          "source": "preflight",
+          "state": "met"
+        },
+        {
+          "check": "PROVIDER_RUNTIMES_RESOLVE",
+          "detail": "every declared profile resolves an executable",
+          "evidence_class": "reported_claim",
+          "required": true,
+          "source": "preflight",
+          "state": "met"
+        },
+        {
+          "check": "REQUIRED_PROVIDER_READINESS",
+          "detail": "every required provider profile is measurably ready",
+          "evidence_class": "reported_claim",
+          "required": true,
+          "required_profiles": [
+            "codex-primary",
+            "claude-secondary"
+          ],
+          "source": "preflight",
+          "state": "met"
+        },
+        {
+          "check": "LIVE_PROVIDER_PALETTE",
+          "detail": "proven ready: ['claude-secondary', 'codex-primary', 'cursor-secondary']",
+          "evidence_class": "reported_claim",
+          "optional": [
+            "cursor-secondary"
+          ],
+          "palette": {
+            "claude-secondary": {
+              "detail": "readiness probe exited 0 (FIXTURE)",
+              "readiness": "available"
+            },
+            "codex-primary": {
+              "detail": "readiness probe exited 0 (FIXTURE)",
+              "readiness": "available"
+            },
+            "cursor-secondary": {
+              "detail": "readiness probe exited 0 (FIXTURE)",
+              "readiness": "available"
+            }
+          },
+          "required": false,
+          "source": "preflight",
+          "state": "met"
+        },
+        {
+          "check": "EVIDENCE_CORE_HEALTH",
+          "detail": "evidence_core reports 'ACCEPTED'",
+          "evidence_class": "reported_claim",
+          "identity": "unknown",
+          "required": true,
+          "source": "preflight",
+          "state": "met"
+        },
+        {
+          "check": "CONTEXT_BROKER_HEALTH",
+          "detail": "context_broker reports 'ok'",
+          "evidence_class": "reported_claim",
+          "identity": "unknown",
+          "required": true,
+          "source": "preflight",
+          "state": "met"
+        },
+        {
+          "check": "PROVIDER_CAPACITY",
+          "detail": "usable declared runtimes: ['codex-primary']",
+          "evidence_class": "rederived",
+          "required": true,
+          "source": "preflight",
+          "state": "met",
+          "states": {
+            "claude-secondary": "readiness_unavailable",
+            "codex-primary": "available"
+          },
+          "usable": [
+            "codex-primary"
+          ]
+        },
+        {
+          "check": "PROTECTED_SURFACES_DECLARED",
+          "declared": {
+            "factory-bug-lab": [
+              "admission_integrity",
+              "emergency_stop",
+              "evaluator_independence",
+              "governance",
+              "improvement_policy",
+              "production_authority",
+              "release_authority",
+              "secret_handling"
+            ],
+            "factory-prototype-lab": [
+              "admission_integrity",
+              "emergency_stop",
+              "evaluator_independence",
+              "governance",
+              "improvement_policy",
+              "production_authority",
+              "release_authority",
+              "secret_handling"
+            ]
+          },
+          "detail": "every declared project names surfaces unattended work may not touch",
+          "evidence_class": "rederived",
+          "required": true,
+          "source": "preflight",
+          "state": "met"
+        },
+        {
+          "check": "PORTFOLIO_WITHIN_RUN_CONTRACT",
+          "detail": "all 4 missions name projects, classes and environments the run contract admits",
+          "evidence_class": "rederived",
+          "required": true,
+          "source": "shift",
+          "state": "met"
+        },
+        {
+          "check": "PORTFOLIO_GATES_DECLARED",
+          "detail": "every mission's gates come from the project registry at the source the registry names",
+          "evidence_class": "rederived",
+          "required": true,
+          "source": "shift",
+          "state": "met"
+        },
+        {
+          "check": "PORTFOLIO_STARTS_NON_MUTATING",
+          "detail": "the first mission produces evidence without mutating a repository, so the path is proved before it can damage anything",
+          "evidence_class": "rederived",
+          "required": true,
+          "source": "shift",
+          "state": "met"
+        },
+        {
+          "check": "PORTFOLIO_SOURCES_FETCHABLE",
+          "detail": "every baseline and gate source the portfolio names is reachable from the project's remote",
+          "evidence_class": "rederived",
+          "required": true,
+          "source": "shift",
+          "state": "met"
+        },
+        {
+          "check": "PORTFOLIO_PROJECTS_DISPATCHABLE",
+          "detail": "every project the portfolio names is registered with the execution layer",
+          "evidence_class": "rederived",
+          "registered": [
+            "factory-bug-lab",
+            "factory-prototype-lab"
+          ],
+          "required": true,
+          "source": "shift",
+          "state": "met"
+        },
+        {
+          "check": "PORTFOLIO_CAPABILITIES_OFFERED",
+          "detail": "every project's declared capability is offered by an admitted profile",
+          "evidence_class": "rederived",
+          "offered": [
+            "bug",
+            "prototype"
+          ],
+          "required": true,
+          "source": "shift",
+          "state": "met"
+        },
+        {
+          "check": "RUNTIME_ELIGIBILITY",
+          "detail": "eligible runtimes: ['codex-primary']",
+          "eligible": [
+            "codex-primary"
+          ],
+          "evidence_class": "rederived",
+          "readings": {
+            "claude-secondary": "readiness_unavailable",
+            "codex-primary": "available"
+          },
+          "required": true,
+          "source": "shift",
+          "state": "met"
+        },
+        {
+          "check": "ACTIVATION_IS_FINITE",
+          "detail": "at most 4 missions, at most 14400 seconds, at most 25.00 USD",
+          "evidence_class": "rederived",
+          "required": true,
+          "source": "shift",
+          "state": "met"
+        },
+        {
+          "check": "CEILING_COVERS_PORTFOLIO",
+          "detail": "the mission ceiling covers the whole portfolio",
+          "evidence_class": "rederived",
+          "required": false,
+          "source": "shift",
+          "state": "met"
+        },
+        {
+          "check": "BUDGET_WITHIN_RUN_CONTRACT",
+          "detail": "the request asks for 25.00 USD against a run ceiling of 25.00 USD",
+          "evidence_class": "rederived",
+          "required": true,
+          "source": "shift",
+          "state": "met"
+        },
+        {
+          "check": "PORTFOLIO_MATCHES_REQUEST",
+          "detail": "the request authorizes 'SF-144-first-internal-dogfood-1' and the portfolio supplied is 'SF-144-first-internal-dogfood-1'",
+          "evidence_class": "rederived",
+          "required": true,
+          "source": "shift",
+          "state": "met"
+        }
+      ],
+      "contract_version": "factory-controller/shift/1.0",
+      "digest": "a18a01c9bab91ea90c5e9b9aff303e7df2629bbb920d534110eb268c05f74545",
+      "gate": "DOGFOOD-ACTIVATION-GATE",
+      "portfolio_ref": "SF-144-first-internal-dogfood-1",
+      "ready": true,
+      "request_ref": "SF-144-shift-1",
+      "run_ref": "SF-142-internal-dogfood-1",
+      "states": {
+        "met": 37,
+        "unknown": 0,
+        "unmet": 0
+      }
+    },
+    "ready": true,
+    "request": {
+      "budget_ceiling": 25.0,
+      "budget_currency": "USD",
+      "duration_seconds": 14400.0,
+      "mission_ceiling": 4,
+      "portfolio_ref": "SF-144-first-internal-dogfood-1",
+      "request_ref": "SF-144-shift-1",
+      "run_ref": "SF-142-internal-dogfood-1"
+    },
+    "would_authorize": {
+      "budget_ceiling": 25.0,
+      "budget_currency": "USD",
+      "eligible_profiles": [
+        "codex-primary"
+      ],
+      "environment_classes": [
+        "local-sim",
+        "staging"
+      ],
+      "expires_at": 1787927145.36586,
+      "mission_ceiling": 4,
+      "missions": [
+        {
+          "acceptance_gate_ids": [
+            "dev-check",
+            "dev-test"
+          ],
+          "acceptance_gate_source": "https://github.com/linc-abela/factory-prototype-lab.git@229b923b050fe8a4450d5597d472157bd42c8647:dev",
+          "baseline_sha": "229b923b050fe8a4450d5597d472157bd42c8647",
+          "environment_class": "local-sim",
+          "evidence_required": [
+            "mission record with every step terminal",
+            "provider receipt naming the profile actually selected",
+            "re-derived exit status for each declared gate",
+            "cost accounting, or a typed absence where the provider returned no usage",
+            "context accounting for the bound package"
+          ],
+          "mission_ref": "DF-1",
+          "mutates_repository": false,
+          "objective": "Carry one declared mission end to end -- context binding, provider dispatch, verification, acceptance-gate re-derivation and evidence sealing -- against a repository state the Factory does not change, and record the resulting mission, receipt and cost/context accounting.",
+          "order": 1,
+          "project_id": "factory-prototype-lab",
+          "rollback_boundary": "None is required and that is the point: the mission produces only Controller state and evidence records, so abandoning it leaves the lab byte-identical.",
+          "stop_conditions": [
+            "the dispatch leg completes with execution_mode fixture rather than reaching a provider process",
+            "any acceptance gate id resolves from anywhere other than the project registry",
+            "the mission writes to the lab working tree"
+          ],
+          "work_class": "backlog"
+        },
+        {
+          "acceptance_gate_ids": [
+            "dev-check",
+            "dev-test",
+            "dev-reproduce"
+          ],
+          "acceptance_gate_source": "https://github.com/linc-abela/factory-bug-lab.git@961a4c97d49183b5501f244ba48773d9f50953ae:dev",
+          "baseline_sha": "4072bfd7c008d3b227e2e164ecbe6f58013c2733",
+          "environment_class": "local-sim",
+          "evidence_required": [
+            "mission record showing dev-reproduce unmet with exit status 1 preserved",
+            "the two passing gates recorded separately from the failing one",
+            "provider receipt naming the profile actually selected",
+            "cost accounting, or a typed absence"
+          ],
+          "mission_ref": "DF-2",
+          "mutates_repository": false,
+          "objective": "Run the same path against a declared gate that is known to fail, and prove the failure is recorded as a failure. At baseline 4072bfd7 dev reproduce exits 1 by design; the mission succeeds when the Factory reports that non-zero exit as an unmet gate with the exit status preserved, and fails if the run is reported healthy.",
+          "order": 2,
+          "project_id": "factory-bug-lab",
+          "rollback_boundary": "None is required; the mission produces only Controller state and evidence records.",
+          "stop_conditions": [
+            "a non-zero gate exit is recorded as met, or as any absence word",
+            "the mission is reported complete without the failing gate appearing in its evidence",
+            "the mission writes to the lab working tree"
+          ],
+          "work_class": "maintenance"
+        },
+        {
+          "acceptance_gate_ids": [
+            "dev-check",
+            "dev-test",
+            "dev-reproduce"
+          ],
+          "acceptance_gate_source": "https://github.com/linc-abela/factory-bug-lab.git@961a4c97d49183b5501f244ba48773d9f50953ae:dev",
+          "baseline_sha": "4072bfd7c008d3b227e2e164ecbe6f58013c2733",
+          "environment_class": "staging",
+          "evidence_required": [
+            "the root cause stated in writing",
+            "before and after exit statuses for all three gates, with exact SHAs",
+            "the regression's own failing result at the baseline commit",
+            "diff confined to the lab package and its tests",
+            "cost and context accounting for the whole mission"
+          ],
+          "mission_ref": "DF-3",
+          "mutates_repository": true,
+          "objective": "Diagnose and fix the seat-overbooking defect the lab's frozen report describes, from baseline 4072bfd7, adding a regression that fails at the baseline and passes at the fix. This is the first mission that changes a repository. It is checkable in a way no other first mutating mission would be: an independent human fix for the same defect exists off this baseline, so the Factory's diagnosis and patch can be compared against a known-good one rather than only against a green suite.",
+          "order": 3,
+          "project_id": "factory-bug-lab",
+          "rollback_boundary": "A single branch off 4072bfd7, never main. Rollback is deleting that branch; nothing the mission does is visible to another host until a person merges it.",
+          "stop_conditions": [
+            "the fix commit does not move dev-reproduce from exit 1 to exit 0",
+            "the added regression passes at the baseline commit",
+            "any change lands outside the lab package and its tests",
+            "the mission force-updates or rewrites any published ref"
+          ],
+          "work_class": "maintenance"
+        },
+        {
+          "acceptance_gate_ids": [
+            "dev-check",
+            "dev-test",
+            "dev-evaluate"
+          ],
+          "acceptance_gate_source": "https://github.com/linc-abela/factory-prototype-lab.git@229b923b050fe8a4450d5597d472157bd42c8647:dev",
+          "baseline_sha": "229b923b050fe8a4450d5597d472157bd42c8647",
+          "environment_class": "staging",
+          "evidence_required": [
+            "baseline measurement recorded before the candidate ran",
+            "post-change measurement for the same metric",
+            "dev-evaluate exit 0 preserved at the fix commit",
+            "the promotion decision with its approval reference",
+            "cost and context accounting"
+          ],
+          "mission_ref": "DF-4",
+          "mutates_repository": true,
+          "objective": "Carry one improvement candidate through baseline measurement and promotion without regressing the lab's own decision boundary. This is last because it is the only mission that changes a project's quality bar rather than its behaviour, and it is the only one whose failure mode is silent.",
+          "order": 4,
+          "project_id": "factory-prototype-lab",
+          "rollback_boundary": "A single branch off 229b923b, never main, plus the improvement plane's own demotion path. Rollback is demote-then-delete-branch, in that order, so the promotion record and the code go together.",
+          "stop_conditions": [
+            "dev-evaluate moves from exit 0 to any non-zero status",
+            "the candidate is promoted without a baseline measurement recorded first",
+            "any protected surface declared for the project is touched",
+            "the mission changes the evaluator or the fixture rather than the implementation"
+          ],
+          "work_class": "improvement"
+        }
+      ],
+      "portfolio_ref": "SF-144-first-internal-dogfood-1",
+      "projects": [
+        "factory-bug-lab",
+        "factory-prototype-lab"
+      ],
+      "repository_mutating_missions": [
+        "DF-3",
+        "DF-4"
+      ],
+      "work_classes": [
+        "backlog",
+        "improvement",
+        "maintenance"
+      ]
+    },
+    "would_not_authorize": [
+      "loading, installing or unloading any host service",
+      "widening an admitted capability or project",
+      "any production environment class",
+      "any provider not named by the run contract",
+      "any mission beyond the portfolio's ordered list"
+    ]
+  },
+  "resume": {
+    "action": "resume",
+    "changed": true,
+    "detail": "the original expiry stands",
+    "grant": {
+      "approval_ref": "notion://SF-144#dogfood-activation",
+      "approved_by": "owner",
+      "budget_ceiling": 25.0,
+      "budget_currency": "USD",
+      "contract_version": "factory-controller/shift/1.0",
+      "expires_at": 1787927145.535178,
+      "gate_digest": "a18a01c9bab91ea90c5e9b9aff303e7df2629bbb920d534110eb268c05f74545",
+      "granted_at": 1787912745.535178,
+      "mission_ceiling": 4,
+      "portfolio_ref": "SF-144-first-internal-dogfood-1",
+      "request_ref": "SF-144-shift-1",
+      "resume_ref": "not_applicable",
+      "revoke_reason": "not_applicable",
+      "revoked_at": "not_applicable",
+      "run_ref": "SF-142-internal-dogfood-1",
+      "suspended_at": "not_applicable"
+    }
+  },
+  "revoke": {
+    "action": "revoke",
+    "changed": true,
+    "detail": "admission stopped; work already running drains",
+    "grant": {
+      "approval_ref": "notion://SF-144#dogfood-activation",
+      "approved_by": "owner",
+      "budget_ceiling": 25.0,
+      "budget_currency": "USD",
+      "contract_version": "factory-controller/shift/1.0",
+      "expires_at": 1787927145.535178,
+      "gate_digest": "a18a01c9bab91ea90c5e9b9aff303e7df2629bbb920d534110eb268c05f74545",
+      "granted_at": 1787912745.535178,
+      "mission_ceiling": 4,
+      "portfolio_ref": "SF-144-first-internal-dogfood-1",
+      "request_ref": "SF-144-shift-1",
+      "resume_ref": "not_applicable",
+      "revoke_reason": "SF-144 evidence run complete",
+      "revoked_at": 1787912777.064773,
+      "run_ref": "SF-142-internal-dogfood-1",
+      "suspended_at": "not_applicable"
+    }
+  },
+  "status-active": {
+    "blockers": [],
+    "contract_version": "factory-controller/shift/1.0",
+    "control_state": "running",
+    "drain_reasons": [],
+    "eligible_profiles": [
+      "codex-primary"
+    ],
+    "gate_ready": true,
+    "grant": {
+      "approval_ref": "notion://SF-144#dogfood-activation",
+      "approved_by": "owner",
+      "budget_ceiling": 25.0,
+      "budget_currency": "USD",
+      "contract_version": "factory-controller/shift/1.0",
+      "expires_at": 1787927145.535178,
+      "gate_digest": "a18a01c9bab91ea90c5e9b9aff303e7df2629bbb920d534110eb268c05f74545",
+      "granted_at": 1787912745.535178,
+      "mission_ceiling": 4,
+      "portfolio_ref": "SF-144-first-internal-dogfood-1",
+      "request_ref": "SF-144-shift-1",
+      "resume_ref": "not_applicable",
+      "revoke_reason": "not_applicable",
+      "revoked_at": "not_applicable",
+      "run_ref": "SF-142-internal-dogfood-1",
+      "suspended_at": "not_applicable"
+    },
+    "state": "active"
+  },
+  "status-exhausted": {
+    "blockers": [
+      {
+        "check": "PROVIDER_CAPACITY",
+        "detail": "every declared runtime is unusable: {'codex-primary': 'exhausted', 'claude-secondary': 'readiness_unavailable'}",
+        "source": "preflight",
+        "state": "unmet"
+      },
+      {
+        "check": "RUNTIME_ELIGIBILITY",
+        "detail": "every declared runtime is unusable, so a shift would be authorized with nothing able to take a mission",
+        "source": "shift",
+        "state": "unmet"
+      }
+    ],
+    "contract_version": "factory-controller/shift/1.0",
+    "control_state": "running",
+    "drain_reasons": [
+      "CAPACITY_EXHAUSTED_NO_ELIGIBLE_RUNTIME"
+    ],
+    "eligible_profiles": [],
+    "gate_ready": false,
+    "grant": {
+      "approval_ref": "notion://SF-144#dogfood-activation",
+      "approved_by": "owner",
+      "budget_ceiling": 25.0,
+      "budget_currency": "USD",
+      "contract_version": "factory-controller/shift/1.0",
+      "expires_at": 1787927145.535178,
+      "gate_digest": "a18a01c9bab91ea90c5e9b9aff303e7df2629bbb920d534110eb268c05f74545",
+      "granted_at": 1787912745.535178,
+      "mission_ceiling": 4,
+      "portfolio_ref": "SF-144-first-internal-dogfood-1",
+      "request_ref": "SF-144-shift-1",
+      "resume_ref": "not_applicable",
+      "revoke_reason": "not_applicable",
+      "revoked_at": "not_applicable",
+      "run_ref": "SF-142-internal-dogfood-1",
+      "suspended_at": "not_applicable"
+    },
+    "state": "off"
+  },
+  "status-post-revoke-reset": {
+    "blockers": [],
+    "contract_version": "factory-controller/shift/1.0",
+    "control_state": "running",
+    "drain_reasons": [
+      "OWNER_STOP"
+    ],
+    "eligible_profiles": [
+      "codex-primary"
+    ],
+    "gate_ready": true,
+    "grant": {
+      "approval_ref": "notion://SF-144#dogfood-activation",
+      "approved_by": "owner",
+      "budget_ceiling": 25.0,
+      "budget_currency": "USD",
+      "contract_version": "factory-controller/shift/1.0",
+      "expires_at": 1787927145.535178,
+      "gate_digest": "a18a01c9bab91ea90c5e9b9aff303e7df2629bbb920d534110eb268c05f74545",
+      "granted_at": 1787912745.535178,
+      "mission_ceiling": 4,
+      "portfolio_ref": "SF-144-first-internal-dogfood-1",
+      "request_ref": "SF-144-shift-1",
+      "resume_ref": "not_applicable",
+      "revoke_reason": "SF-144 evidence run complete",
+      "revoked_at": 1787912777.064773,
+      "run_ref": "SF-142-internal-dogfood-1",
+      "suspended_at": "not_applicable"
+    },
+    "state": "off"
+  },
+  "status-restored": {
+    "blockers": [],
+    "contract_version": "factory-controller/shift/1.0",
+    "control_state": "running",
+    "drain_reasons": [],
+    "eligible_profiles": [
+      "codex-primary"
+    ],
+    "gate_ready": true,
+    "grant": {
+      "approval_ref": "notion://SF-144#dogfood-activation",
+      "approved_by": "owner",
+      "budget_ceiling": 25.0,
+      "budget_currency": "USD",
+      "contract_version": "factory-controller/shift/1.0",
+      "expires_at": 1787927145.535178,
+      "gate_digest": "a18a01c9bab91ea90c5e9b9aff303e7df2629bbb920d534110eb268c05f74545",
+      "granted_at": 1787912745.535178,
+      "mission_ceiling": 4,
+      "portfolio_ref": "SF-144-first-internal-dogfood-1",
+      "request_ref": "SF-144-shift-1",
+      "resume_ref": "not_applicable",
+      "revoke_reason": "not_applicable",
+      "revoked_at": "not_applicable",
+      "run_ref": "SF-142-internal-dogfood-1",
+      "suspended_at": "not_applicable"
+    },
+    "state": "active"
+  },
+  "status-revoked": {
+    "blockers": [],
+    "contract_version": "factory-controller/shift/1.0",
+    "control_state": "running",
+    "drain_reasons": [
+      "OWNER_STOP"
+    ],
+    "eligible_profiles": [
+      "codex-primary"
+    ],
+    "gate_ready": true,
+    "grant": {
+      "approval_ref": "notion://SF-144#dogfood-activation",
+      "approved_by": "owner",
+      "budget_ceiling": 25.0,
+      "budget_currency": "USD",
+      "contract_version": "factory-controller/shift/1.0",
+      "expires_at": 1787927145.535178,
+      "gate_digest": "a18a01c9bab91ea90c5e9b9aff303e7df2629bbb920d534110eb268c05f74545",
+      "granted_at": 1787912745.535178,
+      "mission_ceiling": 4,
+      "portfolio_ref": "SF-144-first-internal-dogfood-1",
+      "request_ref": "SF-144-shift-1",
+      "resume_ref": "not_applicable",
+      "revoke_reason": "SF-144 evidence run complete",
+      "revoked_at": 1787912777.064773,
+      "run_ref": "SF-142-internal-dogfood-1",
+      "suspended_at": "not_applicable"
+    },
+    "state": "off"
+  },
+  "status-suspended": {
+    "blockers": [],
+    "contract_version": "factory-controller/shift/1.0",
+    "control_state": "running",
+    "drain_reasons": [],
+    "eligible_profiles": [
+      "codex-primary"
+    ],
+    "gate_ready": true,
+    "grant": {
+      "approval_ref": "notion://SF-144#dogfood-activation",
+      "approved_by": "owner",
+      "budget_ceiling": 25.0,
+      "budget_currency": "USD",
+      "contract_version": "factory-controller/shift/1.0",
+      "expires_at": 1787927145.535178,
+      "gate_digest": "a18a01c9bab91ea90c5e9b9aff303e7df2629bbb920d534110eb268c05f74545",
+      "granted_at": 1787912745.535178,
+      "mission_ceiling": 4,
+      "portfolio_ref": "SF-144-first-internal-dogfood-1",
+      "request_ref": "SF-144-shift-1",
+      "resume_ref": "vault://active/software-factory/implementation/SF-144#checkpoint",
+      "revoke_reason": "not_applicable",
+      "revoked_at": "not_applicable",
+      "run_ref": "SF-142-internal-dogfood-1",
+      "suspended_at": 1787912776.771062
+    },
+    "state": "suspended"
+  },
+  "suspend": {
+    "action": "suspend",
+    "changed": true,
+    "detail": "resume from vault://active/software-factory/implementation/SF-144#checkpoint",
+    "grant": {
+      "approval_ref": "notion://SF-144#dogfood-activation",
+      "approved_by": "owner",
+      "budget_ceiling": 25.0,
+      "budget_currency": "USD",
+      "contract_version": "factory-controller/shift/1.0",
+      "expires_at": 1787927145.535178,
+      "gate_digest": "a18a01c9bab91ea90c5e9b9aff303e7df2629bbb920d534110eb268c05f74545",
+      "granted_at": 1787912745.535178,
+      "mission_ceiling": 4,
+      "portfolio_ref": "SF-144-first-internal-dogfood-1",
+      "request_ref": "SF-144-shift-1",
+      "resume_ref": "vault://active/software-factory/implementation/SF-144#checkpoint",
+      "revoke_reason": "not_applicable",
+      "revoked_at": "not_applicable",
+      "run_ref": "SF-142-internal-dogfood-1",
+      "suspended_at": 1787912776.771062
+    }
+  },
+  "suspend-noref": {
+    "refused": {
+      "code": "SHIFT_RESUME_REF_REQUIRED",
+      "detail": "a suspension names where the durable state is recorded, or resuming would depend on somebody remembering it"
+    }
+  }
+}

@@ -6,6 +6,8 @@ case "${1:-}" in
       tests.test_stage9_supervisor tests.test_stage9_long_horizon "$@" ;;
   capacity) shift; exec docker compose run --rm controller python -m unittest \
       tests.test_capacity_control_plane tests.test_capacity_windows "$@" ;;
+  dogfood-shift) shift; exec docker compose run --rm controller python -m unittest \
+      tests.test_dogfood_shift "$@" ;;
   dogfood) shift; exec docker compose run --rm controller python -m unittest \
       tests.test_acceptance_gate_provenance tests.test_supervisor_activation \
       tests.test_dogfood_preflight tests.test_dogfood_rehearsal "$@" ;;

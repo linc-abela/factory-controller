@@ -43,6 +43,11 @@ REACHABLE = {
                         "961a4c97d49183b5501f244ba48773d9f50953ae"],
 }
 
+REGISTRY = {
+    "factory-prototype-lab": {"capabilities": ["prototype"]},
+    "factory-bug-lab": {"capabilities": ["bug"]},
+}
+
 DECLARED_GATES = {
     "factory-prototype-lab": {
         "acceptance_gate_ids": ["dev-check", "dev-test", "dev-evaluate"],
@@ -96,6 +101,8 @@ def facts(**overrides) -> shift.GateFacts:
                               for name in CONTRACT.provider_profiles},
         "eligible_profiles": CONTRACT.provider_profiles,
         "fetchable_shas": REACHABLE,
+        "project_registry": REGISTRY,
+        "offered_capabilities": ("prototype", "bug"),
     }
     values.update(overrides)
     return shift.GateFacts(**values)
@@ -338,6 +345,48 @@ class GateTests(unittest.TestCase):
             eligible_profiles=()))
         self.assertIn("RUNTIME_ELIGIBILITY",
                       [row["check"] for row in reading["blockers"]])
+
+    def test_a_project_the_execution_layer_never_heard_of_is_refused(self):
+        """The measured case: one admitted lab is absent from the registry."""
+
+        reading = shift.gate(facts(project_registry={
+            "factory-prototype-lab": {"capabilities": ["prototype"]}}))
+        blocked = [row for row in reading["blockers"]
+                   if row["check"] == "PORTFOLIO_PROJECTS_DISPATCHABLE"]
+        self.assertTrue(blocked)
+        self.assertIn("factory-bug-lab", blocked[0]["detail"])
+
+    def test_a_capability_no_admitted_profile_offers_is_refused(self):
+        """The measured case: no profile on this host offers ``bug``."""
+
+        reading = shift.gate(facts(offered_capabilities=("prototype",)))
+        blocked = [row for row in reading["blockers"]
+                   if row["check"] == "PORTFOLIO_CAPABILITIES_OFFERED"]
+        self.assertTrue(blocked)
+        self.assertIn("factory-bug-lab", blocked[0]["detail"])
+
+    def test_the_capability_check_is_not_circular(self):
+        """Derived from the registry it checks, it could never have fired."""
+
+        offered = [row for row in shift.gate(facts())["checks"]
+                   if row["check"] == "PORTFOLIO_CAPABILITIES_OFFERED"][0]
+        self.assertEqual(offered["offered"], ["bug", "prototype"])
+        self.assertEqual(offered["state"], dogfood.MET)
+
+    def test_no_registry_reading_is_unknown_not_met(self):
+        reading = shift.gate(facts(project_registry=None))
+        for name in ("PORTFOLIO_PROJECTS_DISPATCHABLE",
+                     "PORTFOLIO_CAPABILITIES_OFFERED"):
+            row = [item for item in reading["checks"]
+                   if item["check"] == name][0]
+            self.assertEqual(row["state"], dogfood.UNKNOWN, name)
+        self.assertFalse(reading["ready"])
+
+    def test_no_capability_reading_is_unknown_even_with_a_registry(self):
+        reading = shift.gate(facts(offered_capabilities=None))
+        row = [item for item in reading["checks"]
+               if item["check"] == "PORTFOLIO_CAPABILITIES_OFFERED"][0]
+        self.assertEqual(row["state"], dogfood.UNKNOWN)
 
     def test_no_capacity_reading_is_unknown_not_met(self):
         reading = shift.gate(facts(capacity_readings={}, eligible_profiles=()))
