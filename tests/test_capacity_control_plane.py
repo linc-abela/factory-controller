@@ -600,13 +600,27 @@ class BridgeSeamTests(unittest.TestCase):
             self.assertEqual(reading.state, "readiness_unavailable")
             self.assertEqual(reading.detail["reported_classification"], reported)
 
-    def test_no_bridge_word_is_ever_translated_into_a_measurement(self):
-        """Their vocabulary cannot express `constrained` or `exhausted`."""
+    def test_readiness_alone_never_invents_cooling_or_exhaustion(self):
 
         produced = {capacity.observation_from_bridge_status(
             self.status(classification=word, remaining_seconds=None), 1_000_000.0).state
             for word in capacity.BRIDGE_READINESS}
         self.assertEqual(produced & {"constrained", "exhausted"}, set())
+
+    def test_explicit_bridge_quota_state_crosses_without_invention(self):
+        for reported, reset, expected in (
+                ("cooling", 1_001_000.0, "cooling"),
+                ("exhausted", 1_001_000.0, "exhausted"),
+                ("exhausted", None, "exhausted"),
+                ("unknown", None, "capacity_unmeasurable")):
+            with self.subTest(reported=reported, reset=reset):
+                reading = capacity.observation_from_bridge_status(
+                    self.status(quota_state=reported,
+                                expected_reset_at=reset,
+                                source_ref="operator:SF-142A"), 1_000_050.0)
+                self.assertEqual(reading.state, expected)
+                self.assertEqual(reading.expected_reset_at, reset)
+                self.assertEqual(reading.source_ref, "operator:SF-142A")
 
     def test_an_absent_record_is_an_absence_and_never_a_state(self):
         """Fabricating `capacity_unmeasurable` would make unmanaged look measured."""

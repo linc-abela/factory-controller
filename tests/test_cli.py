@@ -8,6 +8,7 @@ import unittest
 from pathlib import Path
 
 from factory_controller.cli import main
+from factory_controller import capacity, continuity
 from factory_controller.store import MissionStore
 
 
@@ -42,6 +43,24 @@ class ControllerCLITests(unittest.TestCase):
         rc_work = main(["--db", self.db_path, "work-once", "--worker", "cli-worker"])
         self.assertEqual(rc_work, 0)
         self.assertEqual(store.counts().get("completed"), 1)
+
+    def test_operator_can_inspect_durable_work_batons(self) -> None:
+        observation = capacity.CapacityObservation(
+            runtime_id="codex-primary", state="exhausted", observed_at=100,
+            source="test", source_ref="test-observation",
+            expected_reset_at=18100).as_row()
+        baton = continuity.issue_payload(
+            source="https://example.invalid/project.git", head_sha="a" * 40,
+            project_id="project-a", run_id="run-a", lane_id="lane-a",
+            worktree="/tmp/disposable-a", branch="factory/run-a",
+            safe_boundary="pre_dispatch", idempotency_key="run-a:leg-1",
+            required_capabilities=["prototype"],
+            compatible_profiles=["codex-primary"],
+            capacity_observation=observation, evaluator="test",
+            uncertainty={"irreversible_effect": "none"}, issued_at=100)
+        continuity.WorkBatonStore(self.db_path).issue(baton)
+        self.assertEqual(main(["--db", self.db_path, "baton", "inspect",
+                               "--baton-id", baton["baton_id"]]), 0)
 
 
 class ProductionCLITests(unittest.TestCase):

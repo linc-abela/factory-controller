@@ -578,9 +578,9 @@ BRIDGE_OBSERVATION_SCHEMA = "factory.bridge.capacity_observation.v1"
 #: account is not signed in" and "the harness could not be reached" are the
 #: same scheduling fact and different things for a person to fix.
 #:
-#: Nothing maps to ``constrained`` or ``exhausted``.  Their vocabulary cannot
-#: express either, so translating into one would be inventing a measurement --
-#: the same rule SF-136 applied to the Context Broker's ``unavailable``.
+#: The bridge's additive ``quota_state`` is a separate measured fact.  Only
+#: that field may produce ``cooling`` or ``exhausted``; readiness by itself
+#: never does, preserving the same rule SF-136 applied to the Context Broker.
 BRIDGE_READINESS = {
     "available": "available",
     "auth_required": "readiness_unavailable",
@@ -630,21 +630,38 @@ def observation_from_bridge_status(status: Mapping[str, Any], now: float,
         raise PolicyError("a bridge capacity status carries when it was observed")
     remaining = status.get("remaining_seconds")
     measured = isinstance(remaining, (int, float)) and not isinstance(remaining, bool)
+    quota_state = status.get("quota_state", "available" if measured else "unknown")
+    if quota_state not in ("available", "cooling", "exhausted", "unknown"):
+        raise PolicyError("unknown bridge quota state: %r" % (quota_state,))
+    translated = BRIDGE_READINESS[reported]
+    if translated == "available":
+        translated = {
+            "available": "available", "cooling": "cooling",
+            "exhausted": "exhausted", "unknown": "capacity_unmeasurable",
+        }[quota_state]
+    reset = status.get("expected_reset_at")
+    if reset is not None and (not isinstance(reset, (int, float))
+                              or isinstance(reset, bool)):
+        raise PolicyError("a bridge capacity status reset is numeric or absent")
+    if reset is None and measured and translated not in USABLE:
+        reset = float(observed_at) + float(remaining)
+    source_ref = status.get("source_ref") or "%s:%s" % (
+        BRIDGE_OBSERVATION_SCHEMA, status.get("observation_id") or reported)
     return CapacityObservation(
-        runtime_id=profile, state=BRIDGE_READINESS[reported],
+        runtime_id=profile, state=translated,
         observed_at=float(observed_at),
         source="factory_bridge_capacity_status",
-        source_ref="%s:%s" % (BRIDGE_OBSERVATION_SCHEMA,
-                              status.get("observation_id") or reported),
+        source_ref=source_ref,
         # Their window has a remaining *duration* rather than a reset instant,
         # so the reset is derived from the two numbers they did measure and is
         # never guessed when they measured neither.
-        expected_reset_at=(float(observed_at) + float(remaining)
-                           if measured and reported != "available" else None),
-        remaining_units=float(remaining) if measured else None,
-        unit="seconds" if measured else None,
-        precision="exact" if measured else "unknown",
+        expected_reset_at=reset,
+        remaining_units=(float(remaining) if measured and translated in USABLE
+                         else None),
+        unit="seconds" if measured and translated in USABLE else None,
+        precision="exact" if measured and translated in USABLE else "unknown",
         detail={"reported_classification": reported,
+                "reported_quota_state": quota_state,
                 "reported_state": _absent(state, "unknown"),
                 "stale_after_seconds": _absent(status.get("stale_after_seconds"),
                                                "not_measurable")})

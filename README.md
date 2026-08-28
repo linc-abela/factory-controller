@@ -97,6 +97,27 @@ it fails the next dispatch closed with `MISSION_BUDGET_CURRENCY_MISMATCH`.
 Provider figures are reported claims (`evidence_class: reported_claim`). They
 never decide candidate validity: Git and Evidence Core remain authoritative.
 
+### Capacity observations and Work Batons
+
+`factory_controller.capacity` records provider-neutral, sourced capacity facts.
+Managed runtimes treat stale, unknown, and unmeasurable observations as no
+positive capacity.  Its plan only denies profiles from a mission's already
+declared set, so it cannot add a metered fallback or become a second scheduler.
+
+`factory_controller.continuity` serializes a Work Baton at either a
+`pre_dispatch` or explicitly reconciled post-dispatch boundary.  Its immutable
+identity binds repository source and head, project, run, lane, worktree,
+branch, idempotency key, capabilities, compatible profiles, capacity,
+evaluator, and effect uncertainty.  The SQLite issue/consume ledger is
+restart-safe and exactly-once.  Operators can read its compact report with:
+
+```sh
+./dev baton inspect [--baton-id wb_...]
+```
+
+This is handoff plumbing for the capacity control plane; it cannot widen a
+capability, select a metered fallback, or act as a scheduler.
+
 ### Real missions
 
 A mission is a fixture mission unless it declares `execution_mode: real`, and the

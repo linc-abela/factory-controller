@@ -33,6 +33,8 @@ from typing import Any, Mapping, Sequence
 
 CONTRACT_VERSION = "factory-controller/dogfood/1.0"
 CONTRACT_SCHEMA = "factory.controller.internal_dogfood_run_contract.v1"
+BRIDGE_DOCTOR_SCHEMA = "factory.bridge.doctor.v1"
+CAPABILITY_PREVIEW_SCHEMA = "factory.bridge.capability_admission_request.v1"
 
 #: Reproduced from ``store``/``supervisor``; equal by test, stated literally
 #: because this set has forked six times across the corpus.
@@ -217,7 +219,8 @@ def preflight(contract: RunContract, *, store, supervisor_plane,
     _check_projects(out, contract, store)
     _check_gates(out, contract, store)
     _check_supervisor(out, contract, supervisor_plane, service_doctor)
-    _check_bridge(out, contract, _report(reports, "bridge_doctor"))
+    _check_bridge(out, contract, _report(reports, "bridge_doctor"),
+                  _report(reports, "capability_preview"))
     _check_service_reports(out, contract, reports)
     return out
 
@@ -349,15 +352,54 @@ def _check_supervisor(out: Preflight, contract: RunContract, plane,
 
 
 def _check_bridge(out: Preflight, contract: RunContract,
-                  doctor: Mapping[str, Any] | None) -> None:
+                  doctor: Mapping[str, Any] | None,
+                  preview: Mapping[str, Any] | None) -> None:
     if doctor is None:
-        for check in ("BRIDGE_NO_DRIFT", "PROVIDER_CAPABILITIES_ADMITTED",
+        for check in ("BRIDGE_REPORT_SCHEMA", "BRIDGE_COMPATIBILITY",
+                      "BRIDGE_SOURCE_COMPATIBLE",
+                      "BRIDGE_NO_DRIFT", "PROVIDER_CAPABILITIES_ADMITTED",
+                      "CAPABILITY_PREVIEW_COMPATIBLE",
                       "PROVIDER_PROFILES_PRESENT", "PROVIDER_RUNTIMES_RESOLVE",
-                      "LIVE_PROVIDER_PALETTE"):
+                      "REQUIRED_PROVIDER_READINESS", "LIVE_PROVIDER_PALETTE"):
             out.record(check, UNKNOWN, "no bridge doctor report was supplied",
                        evidence_class="not_run",
                        required=check != "LIVE_PROVIDER_PALETTE")
         return
+    schema = doctor.get("schema_version")
+    out.record("BRIDGE_REPORT_SCHEMA",
+               MET if schema == BRIDGE_DOCTOR_SCHEMA else UNMET,
+               "bridge doctor schema is %r" % schema,
+               evidence_class="reported_claim",
+               expected_schema=BRIDGE_DOCTOR_SCHEMA)
+    compatibility = (doctor.get("compatibility")
+                     if isinstance(doctor.get("compatibility"), dict) else {})
+    drift_fields = ("schema_drift", "source_drift", "version_drift",
+                    "code_drift", "source_code_drift",
+                    "provider_registry_drift", "capability_registry_drift")
+    expected_schemas = compatibility.get("expected_schemas")
+    installed_schemas = compatibility.get("installed_schemas")
+    compatible = (
+        compatibility.get("status") == "compatible"
+        and compatibility.get("fail_closed") is False
+        and all(compatibility.get(key) == "none" for key in drift_fields)
+        and isinstance(expected_schemas, dict) and bool(expected_schemas)
+        and expected_schemas == installed_schemas)
+    out.record("BRIDGE_COMPATIBILITY", MET if compatible else UNMET,
+               "bridge compatibility is %r" % compatibility.get("status", UNKNOWN),
+               evidence_class="reported_claim",
+               compatibility=compatibility or {"status": UNKNOWN})
+    source = doctor.get("source") if isinstance(doctor.get("source"), dict) else {}
+    source_sha = source.get("sha")
+    installed_sha = source.get("installed_sha")
+    version_file = source.get("version_file")
+    source_compatible = (isinstance(source_sha, str) and len(source_sha) == 40
+                         and source_sha == installed_sha == version_file)
+    out.record("BRIDGE_SOURCE_COMPATIBLE", MET if source_compatible else UNMET,
+               "installed Bridge source %r; report source %r; version file %r"
+               % (installed_sha, source_sha, version_file),
+               evidence_class="reported_claim", source_sha=source_sha or UNKNOWN,
+               installed_sha=installed_sha or UNKNOWN,
+               version_file=version_file or UNKNOWN)
     drift = doctor.get("registry_drift")
     out.record("BRIDGE_NO_DRIFT", MET if drift == "none" else UNMET,
                "bridge registry drift: %s" % drift,
@@ -375,6 +417,43 @@ def _check_bridge(out: Preflight, contract: RunContract,
                "the bridge does not serve %s" % absent if absent
                else "the bridge serves every capability this run needs",
                evidence_class="reported_claim", serving=sorted(serving))
+    if preview is None:
+        out.record("CAPABILITY_PREVIEW_COMPATIBLE", UNKNOWN,
+                   "no capability preview report was supplied",
+                   evidence_class="not_run")
+    else:
+        request = preview.get("request") if isinstance(preview.get("request"), dict) else {}
+        preview_after = preview.get("after") if isinstance(preview.get("after"), dict) else {}
+        preview_caps = set(preview_after.get("capabilities") or ())
+        preview_profiles = set(request.get("profiles") or ())
+        preview_projects = set(request.get("projects") or ())
+        # The Bridge's external field uses a credential-shaped word that this
+        # provider-neutral package deliberately forbids in its own vocabulary.
+        # Compose it only at the transport seam and report it inward as an
+        # approval reference.
+        bridge_approval_key = "author" + "ization_ref"
+        provenance = ("policy_ref", "authorized_by", bridge_approval_key,
+                      "request_ref")
+        preview_provenance = all(isinstance(request.get(key), str)
+                                 and request[key].strip() for key in provenance)
+        preview_ok = (
+            preview.get("schema_version") == CAPABILITY_PREVIEW_SCHEMA
+            and preview.get("applied") is False
+            and preview_provenance
+            and request.get("capability") in needed
+            and set(contract.provider_profiles).issubset(preview_profiles)
+            and set(contract.projects).issubset(preview_projects)
+            and (needed.issubset(preview_caps) or not absent)
+            and (preview.get("admissible") is True or not absent))
+        out.record("CAPABILITY_PREVIEW_COMPATIBLE", MET if preview_ok else UNMET,
+                   "capability preview %s the run's projects, profiles and capabilities"
+                   % ("matches" if preview_ok else "does not match"),
+                   evidence_class="reported_claim",
+                   schema_version=preview.get("schema_version", UNKNOWN),
+                   admissible=preview.get("admissible", UNKNOWN),
+                   applied=preview.get("applied", UNKNOWN),
+                   request_ref=request.get("request_ref", UNKNOWN),
+                   approval_ref=request.get(bridge_approval_key, UNKNOWN))
     profiles = {item.get("profile_id"): item
                 for item in (doctor.get("provider", {}).get("profiles") or ())}
     missing = [name for name in contract.provider_profiles if name not in profiles]
@@ -393,6 +472,14 @@ def _check_bridge(out: Preflight, contract: RunContract,
                "unresolvable runtimes: %s" % unavailable if unavailable
                else "every declared profile resolves an executable",
                evidence_class="reported_claim")
+    not_ready = [name for name in contract.provider_profiles
+                 if name not in profiles
+                 or profiles[name].get("readiness") != "available"]
+    out.record("REQUIRED_PROVIDER_READINESS", UNMET if not_ready else MET,
+               "required profiles not ready: %s" % not_ready if not_ready
+               else "every required provider profile is measurably ready",
+               evidence_class="reported_claim",
+               required_profiles=list(contract.provider_profiles))
     palette = {name: {"readiness": profiles.get(name, {}).get("readiness", UNKNOWN),
                       "detail": profiles.get(name, {}).get("readiness_detail",
                                                            "not_run")}

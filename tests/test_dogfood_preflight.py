@@ -26,22 +26,46 @@ CONTRACT_PATH = (Path(__file__).resolve().parent.parent / "contracts"
                  / "internal-dogfood-run-contract.json")
 
 BRIDGE_DOCTOR = {
+    "schema_version": dogfood.BRIDGE_DOCTOR_SCHEMA,
+    "compatibility": {"status": "compatible", "fail_closed": False,
+                      "schema_drift": "none", "source_drift": "none",
+                      "version_drift": "none", "code_drift": "none",
+                      "source_code_drift": "none",
+                      "provider_registry_drift": "none",
+                      "capability_registry_drift": "none",
+                      "expected_schemas": {"protocol": "1.0"},
+                      "installed_schemas": {"protocol": "1.0"}},
     "registry_drift": "none",
-    "source": {"installed_sha": "a" * 40, "sha": "a" * 40},
+    "source": {"installed_sha": "a" * 40, "sha": "a" * 40,
+               "version_file": "a" * 40},
     "capabilities": ["prototype"],
     "capability_admissions": {"serving": ["bug", "prototype"]},
     "provider": {"profiles": [
         {"profile_id": "codex-primary", "status": "available",
          "readiness": "available", "readiness_detail": "readiness probe exited 0"},
         {"profile_id": "claude-secondary", "status": "available",
-         "readiness": "not_probed", "readiness_detail": "no probe"},
+         "readiness": "available", "readiness_detail": "readiness probe exited 0"},
         {"profile_id": "cursor-secondary", "status": "available",
          "readiness": "unavailable", "readiness_detail": "readiness probe exited 1"},
     ]},
 }
 
+CAPABILITY_PREVIEW = {
+    "schema_version": dogfood.CAPABILITY_PREVIEW_SCHEMA,
+    "request": {"capability": "bug",
+                "profiles": ["codex-primary", "claude-secondary"],
+                "projects": ["factory-prototype-lab", "factory-bug-lab"],
+                "policy_ref": "vault://stage-9/capabilities",
+                "authorized_by": "owner",
+                "authorization_ref": "notion://SF-142",
+                "request_ref": "SF-142-bug"},
+    "admissible": True, "applied": False,
+    "after": {"capabilities": ["prototype", "bug"]},
+}
+
 HEALTHY = {"evidence_core": {"status": "ACCEPTED", "identity": "e" * 40},
-           "context_broker": {"status": "ok", "identity": "c" * 40}}
+           "context_broker": {"status": "ok", "identity": "c" * 40},
+           "capability_preview": CAPABILITY_PREVIEW}
 
 
 def payload(**overrides) -> dict:
@@ -194,6 +218,38 @@ class PreflightTests(PreflightCase):
         row = self.run_preflight(reports={"bridge_doctor": doctor, **HEALTHY})
         self.assertEqual(self.state(row, "BRIDGE_NO_DRIFT"), dogfood.UNMET)
 
+    def test_stale_installed_bridge_is_refused_even_when_registry_has_no_drift(self):
+        self.provision()
+        doctor = {**BRIDGE_DOCTOR,
+                  "source": {**BRIDGE_DOCTOR["source"],
+                             "installed_sha": "b" * 40,
+                             "version_file": "b" * 40}}
+        row = self.run_preflight(reports={"bridge_doctor": doctor, **HEALTHY})
+        self.assertEqual(self.state(row, "BRIDGE_NO_DRIFT"), dogfood.MET)
+        self.assertEqual(self.state(row, "BRIDGE_SOURCE_COMPATIBLE"), dogfood.UNMET)
+        self.assertFalse(row["ready"])
+
+    def test_bridge_compatibility_unknown_fails_closed(self):
+        self.provision()
+        doctor = {**BRIDGE_DOCTOR, "compatibility": {"status": "unknown",
+                                                     "fail_closed": True}}
+        row = self.run_preflight(reports={"bridge_doctor": doctor, **HEALTHY})
+        self.assertEqual(self.state(row, "BRIDGE_COMPATIBILITY"), dogfood.UNMET)
+
+    def test_required_profiles_each_need_measured_readiness(self):
+        self.provision()
+        doctor = json.loads(json.dumps(BRIDGE_DOCTOR))
+        doctor["provider"]["profiles"][1]["readiness"] = "not_probed"
+        row = self.run_preflight(reports={"bridge_doctor": doctor, **HEALTHY})
+        self.assertEqual(self.state(row, "REQUIRED_PROVIDER_READINESS"), dogfood.UNMET)
+
+    def test_capability_preview_is_explicit_and_never_applies_authority(self):
+        self.provision()
+        reports = {"bridge_doctor": BRIDGE_DOCTOR, **HEALTHY}
+        reports["capability_preview"] = {**CAPABILITY_PREVIEW, "applied": True}
+        row = self.run_preflight(reports=reports)
+        self.assertEqual(self.state(row, "CAPABILITY_PREVIEW_COMPATIBLE"), dogfood.UNMET)
+
     def test_cursor_never_blocks_the_deterministic_preflight(self):
         """Scope 8: optional, classified accurately, and never fabricated."""
 
@@ -207,7 +263,7 @@ class PreflightTests(PreflightCase):
         self.assertEqual(palette["palette"]["cursor-secondary"]["readiness"],
                          "unavailable")
         self.assertEqual(palette["palette"]["claude-secondary"]["readiness"],
-                         "not_probed")
+                         "available")
         self.assertTrue(row["ready"])
 
     def test_a_work_class_outside_the_contract_is_unmet(self):
