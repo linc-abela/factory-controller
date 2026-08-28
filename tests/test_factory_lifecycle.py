@@ -32,6 +32,7 @@ class FakeHost:
         self.installed = False
         self.containment = True
         self.primary_ready = True
+        self.capacity_fresh = True
         self.source_drift = False
         self.capability_admitted = False
         self.loaded = {config.legacy_label}
@@ -93,6 +94,8 @@ class FakeHost:
             self.capability_admits += 1
             return HostCommandResult(0, json.dumps({"outcome": "admitted"}))
         if arguments == ("capacity", "status", "codex-primary"):
+            if not self.capacity_fresh:
+                return HostCommandResult(1, json.dumps({"state": "absent"}))
             return HostCommandResult(0, json.dumps({
                 "schema_version": "factory.bridge.capacity_observation.v1",
                 "profile_id": "codex-primary",
@@ -287,6 +290,17 @@ class FactoryLifecycleTests(unittest.TestCase):
         blocked = self.lifecycle.dispatch("start")
         self.assertFalse(blocked.ok)
         self.assertIn("sandbox containment", blocked.render().lower())
+        self.assertEqual(self.lifecycle.shift.grants(), [])
+
+    def test_capacity_failure_does_not_admit_the_next_capability(self):
+        self.assertTrue(self.lifecycle.dispatch("install").ok)
+        self.host.capacity_fresh = False
+
+        result = self.lifecycle.dispatch("start")
+
+        self.assertFalse(result.ok)
+        self.assertIn("capacity is unavailable", result.render().lower())
+        self.assertEqual(self.host.capability_admits, 0)
         self.assertEqual(self.lifecycle.shift.grants(), [])
 
     def test_optional_profiles_do_not_gate_a_ready_primary(self):

@@ -230,10 +230,10 @@ class FactoryLifecycle:
             "request_ref": request_ref,
             "scope": "first internal dogfood",
         })
-        doctor, capability_preview = self._admit_required_capability(
-            contract, doctor, approval_ref)
         self._provision_store(contract, entry, doctor)
         readings = self._refresh_capacity(contract)
+        doctor, capability_preview = self._admit_required_capability(
+            contract, doctor, approval_ref)
         plan = self._install_supervisor_definition()
         service_doctor = activation.doctor(plan)
         facts, request, gate_preview = self._shift_gate_inputs(
