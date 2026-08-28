@@ -5,10 +5,12 @@ from __future__ import annotations
 import json
 import tempfile
 import unittest
+from contextlib import redirect_stdout
+from io import StringIO
 from pathlib import Path
 
 from factory_controller.cli import main
-from factory_controller import capacity, continuity
+from factory_controller import capacity, continuity, shift
 from factory_controller.store import MissionStore
 
 
@@ -61,6 +63,35 @@ class ControllerCLITests(unittest.TestCase):
         continuity.WorkBatonStore(self.db_path).issue(baton)
         self.assertEqual(main(["--db", self.db_path, "baton", "inspect",
                                "--baton-id", baton["baton_id"]]), 0)
+
+    def run_json(self, *argv):
+        output = StringIO()
+        with redirect_stdout(output):
+            code = main(["--db", self.db_path, *argv])
+        return code, json.loads(output.getvalue())
+
+    def test_shift_runtime_status_is_observational(self) -> None:
+        code, row = self.run_json("shift-runtime", "status")
+        self.assertEqual(code, 0)
+        self.assertEqual(row["state"], "stopped")
+        self.assertTrue(row["cold_start"])
+        self.assertFalse(row["conversation_state_used"])
+        self.assertEqual(row["checkpoint_count"], 0)
+        self.assertEqual(shift.ShiftPlane(MissionStore(self.db_path)).grants(), [])
+
+    def test_shift_preview_includes_runtime_projection_without_granting(self) -> None:
+        root = Path(__file__).resolve().parent.parent
+        code, row = self.run_json(
+            "shift", "preview",
+            "--contract", str(root / "contracts" / "internal-dogfood-run-contract.json"),
+            "--portfolio", str(root / "contracts" / "first-dogfood-mission-portfolio.json"),
+        )
+        self.assertEqual(code, 1)
+        self.assertIn("runtime", row)
+        self.assertTrue(row["runtime"]["status"]["cold_start"])
+        self.assertFalse(row["runtime"]["status"]["conversation_state_used"])
+        self.assertEqual(row["runtime"]["resume_preview"]["plans"], [])
+        self.assertIsNone(shift.ShiftPlane(MissionStore(self.db_path)).grant())
 
 
 class ProductionCLITests(unittest.TestCase):

@@ -9,7 +9,7 @@ from pathlib import Path
 
 from factory_controller import capacity, continuity, portfolio, shift_runtime
 from factory_controller.engine import Controller, RetryPolicy
-from factory_controller.store import MissionStore
+from factory_controller.store import MissionStore, TERMINAL as LEDGER_TERMINAL
 
 from tests.support import ALPHA, BETA, Clock, LayerAdapter, ProcessDeath
 
@@ -56,6 +56,12 @@ class ShiftRuntimeTests(unittest.TestCase):
 
     def runtime(self, controller=None) -> shift_runtime.ShiftRuntime:
         return shift_runtime.ShiftRuntime(controller or self.controller)
+
+    def test_terminal_states_are_derived_from_the_mission_ledger(self):
+        self.assertEqual(
+            shift_runtime.TERMINAL_STATES,
+            frozenset(LEDGER_TERMINAL) | {"escalated"},
+        )
 
     def test_checkpoint_is_deterministic_and_resume_package_is_selective(self):
         mission_id = self.submit("checkpoint")

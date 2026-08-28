@@ -24,6 +24,7 @@ from . import capacity
 from . import continuity
 from . import context as context_contract
 from . import supervisor
+from .store import TERMINAL as LEDGER_TERMINAL
 from .store import MissionStore, canonical_json
 
 
@@ -35,9 +36,10 @@ CANONICAL_ABSENCE = frozenset({
 })
 
 MISSION_STEPS = capacity.MISSION_STEPS
-TERMINAL_STATES = frozenset({
-    "completed", "refused", "failed", "cancelled", "escalated",
-})
+# The ledger owns ordinary terminal mission states.  Runtime adds only its
+# explicit escalation state, so this projection cannot silently drift when the
+# ledger vocabulary changes.
+TERMINAL_STATES = frozenset(LEDGER_TERMINAL) | {"escalated"}
 
 CHECKPOINT_FIELDS = (
     "schema_version", "mission_id", "project_id", "work_item_id",

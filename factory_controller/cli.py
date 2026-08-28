@@ -20,6 +20,7 @@ from . import portfolio
 from . import production
 from . import rehearsal
 from . import shift as shift_plane
+from . import shift_runtime
 from . import supervisor as sup
 from .adapter import JsonProcessAdapter
 from .engine import Controller, RetryPolicy
@@ -295,6 +296,18 @@ def parser() -> argparse.ArgumentParser:
                     default=str(Path.home() / "Library" / "LaunchAgents"))
     sh.add_argument("--state-dir", dest="sh_state_dir",
                     default=str(Path.home() / ".factory-controller"))
+
+    runtime = sub.add_parser(
+        "shift-runtime",
+        help="observe crash-safe runtime state; this is not shift governance")
+    runtime.add_argument("action", choices=("status", "resume-preview"),
+                         help="read runtime state without claiming or advancing work")
+    runtime.add_argument("--mission", dest="runtime_mission",
+                         help="limit the observation to one mission id")
+    runtime.add_argument("--project", dest="runtime_project",
+                         help="limit the observation to one project")
+    runtime.add_argument("--target-profile", dest="runtime_profile",
+                         help="target the named compatible runtime in a resume preview")
 
     sup_parser = sub.add_parser("supervisor")
     sup_parser.add_argument("action", choices=(
@@ -924,6 +937,35 @@ def _shift_facts(args, controller, contract, entry):
     return facts, plane, readings, usable, denied
 
 
+def _shift_runtime(args, controller) -> int:
+    """Expose the runtime's observational seam without adding authority.
+
+    ``shift`` owns the Owner's grant and suspend decisions.  This distinct
+    command reaches the crash-safe runtime's status and cold-start resume
+    projection, both of which read durable state and never claim work.
+    """
+
+    runtime = shift_runtime.ShiftRuntime(controller)
+    try:
+        if args.action == "status":
+            result = runtime.status(
+                mission_id=args.runtime_mission,
+                project_id=args.runtime_project,
+            )
+        else:
+            result = runtime.resume_preview(
+                mission_id=args.runtime_mission,
+                target_profile=args.runtime_profile,
+            )
+    except shift_runtime.ShiftRefusal as refusal:
+        # Runtime refusals deliberately keep their flat row shape; governance
+        # refusals remain nested under ``refused`` in the shift CLI.
+        print(json.dumps(refusal.as_row(), sort_keys=True, default=str))
+        return 2
+    print(json.dumps(result, sort_keys=True, default=str))
+    return 0
+
+
 def _shift(args, controller) -> int:
     """The Owner's four acts and the readings behind them.  Nothing is started.
 
@@ -986,7 +1028,14 @@ def _shift(args, controller) -> int:
     approval = shift_plane.approval_record(args.sh_approval,
                                            request_ref=args.sh_request)
     if args.action == "preview":
-        print(json.dumps(plane.preview(facts, approval=approval), sort_keys=True))
+        result = plane.preview(facts, approval=approval)
+        runtime = shift_runtime.ShiftRuntime(
+            controller, supervisor_plane=ops)
+        result["runtime"] = {
+            "status": runtime.status(),
+            "resume_preview": runtime.resume_preview(),
+        }
+        print(json.dumps(result, sort_keys=True, default=str))
         return 0 if reading["ready"] else 1
     if args.action == "apply":
         try:
@@ -1195,6 +1244,8 @@ def main(argv: list[str] | None = None) -> int:
         return _dogfood(args, controller)
     elif args.command == "shift":
         return _shift(args, controller)
+    elif args.command == "shift-runtime":
+        return _shift_runtime(args, controller)
     elif args.command == "harness":
         ids = []
         for index in range(args.missions):

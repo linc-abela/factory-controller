@@ -24,6 +24,8 @@ for live mission state; Notion is not read by runtime code.
 ./dev --db controller.db advise --probe | --proposals FILE [--policy FILE]
 ./dev --db harness --missions 10
 ./dev --db controller.db supervisor status | brief | cycle --worker host
+./dev --db controller.db shift-runtime status
+./dev --db controller.db shift-runtime resume-preview
 ./dev test
 ./dev stage9
 ```
