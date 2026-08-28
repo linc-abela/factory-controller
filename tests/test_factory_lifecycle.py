@@ -245,6 +245,34 @@ class FactoryLifecycleTests(unittest.TestCase):
         self.assertEqual([row["detail"]["action"] for row in acts],
                          ["install", "start", "start", "stop", "stop"])
 
+    def test_start_repairs_partial_bridge_and_supervisor_activation(self):
+        installed = self.lifecycle.dispatch("install")
+        self.assertTrue(installed.ok, installed.render())
+        self.host.loaded.discard(self.config.bridge_label)
+        self.host.capability_admitted = False
+        self.host.loaded.discard(self.config.supervisor_label)
+
+        result = self.lifecycle.dispatch("start")
+
+        self.assertTrue(result.ok, result.render())
+        self.assertIn(self.config.bridge_label, self.host.loaded)
+        self.assertIn(self.config.supervisor_label, self.host.loaded)
+        self.assertEqual(self.host.capability_admits, 1)
+
+    def test_missing_owner_identity_blocks_before_host_inspection(self):
+        lifecycle = FactoryLifecycle(
+            self.lifecycle.controller,
+            config=self.config,
+            runner=self.host,
+            owner=OwnerIdentity(0, "root"),
+        )
+
+        result = lifecycle.dispatch("start")
+
+        self.assertFalse(result.ok)
+        self.assertIn("trusted local Owner identity", result.render())
+        self.assertEqual(self.host.calls, [])
+
     def test_start_fails_closed_for_source_drift_or_missing_containment(self):
         self.assertTrue(self.lifecycle.dispatch("install").ok)
 
