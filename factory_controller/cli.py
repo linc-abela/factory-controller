@@ -860,19 +860,19 @@ def _shift_facts(args, controller, contract, entry):
     for pair in args.sh_reports:
         name, _, path = pair.partition("=")
         if not path:
-            raise shift_plane.ShiftRefusal("SHIFT_REPORT_MALFORMED",
+            raise shift_plane.ShiftGovernanceRefusal("SHIFT_REPORT_MALFORMED",
                                            "expected NAME=PATH, got %r" % pair)
         try:
             reports[name] = json.loads(Path(path).read_text())
         except (OSError, ValueError) as exc:
-            raise shift_plane.ShiftRefusal("SHIFT_REPORT_UNREADABLE",
+            raise shift_plane.ShiftGovernanceRefusal("SHIFT_REPORT_UNREADABLE",
                                            "%s: %s" % (name, exc))
     reachable = None
     if args.sh_reachable:
         try:
             reachable = json.loads(Path(args.sh_reachable).read_text())
         except (OSError, ValueError) as exc:
-            raise shift_plane.ShiftRefusal("SHIFT_REACHABILITY_UNREADABLE",
+            raise shift_plane.ShiftGovernanceRefusal("SHIFT_REACHABILITY_UNREADABLE",
                                            str(exc))
     registry = reports.get("project_registry")
     registry = (registry or {}).get("projects") if isinstance(registry, dict) else None
@@ -968,7 +968,7 @@ def _shift(args, controller) -> int:
                                        resume_ref=args.sh_resume_ref or "",
                                        missions_in_flight=in_flight,
                                        actor=args.sh_actor)
-        except shift_plane.ShiftRefusal as refusal:
+        except shift_plane.ShiftGovernanceRefusal as refusal:
             print(json.dumps(refusal.as_row(), sort_keys=True))
             return 2
         print(json.dumps(result, sort_keys=True))
@@ -976,7 +976,7 @@ def _shift(args, controller) -> int:
     try:
         facts, ops, readings, usable, denied = _shift_facts(
             args, controller, contract, entry)
-    except shift_plane.ShiftRefusal as refusal:
+    except shift_plane.ShiftGovernanceRefusal as refusal:
         print(json.dumps(refusal.as_row(), sort_keys=True))
         return 2
     reading = shift_plane.gate(facts)
@@ -991,7 +991,7 @@ def _shift(args, controller) -> int:
     if args.action == "apply":
         try:
             result = plane.apply(facts, approval, actor=args.sh_actor)
-        except shift_plane.ShiftRefusal as refusal:
+        except shift_plane.ShiftGovernanceRefusal as refusal:
             print(json.dumps(refusal.as_row(), sort_keys=True))
             return 2
         print(json.dumps(result, sort_keys=True))

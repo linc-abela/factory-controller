@@ -148,7 +148,7 @@ class ShiftError(ValueError):
     """A shift request or portfolio the Controller will not read as authority."""
 
 
-class ShiftRefusal(Exception):
+class ShiftGovernanceRefusal(Exception):
     """One named refusal, carried far enough to outlive the transaction.
 
     Prefixed because the neighbours already own the bare names: the bridge owns
@@ -1109,7 +1109,7 @@ class ShiftPlane:
         existing = self.grant(request.request_ref)
         if existing is not None:
             if existing.revoked_at is not None:
-                raise ShiftRefusal(
+                raise ShiftGovernanceRefusal(
                     "SHIFT_GRANT_REVOKED",
                     "request %r was revoked at %.0f and cannot be re-applied; "
                     "a new decision needs a new request_ref"
@@ -1119,19 +1119,19 @@ class ShiftPlane:
                     "detail": "this request already holds a grant"}
         live = self.grant()
         if live is not None:
-            raise ShiftRefusal(
+            raise ShiftGovernanceRefusal(
                 "SHIFT_ALREADY_ACTIVE",
                 "request %r already holds a live grant; revoke it before "
                 "opening another shift" % live.request_ref,
                 request_ref=live.request_ref)
         reading = gate(facts)
         if not reading["ready"]:
-            raise ShiftRefusal(
+            raise ShiftGovernanceRefusal(
                 "SHIFT_GATE_UNMET",
                 "%d gate checks are not met" % len(reading["blockers"]),
                 blockers=reading["blockers"])
         if not approval.get("approved"):
-            raise ShiftRefusal(
+            raise ShiftGovernanceRefusal(
                 "SHIFT_UNAPPROVED",
                 "opening a shift needs a durable Owner approval; %s"
                 % approval.get("detail", "none was supplied"),
@@ -1178,7 +1178,7 @@ class ShiftPlane:
 
         grant = self.grant(request_ref)
         if grant is None:
-            raise ShiftRefusal("SHIFT_GRANT_UNKNOWN",
+            raise ShiftGovernanceRefusal("SHIFT_GRANT_UNKNOWN",
                                "no shift grant named %r" % request_ref)
         if grant.revoked_at is not None:
             return {"action": "revoke", "changed": False,
@@ -1206,19 +1206,19 @@ class ShiftPlane:
 
         grant = self.grant(request_ref)
         if grant is None:
-            raise ShiftRefusal("SHIFT_GRANT_UNKNOWN",
+            raise ShiftGovernanceRefusal("SHIFT_GRANT_UNKNOWN",
                                "no shift grant named %r" % request_ref)
         if grant.revoked_at is not None:
-            raise ShiftRefusal("SHIFT_GRANT_REVOKED",
+            raise ShiftGovernanceRefusal("SHIFT_GRANT_REVOKED",
                                "a revoked grant has nothing to suspend")
         if missions_in_flight:
-            raise ShiftRefusal(
+            raise ShiftGovernanceRefusal(
                 "SHIFT_DRAIN_REQUIRED",
                 "%d missions are still running; drain before suspending so "
                 "the handover describes a state that is actually true"
                 % missions_in_flight)
         if not resume_ref or not isinstance(resume_ref, str):
-            raise ShiftRefusal(
+            raise ShiftGovernanceRefusal(
                 "SHIFT_RESUME_REF_REQUIRED",
                 "a suspension names where the durable state is recorded, or "
                 "resuming would depend on somebody remembering it")
@@ -1245,10 +1245,10 @@ class ShiftPlane:
 
         grant = self.grant(request_ref)
         if grant is None:
-            raise ShiftRefusal("SHIFT_GRANT_UNKNOWN",
+            raise ShiftGovernanceRefusal("SHIFT_GRANT_UNKNOWN",
                                "no shift grant named %r" % request_ref)
         if grant.revoked_at is not None:
-            raise ShiftRefusal("SHIFT_GRANT_REVOKED",
+            raise ShiftGovernanceRefusal("SHIFT_GRANT_REVOKED",
                                "a revoked grant cannot be resumed; a new "
                                "decision needs a new request_ref")
         if grant.suspended_at is None:
