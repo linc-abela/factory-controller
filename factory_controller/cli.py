@@ -13,6 +13,7 @@ from . import activation
 from . import capacity
 from . import advisor as advisory
 from . import dogfood
+from . import factory as factory_lifecycle
 from . import continuity
 from . import improvement as imp
 from . import maintenance as mnt
@@ -363,6 +364,11 @@ def parser() -> argparse.ArgumentParser:
     sup_parser.add_argument("--apply", dest="sup_apply", action="store_true",
                             help="write the service files; without it nothing "
                                  "is written and the plan is printed")
+
+    factory_parser = sub.add_parser(
+        "factory", help="the bounded Owner install/start/stop/status surface")
+    factory_parser.add_argument(
+        "factory_action", choices=("install", "start", "stop", "status"))
     return p
 
 
@@ -1147,6 +1153,14 @@ def _improvement_policy(declared: dict) -> "imp.ImprovementPolicy":
 
 def main(argv: list[str] | None = None) -> int:
     args = parser().parse_args(argv)
+    if args.command == "factory":
+        lifecycle = factory_lifecycle.FactoryLifecycle(
+            Controller(MissionStore(args.db),
+                       JsonProcessAdapter(shlex.split(args.adapter)),
+                       retry_policy=RetryPolicy()))
+        result = lifecycle.dispatch(args.factory_action)
+        print(result.render())
+        return 0 if result.ok else 1
     controller = _controller(args)
     store = controller.store
     if args.command == "submit":

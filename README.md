@@ -30,6 +30,29 @@ for live mission state; Notion is not read by runtime code.
 ./dev stage9
 ```
 
+### Owner lifecycle
+
+The supported local Factory workflow is intentionally four commands. They are
+host-facing because Bridge and the supervisor use native macOS service
+integration; provider work remains contained by Bridge and verification stays
+in the repository containers.
+
+```text
+./dev factory install
+./dev factory start
+./dev factory stop
+./dev factory status
+```
+
+`install` validates and repairs the canonical Bridge, bootstraps its service,
+and writes the supervisor definition while leaving the Factory off. `start`
+refreshes the required primary runtime and capacity facts, previews the
+first-dogfood capability and bounded shift, then applies both only when every
+gate is met. `stop` revokes admission, checkpoints and drains resumable work,
+then unloads Factory services. Repeating any command is safe and status is
+read-only. Normal output is `FACTORY INSTALLED`, `FACTORY READY`, `FACTORY
+OFF`, or one actionable `BLOCKED: ...` line.
+
 The default adapter is a token-free safe local process. Supply `--adapter` with
 a JSON process that composes the frozen admission/bridge/verification/Evidence
 Core seams. Each request contains `step`, deterministic `operation_key`, and
