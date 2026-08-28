@@ -49,9 +49,10 @@ and writes the supervisor definition while leaving the Factory off. `start`
 refreshes the required primary runtime and capacity facts, previews the
 first-dogfood capability and bounded shift, then applies both only when every
 gate is met. `stop` revokes admission, checkpoints and drains resumable work,
-then unloads Factory services. Repeating any command is safe and status is
-read-only. Normal output is `FACTORY INSTALLED`, `FACTORY READY`, `FACTORY
-OFF`, or one actionable `BLOCKED: ...` line.
+then unloads the Factory supervisor while leaving a healthy Bridge loaded.
+Repeating any command is safe and status is read-only. Normal output is
+`FACTORY INSTALLED`, `FACTORY READY`, `FACTORY OFF`, or one actionable
+`BLOCKED: ...` line.
 
 The default adapter is a token-free safe local process. Supply `--adapter` with
 a JSON process that composes the frozen admission/bridge/verification/Evidence

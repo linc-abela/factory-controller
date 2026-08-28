@@ -97,12 +97,20 @@ class ServicePlan:
         return str(Path(self.state_dir) / "supervisor.log")
 
     @property
+    def interpreter(self) -> str:
+        """The executable the host scheduler will restart for every cycle."""
+
+        value = self.invocation[0]
+        return value if Path(value).is_absolute() else "unknown"
+
+    @property
     def digest(self) -> str:
         return hashlib.sha256(json.dumps(
             self.as_row(), sort_keys=True, separators=(",", ":")).encode()).hexdigest()
 
     def as_row(self) -> dict[str, Any]:
         return {"label": self.label, "invocation": list(self.invocation),
+                "interpreter": self.interpreter,
                 "interval_seconds": self.interval_seconds,
                 "agents_dir": self.agents_dir, "state_dir": self.state_dir,
                 "working_dir": self.working_dir}
@@ -221,6 +229,7 @@ def install(plan: ServicePlan, *, apply: bool = False,
         "definition_path": plan.definition_path,
         "definition_digest": hashlib.sha256(body.encode()).hexdigest(),
         "receipt_path": plan.receipt_path,
+        "interpreter": plan.interpreter,
         "previous_digest": (previous or {}).get("plan_digest", "not_applicable"),
         "outcome": "unchanged" if unchanged else "planned",
         "applied": False,
@@ -232,6 +241,7 @@ def install(plan: ServicePlan, *, apply: bool = False,
     Path(plan.state_dir).mkdir(parents=True, exist_ok=True)
     Path(plan.definition_path).write_text(body)
     receipt = {"plan_digest": plan.digest, "plan": plan.as_row(),
+               "interpreter": plan.interpreter,
                "definition_digest": result["definition_digest"],
                "definition_path": plan.definition_path,
                "installed_at": (clock or _now)()}
@@ -280,6 +290,7 @@ def doctor(plan: ServicePlan) -> dict[str, Any]:
             "whether the host scheduler holds this job is a host query this "
             "package does not make; the Owner's verify steps answer it",
         "invocation": list(plan.invocation),
+        "interpreter": plan.interpreter,
         "interval_seconds": plan.interval_seconds,
         "activation": activation_command(plan),
     }

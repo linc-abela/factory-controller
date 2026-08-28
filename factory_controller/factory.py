@@ -12,6 +12,8 @@ from __future__ import annotations
 import json
 import os
 import pwd
+import re
+import shutil
 import sys
 import time
 from dataclasses import dataclass, field
@@ -91,6 +93,7 @@ class FactoryConfig:
     interval_seconds: int = 300
     shift_duration_seconds: float = 4 * 3600.0
     request_prefix: str = "factory-shift"
+    python_path: Path | None = None
 
     @property
     def bridge_plist(self) -> Path:
@@ -99,6 +102,10 @@ class FactoryConfig:
     @property
     def bridge_socket(self) -> Path:
         return self.bridge_prefix / "run" / "factory.sock"
+
+    @property
+    def runtime_receipt_path(self) -> Path:
+        return self.state_dir / "supervisor-runtime.json"
 
     @classmethod
     def default(cls, db_path: str | Path | None = None) -> "FactoryConfig":
@@ -197,6 +204,7 @@ class FactoryLifecycle:
 
     def install(self) -> FactoryResult:
         self._require_owner()
+        self._resolve_supported_python()
         contract, entry = self._load_contract_and_portfolio()
         self._ensure_factory_off(unload_bridge=False)
         doctor = self._prepare_bridge(allow_install=True, load=True)
@@ -219,6 +227,7 @@ class FactoryLifecycle:
 
     def start(self) -> FactoryResult:
         self._require_owner()
+        self._resolve_supported_python()
         contract, entry = self._load_contract_and_portfolio()
         self._prepare_control_for_start()
         doctor = self._prepare_bridge(allow_install=False, load=True)
@@ -317,10 +326,10 @@ class FactoryLifecycle:
                 "DRAIN_INCOMPLETE",
                 "The Factory has not reached a safe stopped state. Retry the command.")
         self._bootout_if_loaded(self.config.supervisor_label)
-        self._bootout_if_loaded(self.config.bridge_label)
         self._bootout_if_loaded(self.config.legacy_label)
+        bridge = self._prepare_bridge(allow_install=False, load=True)
         if self._service_loaded(self.config.supervisor_label) \
-                or self._service_loaded(self.config.bridge_label):
+                or not self._service_loaded(self.config.bridge_label):
             raise FactoryRefusal(
                 "SERVICE_STOP_FAILED",
                 "The Factory services could not be stopped safely. Retry the command.")
@@ -328,7 +337,7 @@ class FactoryLifecycle:
         return FactoryResult(
             action="stop", ok=True, state="off",
             lines=("FACTORY OFF", "All state saved."),
-            details={"drain": drain},
+            details={"drain": drain, "bridge": bridge},
         )
 
     def status(self) -> FactoryResult:
@@ -618,9 +627,7 @@ class FactoryLifecycle:
         return contract, entry
 
     def _project_rows(self, contract, entry, doctor):
-        registry = (doctor.get("registry") or {})
-        rows = registry.get("projects") if isinstance(registry, Mapping) else None
-        by_id = {row.get("project_id"): row for row in (rows or ())
+        by_id = {row.get("project_id"): row for row in self._registry_rows(doctor)
                  if isinstance(row, Mapping)}
         missions_by_project: dict[str, list[Any]] = {}
         for mission in entry.missions:
@@ -712,8 +719,9 @@ class FactoryLifecycle:
                 self.store.set_runtime_policy(desired)
 
     def _service_plan(self) -> activation.ServicePlan:
+        interpreter = self._resolve_supported_python()
         invocation = (
-            sys.executable, "-m", "factory_controller.cli",
+            interpreter, "-m", "factory_controller.cli",
             "--db", str(Path(self.store.path).resolve()),
             "supervisor", "cycle",
         )
@@ -896,8 +904,8 @@ class FactoryLifecycle:
 
     def _refresh_capacity(self, contract):
         for profile in contract.provider_profiles:
-            result, status = self._bridge_json("capacity", "status", profile)
-            if result.returncode != 0 or status.get("state") != "fresh":
+            result, status = self._bridge_json("capacity", "observe", profile)
+            if result.returncode not in (0, 1) or status.get("state") != "fresh":
                 raise FactoryRefusal(
                     "CAPACITY_UNAVAILABLE",
                     "%s provider capacity is unavailable. Try again later."
@@ -924,17 +932,18 @@ class FactoryLifecycle:
     def _load_reports(self) -> dict[str, Mapping[str, Any]]:
         if self.reports is not None:
             return {name: dict(value) for name, value in self.reports.items()}
-        paths = {
-            "evidence_core": self.config.controller_root / "evidence" / "SF-142" /
-            "evidence-core-health.json",
-            "context_broker": self.config.controller_root / "evidence" / "SF-142" /
-            "context-broker-health.json",
+        roots = {
+            "evidence_core": self.config.controller_root.parent /
+            "factory-evidence-core",
+            "context_broker": self.config.controller_root.parent /
+            "factory-context-broker",
         }
         output: dict[str, Mapping[str, Any]] = {}
-        for name, path in paths.items():
+        for name, root in roots.items():
+            result = self._run((str(root / "dev"), "health"), cwd=root)
             try:
-                value = json.loads(path.read_text())
-            except (OSError, ValueError):
+                value = json.loads(result.stdout)
+            except (TypeError, ValueError):
                 continue
             if isinstance(value, dict):
                 output[name] = value
@@ -943,11 +952,8 @@ class FactoryLifecycle:
     def _remote_shas(self, entry, doctor) -> Mapping[str, Sequence[str]]:
         if self.remote_reachability is not None:
             return self.remote_reachability
-        by_id = {
-            row.get("project_id"): row
-            for row in ((doctor.get("registry") or {}).get("projects") or ())
-            if isinstance(row, Mapping)
-        }
+        by_id = {row.get("project_id"): row for row in self._registry_rows(doctor)}
+        advertised: dict[str, set[str]] = {}
         found: dict[str, list[str]] = {}
         for mission in entry.missions:
             source = mission.acceptance_gate_source
@@ -958,16 +964,18 @@ class FactoryLifecycle:
             shas = {mission.baseline_sha, source_sha}
             row = by_id.get(mission.project_id) or {}
             remote = str(row.get("repository_remote_url") or remote)
-            for sha in shas:
+            if remote not in advertised:
                 result = self._run(
-                    ("git", "ls-remote", remote, sha),
+                    ("git", "ls-remote", remote),
                     cwd=self.config.controller_root,
                 )
-                if result.returncode == 0 and any(
-                        line.split()[0] == sha
-                        for line in result.stdout.splitlines()
-                        if line.split()):
-                    found.setdefault(mission.project_id, []).append(sha)
+                advertised[remote] = {
+                    fields[0] for fields in
+                    (line.split() for line in result.stdout.splitlines())
+                    if result.returncode == 0 and len(fields) >= 2
+                }
+            for sha in shas & advertised[remote]:
+                found.setdefault(mission.project_id, []).append(sha)
         return {name: tuple(sorted(set(values))) for name, values in found.items()}
 
     def _shift_gate_inputs(self, contract, entry, doctor, service_doctor,
@@ -1001,7 +1009,7 @@ class FactoryLifecycle:
         capacity_readings = self.store.capacity_readings()
         project_registry = {
             row.get("project_id"): row
-            for row in ((doctor.get("registry") or {}).get("projects") or ())
+            for row in self._registry_rows(doctor)
             if isinstance(row, Mapping)
         }
         declared_gates = {}
@@ -1076,6 +1084,113 @@ class FactoryLifecycle:
                 except ValueError:
                     continue
         return "%s-%d" % (self.config.request_prefix, highest + 1)
+
+    @staticmethod
+    def _registry_rows(doctor: Mapping[str, Any]) -> tuple[Mapping[str, Any], ...]:
+        """Adapt the Bridge's two observed registry envelope shapes once."""
+
+        registry = doctor.get("registry")
+        if isinstance(registry, Mapping):
+            rows = registry.get("projects", registry.get("entries"))
+            if rows is None and registry and all(
+                    isinstance(value, Mapping) for value in registry.values()):
+                rows = registry
+        elif isinstance(registry, list):
+            rows = registry
+        else:
+            rows = ()
+        if isinstance(rows, Mapping):
+            adapted = []
+            for project_id, value in rows.items():
+                if not isinstance(value, Mapping):
+                    continue
+                row = dict(value)
+                if not row.get("project_id") and isinstance(project_id, str):
+                    row["project_id"] = project_id
+                adapted.append(row)
+            rows = adapted
+        return tuple(row for row in rows or () if isinstance(row, Mapping))
+
+    def _resolve_supported_python(self) -> str:
+        """Resolve and persist one absolute Python >= 3.11 for the supervisor."""
+
+        configured = self.config.python_path
+        if configured is None:
+            configured_value = os.environ.get("FACTORY_CONTROLLER_PYTHON")
+            configured = Path(configured_value) if configured_value else None
+        explicit = configured is not None
+        candidates: list[Path] = []
+        if configured is not None:
+            if not configured.is_absolute():
+                raise FactoryRefusal(
+                    "SUPPORTED_PYTHON_UNAVAILABLE",
+                    "FACTORY_CONTROLLER_PYTHON must be an absolute executable path.")
+            candidates.append(configured)
+        else:
+            current = Path(sys.executable).resolve()
+            if sys.version_info >= (3, 11):
+                candidates.append(current)
+            for name in ("python3.14", "python3.13", "python3.12", "python3.11"):
+                found = shutil.which(name)
+                if found:
+                    candidates.append(Path(found))
+            uv_root = Path.home() / ".local" / "share" / "uv" / "python"
+            try:
+                candidates.extend(sorted(
+                    uv_root.glob("cpython-3.*-*/bin/python3.*"),
+                    key=lambda path: str(path), reverse=True))
+            except OSError:
+                pass
+            try:
+                stored = json.loads(self.config.runtime_receipt_path.read_text())
+                previous = stored.get("interpreter")
+                if isinstance(previous, str) and previous:
+                    candidates.insert(0, Path(previous))
+            except (OSError, ValueError, TypeError):
+                pass
+
+        selected = None
+        seen: set[str] = set()
+        for candidate in candidates:
+            try:
+                resolved = str(candidate.resolve())
+            except OSError:
+                continue
+            if resolved in seen or not os.path.isfile(resolved) \
+                    or not os.access(resolved, os.X_OK):
+                continue
+            seen.add(resolved)
+            if self._python_version(resolved) >= (3, 11):
+                selected = resolved
+                break
+        if selected is None:
+            detail = ("Set FACTORY_CONTROLLER_PYTHON to an absolute Python 3.11+ "
+                      "executable path." if explicit else
+                      "Install or select a supported Python 3.11+ executable before retrying.")
+            raise FactoryRefusal("SUPPORTED_PYTHON_UNAVAILABLE", detail)
+        try:
+            self.config.state_dir.mkdir(parents=True, exist_ok=True)
+            self.config.runtime_receipt_path.write_text(json.dumps({
+                "schema_version": "factory.controller.runtime.v1",
+                "interpreter": selected,
+                "python": ".".join(map(str, self._python_version(selected))),
+            }, sort_keys=True, indent=2) + "\n")
+        except OSError:
+            raise FactoryRefusal(
+                "SUPERVISOR_RUNTIME_UNRECORDED",
+                "The supported supervisor interpreter could not be recorded safely.") from None
+        return selected
+
+    def _python_version(self, interpreter: str) -> tuple[int, int]:
+        if Path(interpreter).resolve() == Path(sys.executable).resolve():
+            return sys.version_info[:2]
+        result = self._run((interpreter, "-c",
+                            "import sys; print('%d.%d' % sys.version_info[:2])"),
+                           cwd=self.config.controller_root)
+        if result.returncode != 0:
+            return (0, 0)
+        match = re.fullmatch(r"(\d+)\.(\d+)", result.stdout.strip())
+        return (int(match.group(1)), int(match.group(2))) if match else (0, 0)
 
 
 __all__ = [

@@ -148,11 +148,12 @@ class ProviderNeutralityTests(unittest.TestCase):
         """The seam may send a credential it was handed.  It may not find one.
 
         Reading the environment belongs to the two execution-side modules and
-        nowhere else: `context_adapter.py` takes the broker command and paths
-        that way, and `safe_provider.py` takes its own local settings.  The
+        the native lifecycle edge: `context_adapter.py` takes the broker
+        command and paths that way, `safe_provider.py` takes its own local
+        settings, and `factory.py` accepts only a named interpreter path. The
         external seam is deliberately not on that list, so a token can only
         arrive as an argument from the operator -- which is what keeps it out of
-        durable state.  No module anywhere reads a keyring or a secrets file.
+        durable state. No module anywhere reads a keyring or a secrets file.
         """
 
         readers = set()
@@ -166,7 +167,7 @@ class ProviderNeutralityTests(unittest.TestCase):
             # rather than catch the thing it exists to catch.
             if {"environ", "environb", "getenv"} & set(code.split("\n")):
                 readers.add(path.name)
-        self.assertEqual(readers, {"context_adapter.py", "safe_provider.py"},
+        self.assertEqual(readers, {"context_adapter.py", "factory.py", "safe_provider.py"},
                          "unexpected environment readers: %s" % readers)
         self.assertFalse(readers & EXTERNAL_SEAM)
 

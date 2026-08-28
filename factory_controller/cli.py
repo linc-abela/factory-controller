@@ -1154,10 +1154,17 @@ def _improvement_policy(declared: dict) -> "imp.ImprovementPolicy":
 def main(argv: list[str] | None = None) -> int:
     args = parser().parse_args(argv)
     if args.command == "factory":
+        config = factory_lifecycle.FactoryConfig.default()
+        db_path = Path(args.db)
+        if args.db == "factory-controller.db":
+            db_path = config.state_dir / "factory-controller.db"
+        elif not db_path.is_absolute():
+            db_path = Path.cwd() / db_path
         lifecycle = factory_lifecycle.FactoryLifecycle(
-            Controller(MissionStore(args.db),
+            Controller(MissionStore(db_path),
                        JsonProcessAdapter(shlex.split(args.adapter)),
-                       retry_policy=RetryPolicy()))
+                       retry_policy=RetryPolicy()),
+            config=config)
         result = lifecycle.dispatch(args.factory_action)
         print(result.render())
         return 0 if result.ok else 1

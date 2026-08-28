@@ -93,7 +93,8 @@ class FakeHost:
             self.capability_admitted = True
             self.capability_admits += 1
             return HostCommandResult(0, json.dumps({"outcome": "admitted"}))
-        if arguments == ("capacity", "status", "codex-primary"):
+        if arguments in (("capacity", "observe", "codex-primary"),
+                         ("capacity", "status", "codex-primary")):
             if not self.capacity_fresh:
                 return HostCommandResult(1, json.dumps({"state": "absent"}))
             return HostCommandResult(0, json.dumps({
@@ -242,6 +243,11 @@ class FactoryLifecycleTests(unittest.TestCase):
         self.assertEqual(len(self.lifecycle.shift.grants()), 1)
         self.assertEqual(len(self.lifecycle.store.capacity_observations()), 1)
         self.assertIn("FACTORY OFF", stopped.render())
+        self.assertIn(self.config.bridge_label, self.host.loaded)
+        self.assertFalse(any(
+            command[:2] == ("launchctl", "bootout")
+            and command[2].endswith(self.config.bridge_label)
+            for command, _ in self.host.calls))
 
         acts = [row for row in self.lifecycle.store.coordination()
                 if row["reason"] == "FACTORY_OWNER_ACTION"]
@@ -319,6 +325,18 @@ class FactoryLifecycleTests(unittest.TestCase):
         blocked = self.lifecycle.dispatch("start")
         self.assertFalse(blocked.ok)
         self.assertIn("unavailable", blocked.render().lower())
+
+    def test_registry_shape_adapter_accepts_list_and_keyed_projects(self):
+        listed = FactoryLifecycle._registry_rows({
+            "registry": {"projects": [{"project_id": "listed"}]}})
+        keyed = FactoryLifecycle._registry_rows({
+            "registry": {"projects": {"keyed": {"resolution": "resolved"}}}})
+        entries = FactoryLifecycle._registry_rows({
+            "registry": {"entries": {"entry": {"project_id": "entry"}}}})
+
+        self.assertEqual(("listed",), tuple(row["project_id"] for row in listed))
+        self.assertEqual(("keyed",), tuple(row["project_id"] for row in keyed))
+        self.assertEqual(("entry",), tuple(row["project_id"] for row in entries))
 
 
 if __name__ == "__main__":
