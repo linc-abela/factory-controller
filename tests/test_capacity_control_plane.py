@@ -565,6 +565,72 @@ class OwnerBriefTests(PortfolioTestCase, unittest.TestCase):
         self.assertEqual(brief["next_eligible"], "not_applicable")
 
 
+class BridgeSeamTests(unittest.TestCase):
+    """The execution layer measures; this layer decides.  One translation.
+
+    ``factory-bridge`` grew its own ``capacity status`` reading in SF-142A with
+    a four-word readiness vocabulary. It is translated at the seam and never
+    carried inward, which is the rule SF-136 arrived at for the Context
+    Broker's ``unavailable``.
+    """
+
+    def status(self, **extra):
+        body = {"schema_version": capacity.BRIDGE_OBSERVATION_SCHEMA,
+                "profile_id": ALPHA, "classification": "available",
+                "observed_at": 1_000_000.0, "stale_after_seconds": 900,
+                "remaining_seconds": None, "source": "manual",
+                "observation_id": "d" * 64, "state": "fresh"}
+        body.update(extra)
+        return body
+
+    def test_an_available_window_with_a_measured_remainder_crosses_intact(self):
+        reading = capacity.observation_from_bridge_status(
+            self.status(remaining_seconds=1_200), 1_000_050.0)
+        self.assertEqual(reading.state, "available")
+        self.assertEqual((reading.remaining_units, reading.unit, reading.precision),
+                         (1_200.0, "seconds", "exact"))
+        self.assertEqual(reading.source, "factory_bridge_capacity_status")
+
+    def test_two_of_their_words_collapse_and_the_distinction_survives(self):
+        """One scheduling fact; two different things for a person to fix."""
+
+        for reported in ("auth_required", "unavailable"):
+            reading = capacity.observation_from_bridge_status(
+                self.status(classification=reported), 1_000_000.0)
+            self.assertEqual(reading.state, "readiness_unavailable")
+            self.assertEqual(reading.detail["reported_classification"], reported)
+
+    def test_no_bridge_word_is_ever_translated_into_a_measurement(self):
+        """Their vocabulary cannot express `constrained` or `exhausted`."""
+
+        produced = {capacity.observation_from_bridge_status(
+            self.status(classification=word, remaining_seconds=None), 1_000_000.0).state
+            for word in capacity.BRIDGE_READINESS}
+        self.assertEqual(produced & {"constrained", "exhausted"}, set())
+
+    def test_an_absent_record_is_an_absence_and_never_a_state(self):
+        """Fabricating `capacity_unmeasurable` would make unmanaged look measured."""
+
+        self.assertIsNone(capacity.observation_from_bridge_status(
+            {"state": "absent", "classification": "unmeasurable"}, 1_000_000.0))
+
+    def test_an_unreadable_record_does_become_an_observation(self):
+        """Something is there and it is wrong, which the scheduler should act on."""
+
+        reading = capacity.observation_from_bridge_status(
+            {"state": "invalid", "profile_id": ALPHA, "detail": "digest differs"},
+            1_000_000.0)
+        self.assertEqual(reading.state, "capacity_unmeasurable")
+        self.assertEqual(reading.source_ref, "bridge_record_invalid")
+
+    def test_an_unrecognised_schema_or_word_is_refused_rather_than_guessed(self):
+        for bad in ({"schema_version": "factory.bridge.capacity_observation.v2"},
+                    {"classification": "probably_fine"},
+                    {"observed_at": "recently"}):
+            with self.assertRaises(capacity.PolicyError):
+                capacity.observation_from_bridge_status(self.status(**bad), 1_000_000.0)
+
+
 class CapacityCLITests(unittest.TestCase):
     """The Owner's surface, including the two things it must not offer."""
 
@@ -591,6 +657,29 @@ class CapacityCLITests(unittest.TestCase):
     def test_a_measurement_with_no_provenance_is_refused_at_the_surface(self):
         self.assertEqual(self.run_cli("observe", "--runtime", ALPHA,
                                       "--state", "cooling", "--source", "owner"), 1)
+
+    def test_a_bridge_reading_is_ingested_through_the_seam(self):
+        import json
+        from pathlib import Path
+        path = Path(self.db).with_name("bridge-status.json")
+        path.write_text(json.dumps({
+            "schema_version": capacity.BRIDGE_OBSERVATION_SCHEMA,
+            "profile_id": ALPHA, "classification": "auth_required",
+            "observed_at": 1_000_000.0, "stale_after_seconds": 900,
+            "remaining_seconds": None, "source": "manual", "state": "fresh"}))
+        self.assertEqual(self.run_cli("observe", "--from-bridge", str(path)), 0)
+        store = MissionStore(self.db)
+        self.assertEqual(store.latest_observations()[ALPHA].state,
+                         "readiness_unavailable")
+
+    def test_ingesting_an_absent_bridge_record_writes_nothing(self):
+        import json
+        from pathlib import Path
+        path = Path(self.db).with_name("absent.json")
+        path.write_text(json.dumps({"state": "absent", "profile_id": ALPHA,
+                                    "classification": "unmeasurable"}))
+        self.assertEqual(self.run_cli("observe", "--from-bridge", str(path)), 1)
+        self.assertEqual(MissionStore(self.db).latest_observations(), {})
 
     def test_the_brief_exits_non_zero_when_no_runtime_is_usable(self):
         self.assertEqual(self.run_cli("policy", "--runtime", ALPHA), 0)

@@ -567,6 +567,89 @@ def plan(runtime_ids: Sequence[str], runtime_readings: Mapping[str, RuntimeReadi
                         min(resume_candidates) if resume_candidates else None)
 
 
+#: The execution layer's own capacity record, from ``factory-bridge``
+#: ``src/factory_bridge/continuity.py``.  Reproduced rather than imported:
+#: neither repository depends on the other, which is the point of the boundary.
+BRIDGE_OBSERVATION_SCHEMA = "factory.bridge.capacity_observation.v1"
+
+#: Their four readiness words to this module's six states.  Two of theirs
+#: collapse into one of mine, and the distinction is *kept* rather than lost:
+#: the original word is carried in the observation's detail, because "the
+#: account is not signed in" and "the harness could not be reached" are the
+#: same scheduling fact and different things for a person to fix.
+#:
+#: Nothing maps to ``constrained`` or ``exhausted``.  Their vocabulary cannot
+#: express either, so translating into one would be inventing a measurement --
+#: the same rule SF-136 applied to the Context Broker's ``unavailable``.
+BRIDGE_READINESS = {
+    "available": "available",
+    "auth_required": "readiness_unavailable",
+    "unavailable": "readiness_unavailable",
+    "unmeasurable": "capacity_unmeasurable",
+}
+
+
+def observation_from_bridge_status(status: Mapping[str, Any], now: float,
+                                   runtime_id: str | None = None
+                                   ) -> CapacityObservation | None:
+    """Read one ``factory-bridge capacity status`` reading as an observation.
+
+    This is the seam between the layer that can see a harness and the layer
+    that decides what runs.  ``None`` means the bridge holds no record at all,
+    which is a genuine absence and must not become a state: fabricating
+    ``capacity_unmeasurable`` for it would make an unregistered runtime look
+    measured-and-unreadable rather than simply unmanaged.
+
+    A record the bridge could not parse is different, and does become an
+    observation -- something is there and it is wrong, which is a fact the
+    scheduler should act on rather than ignore.
+    """
+
+    if not isinstance(status, dict):
+        raise PolicyError("a bridge capacity status is an object")
+    state = status.get("state")
+    if state == "absent":
+        return None
+    profile = runtime_id or status.get("profile_id")
+    if not isinstance(profile, str) or not profile:
+        raise PolicyError("a bridge capacity status names the profile it measured")
+    if state == "invalid":
+        return CapacityObservation(
+            runtime_id=profile, state="capacity_unmeasurable", observed_at=now,
+            source="factory_bridge_capacity_status",
+            source_ref="bridge_record_invalid",
+            detail={"detail": str(status.get("detail", "unknown"))[:256]})
+    schema = status.get("schema_version")
+    if schema != BRIDGE_OBSERVATION_SCHEMA:
+        raise PolicyError("unsupported bridge capacity schema: %r" % (schema,))
+    reported = status.get("classification")
+    if reported not in BRIDGE_READINESS:
+        raise PolicyError("unknown bridge readiness classification: %r" % (reported,))
+    observed_at = status.get("observed_at")
+    if not isinstance(observed_at, (int, float)) or isinstance(observed_at, bool):
+        raise PolicyError("a bridge capacity status carries when it was observed")
+    remaining = status.get("remaining_seconds")
+    measured = isinstance(remaining, (int, float)) and not isinstance(remaining, bool)
+    return CapacityObservation(
+        runtime_id=profile, state=BRIDGE_READINESS[reported],
+        observed_at=float(observed_at),
+        source="factory_bridge_capacity_status",
+        source_ref="%s:%s" % (BRIDGE_OBSERVATION_SCHEMA,
+                              status.get("observation_id") or reported),
+        # Their window has a remaining *duration* rather than a reset instant,
+        # so the reset is derived from the two numbers they did measure and is
+        # never guessed when they measured neither.
+        expected_reset_at=(float(observed_at) + float(remaining)
+                           if measured and reported != "available" else None),
+        remaining_units=float(remaining) if measured else None,
+        unit="seconds" if measured else None,
+        precision="exact" if measured else "unknown",
+        detail={"reported_classification": reported,
+                "reported_state": _absent(state, "unknown"),
+                "stale_after_seconds": _absent(status.get("stale_after_seconds"),
+                                               "not_measurable")})
+
+
 def observation_from_refusal(runtime_id: str, refusal_code: str | None, now: float,
                              *, expected_reset_at: float | None = None
                              ) -> CapacityObservation | None:

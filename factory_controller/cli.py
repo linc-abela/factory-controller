@@ -83,6 +83,10 @@ def parser() -> argparse.ArgumentParser:
                      default=capacity.DEFAULT_UNKNOWN_RESET_BACKOFF_SECONDS)
     cap.add_argument("--policy-version", dest="cap_policy_version", default="unset")
     cap.add_argument("--mission", dest="cap_mission")
+    cap.add_argument("--from-bridge", dest="cap_from_bridge", type=Path,
+                     help="a `factory-bridge capacity status` reading, as JSON; "
+                          "the layer that can see a harness measures, this one "
+                          "decides what runs")
 
     project = sub.add_parser("project")
     project.add_argument("action", choices=("register", "state", "list"))
@@ -607,6 +611,21 @@ def _capacity(args, controller) -> int:
         if args.action == "policies":
             print(json.dumps({key: value.as_row() for key, value
                               in store.runtime_policies().items()}, sort_keys=True))
+            return 0
+        if args.action == "observe" and args.cap_from_bridge is not None:
+            reading = capacity.observation_from_bridge_status(
+                json.loads(args.cap_from_bridge.read_text()), store.clock(),
+                args.cap_runtime)
+            if reading is None:
+                # The bridge holds no record for this profile.  Recording an
+                # absence as a state would make an unmanaged runtime look
+                # measured, so nothing is written and the caller is told.
+                print(json.dumps({"refused": {
+                    "code": "CAPACITY_OBSERVATION_ABSENT",
+                    "detail": "the execution layer holds no capacity record "
+                              "for this profile"}}, sort_keys=True))
+                return 1
+            print(json.dumps(store.observe_capacity(reading), sort_keys=True))
             return 0
         if args.action == "observe":
             row = store.observe_capacity(capacity.CapacityObservation(
