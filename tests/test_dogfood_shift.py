@@ -26,6 +26,7 @@ from pathlib import Path
 
 from factory_controller import (activation, advisor, capacity, dogfood,
                                 improvement, production, shift, supervisor)
+from factory_controller import shift_runtime
 from factory_controller import store as ledger
 
 from tests.test_stage9_supervisor import SupervisorCase
@@ -40,8 +41,7 @@ PORTFOLIO = shift.load_portfolio(str(PORTFOLIO_PATH))
 
 REACHABLE = {
     "factory-prototype-lab": ["229b923b050fe8a4450d5597d472157bd42c8647"],
-    "factory-bug-lab": ["4072bfd7c008d3b227e2e164ecbe6f58013c2733",
-                        "961a4c97d49183b5501f244ba48773d9f50953ae"],
+    "factory-bug-lab": ["4072bfd7c008d3b227e2e164ecbe6f58013c2733"],
 }
 
 REGISTRY = {
@@ -57,7 +57,7 @@ DECLARED_GATES = {
     "factory-bug-lab": {
         "acceptance_gate_ids": ["dev-check", "dev-test", "dev-reproduce"],
         "source": "https://github.com/linc-abela/factory-bug-lab.git"
-                  "@961a4c97d49183b5501f244ba48773d9f50953ae:dev"},
+                  "@4072bfd7c008d3b227e2e164ecbe6f58013c2733:dev"},
 }
 
 
@@ -147,11 +147,17 @@ class VocabularyTests(unittest.TestCase):
         """The bridge owns the bare names; every code here carries its layer."""
 
         codes = [refusal.code for refusal in (
-            shift.ShiftRefusal("SHIFT_GATE_UNMET", "x"),
-            shift.ShiftRefusal("SHIFT_ALREADY_ACTIVE", "x"),
-            shift.ShiftRefusal("SHIFT_DRAIN_REQUIRED", "x"))]
+            shift.ShiftGovernanceRefusal("SHIFT_GATE_UNMET", "x"),
+            shift.ShiftGovernanceRefusal("SHIFT_ALREADY_ACTIVE", "x"),
+            shift.ShiftGovernanceRefusal("SHIFT_DRAIN_REQUIRED", "x"))]
         for code in codes:
             self.assertTrue(code.startswith("SHIFT_"), code)
+
+    def test_governance_and_runtime_refusals_have_distinct_public_names(self):
+        self.assertFalse(hasattr(shift, "ShiftRefusal"))
+        self.assertTrue(hasattr(shift, "ShiftGovernanceRefusal"))
+        self.assertIsNot(shift.ShiftGovernanceRefusal,
+                         shift_runtime.ShiftRefusal)
 
 
 class PortfolioTests(unittest.TestCase):
@@ -325,16 +331,24 @@ class GateTests(unittest.TestCase):
                       [row["check"] for row in reading["blockers"]])
 
     def test_a_commit_only_this_host_holds_is_refused(self):
-        """The measured case: the bug lab's declared gate source is local-only."""
+        """A commit the project's remote cannot serve is refused.
+
+        SF-144 measured this against the bug lab's declared gate source, which
+        named ``961a4c97`` -- a commit that exists only in this host's working
+        copy.  SF-145 re-pointed that declaration at the mission's own baseline
+        ``4072bfd7``, which the remote does serve and which carries a
+        byte-identical ``dev`` script, so the *measured* instance is closed.
+        The check still has to fire, so the case is now constructed: an
+        operator's reading in which the bug lab's remote serves nothing.
+        """
 
         reachable = {"factory-prototype-lab": REACHABLE["factory-prototype-lab"],
-                     "factory-bug-lab": [
-                         "4072bfd7c008d3b227e2e164ecbe6f58013c2733"]}
+                     "factory-bug-lab": []}
         reading = shift.gate(facts(fetchable_shas=reachable))
         blocked = [row for row in reading["blockers"]
                    if row["check"] == "PORTFOLIO_SOURCES_FETCHABLE"]
         self.assertTrue(blocked)
-        self.assertIn("961a4c97", blocked[0]["detail"])
+        self.assertIn("4072bfd7", blocked[0]["detail"])
 
     def test_no_reachability_reading_is_unknown_not_met(self):
         reading = shift.gate(facts(fetchable_shas=None))
@@ -728,7 +742,7 @@ class PreviewApplyRevokeTests(PlaneCase):
         self.assertEqual(len(self.shift.grants()), 1)
 
     def test_apply_without_an_approval_is_refused(self):
-        with self.assertRaises(shift.ShiftRefusal) as caught:
+        with self.assertRaises(shift.ShiftGovernanceRefusal) as caught:
             self.shift.apply(facts(), shift.approval_record(
                 None, request_ref="SF-144-shift-1"))
         self.assertEqual(caught.exception.code, "SHIFT_UNAPPROVED")
@@ -737,7 +751,7 @@ class PreviewApplyRevokeTests(PlaneCase):
     def test_apply_against_an_unmet_gate_is_refused(self):
         pre = ready_preflight()
         pre["checks"][0]["state"] = dogfood.UNMET
-        with self.assertRaises(shift.ShiftRefusal) as caught:
+        with self.assertRaises(shift.ShiftGovernanceRefusal) as caught:
             self.shift.apply(facts(preflight=pre), self.approval())
         self.assertEqual(caught.exception.code, "SHIFT_GATE_UNMET")
 
@@ -746,14 +760,14 @@ class PreviewApplyRevokeTests(PlaneCase):
 
         pre = ready_preflight()
         pre["checks"][0]["state"] = dogfood.UNKNOWN
-        with self.assertRaises(shift.ShiftRefusal) as caught:
+        with self.assertRaises(shift.ShiftGovernanceRefusal) as caught:
             self.shift.apply(facts(preflight=pre), self.approval())
         self.assertEqual(caught.exception.code, "SHIFT_GATE_UNMET")
 
     def test_a_second_overlapping_shift_is_refused(self):
         self.shift.apply(facts(), self.approval())
         other = facts(request=request(request_ref="SF-144-shift-2"))
-        with self.assertRaises(shift.ShiftRefusal) as caught:
+        with self.assertRaises(shift.ShiftGovernanceRefusal) as caught:
             self.shift.apply(other, self.approval("SF-144-shift-2"))
         self.assertEqual(caught.exception.code, "SHIFT_ALREADY_ACTIVE")
 
@@ -771,7 +785,7 @@ class PreviewApplyRevokeTests(PlaneCase):
 
         self.shift.apply(facts(), self.approval())
         self.shift.revoke("SF-144-shift-1", reason="stop")
-        with self.assertRaises(shift.ShiftRefusal) as caught:
+        with self.assertRaises(shift.ShiftGovernanceRefusal) as caught:
             self.shift.apply(facts(), self.approval())
         self.assertEqual(caught.exception.code, "SHIFT_GRANT_REVOKED")
 
@@ -784,7 +798,7 @@ class PreviewApplyRevokeTests(PlaneCase):
         self.assertTrue(result["created"])
 
     def test_revoking_an_unknown_request_is_a_named_refusal(self):
-        with self.assertRaises(shift.ShiftRefusal) as caught:
+        with self.assertRaises(shift.ShiftGovernanceRefusal) as caught:
             self.shift.revoke("nobody", reason="x")
         self.assertEqual(caught.exception.code, "SHIFT_GRANT_UNKNOWN")
 
@@ -804,14 +818,14 @@ class SuspendResumeTests(PlaneCase):
 
     def test_suspend_requires_a_drained_shift(self):
         self.shift.apply(facts(), self.approval())
-        with self.assertRaises(shift.ShiftRefusal) as caught:
+        with self.assertRaises(shift.ShiftGovernanceRefusal) as caught:
             self.shift.suspend("SF-144-shift-1", resume_ref="vault://x",
                                missions_in_flight=2)
         self.assertEqual(caught.exception.code, "SHIFT_DRAIN_REQUIRED")
 
     def test_suspend_requires_somewhere_to_resume_from(self):
         self.shift.apply(facts(), self.approval())
-        with self.assertRaises(shift.ShiftRefusal) as caught:
+        with self.assertRaises(shift.ShiftGovernanceRefusal) as caught:
             self.shift.suspend("SF-144-shift-1", resume_ref="",
                                missions_in_flight=0)
         self.assertEqual(caught.exception.code, "SHIFT_RESUME_REF_REQUIRED")
@@ -842,7 +856,7 @@ class SuspendResumeTests(PlaneCase):
     def test_a_revoked_grant_cannot_be_resumed(self):
         self.shift.apply(facts(), self.approval())
         self.shift.revoke("SF-144-shift-1", reason="stop")
-        with self.assertRaises(shift.ShiftRefusal) as caught:
+        with self.assertRaises(shift.ShiftGovernanceRefusal) as caught:
             self.shift.resume("SF-144-shift-1")
         self.assertEqual(caught.exception.code, "SHIFT_GRANT_REVOKED")
 

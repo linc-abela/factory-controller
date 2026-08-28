@@ -267,7 +267,10 @@ class PreflightTests(PreflightCase):
     def test_required_profiles_each_need_measured_readiness(self):
         self.provision()
         doctor = json.loads(json.dumps(BRIDGE_DOCTOR))
-        doctor["provider"]["profiles"][1]["readiness"] = "not_probed"
+        # Index 0 is ``codex-primary``.  SF-145 narrowed the run contract's
+        # required set to that profile alone, so degrading index 1 no longer
+        # degrades a *required* profile and the check would stay met.
+        doctor["provider"]["profiles"][0]["readiness"] = "not_probed"
         row = self.run_preflight(reports={"bridge_doctor": doctor, **HEALTHY})
         self.assertEqual(self.state(row, "REQUIRED_PROVIDER_READINESS"), dogfood.UNMET)
 

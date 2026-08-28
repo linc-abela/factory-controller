@@ -12,10 +12,10 @@
     "improvement"
   ],
   "provider_profiles": [
-    "codex-primary",
-    "claude-secondary"
+    "codex-primary"
   ],
   "optional_providers": [
+    "claude-secondary",
     "cursor-secondary"
   ],
   "environment_classes": [
@@ -47,7 +47,7 @@
         "dev-test",
         "dev-reproduce"
       ],
-      "acceptance_gate_source": "https://github.com/linc-abela/factory-bug-lab.git@961a4c97d49183b5501f244ba48773d9f50953ae:dev"
+      "acceptance_gate_source": "https://github.com/linc-abela/factory-bug-lab.git@4072bfd7c008d3b227e2e164ecbe6f58013c2733:dev"
     }
   },
   "health_criteria": {
