@@ -32,7 +32,7 @@ for live mission state; Notion is not read by runtime code.
 
 ### Owner lifecycle
 
-The supported local Factory workflow is intentionally four commands. They are
+The supported local Factory workflow is intentionally five commands. They are
 host-facing because Bridge and the supervisor use native macOS service
 integration; provider work remains contained by Bridge and verification stays
 in the repository containers.
@@ -40,6 +40,7 @@ in the repository containers.
 ```text
 ./dev factory install
 ./dev factory start
+./dev factory run
 ./dev factory stop
 ./dev factory status
 ```
@@ -48,11 +49,17 @@ in the repository containers.
 and writes the supervisor definition while leaving the Factory off. `start`
 refreshes the required primary runtime and capacity facts, previews the
 first-dogfood capability and bounded shift, then applies both only when every
-gate is met. `stop` revokes admission, checkpoints and drains resumable work,
+gate is met. `run` submits the next mission of the frozen first-dogfood
+portfolio and no more than one: which mission is next is the portfolio's own
+serial rule read from durable state, and the mission's identity, live admission
+document, provider candidates and per-gate commands are all derived from the
+frozen contract, the frozen portfolio and Bridge's project registry, so the
+Owner names nothing. Repeating it while that mission is in flight reports it
+rather than submitting a second. `stop` revokes admission, checkpoints and drains resumable work,
 then unloads the Factory supervisor while leaving a healthy Bridge loaded.
 Repeating any command is safe and status is read-only. Normal output is
-`FACTORY INSTALLED`, `FACTORY READY`, `FACTORY OFF`, or one actionable
-`BLOCKED: ...` line.
+`FACTORY INSTALLED`, `FACTORY READY`, `FACTORY OFF`, `DOGFOOD MISSION QUEUED`,
+`DOGFOOD MISSION RUNNING`, or one actionable `BLOCKED: ...` line.
 
 The default adapter is a token-free safe local process. Supply `--adapter` with
 a JSON process that composes the frozen admission/bridge/verification/Evidence
@@ -64,7 +71,11 @@ idempotently. A genuine provider remains an explicit operator choice.
 Its mission payload names Evidence Core's public `first-live` command, working
 directory, output, admission fixture, and target repository. `mode: real`
 refuses unless `operator_opt_in: true`; the Controller itself never selects a
-provider or invents verification/evidence results.
+provider or invents verification/evidence results. A mission that declares no
+`stage1` configuration is served by the token-free fixture instead, which is
+what lets the supervisor service name this one adapter for both kinds of work.
+`./dev factory run` writes the admission document a dogfood mission names to
+`~/.factory-controller/dogfood/`.
 
 Lifecycle follows the landed `factory-controller/1.0` seam: `admitted ->
 dispatching -> dispatched -> candidate_verified -> evaluated -> evidence_sealed

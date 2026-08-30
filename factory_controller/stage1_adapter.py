@@ -26,6 +26,8 @@ import time
 from pathlib import Path
 from typing import Any
 
+from . import safe_provider
+
 
 def _stage1_config(request: dict[str, Any]) -> dict[str, Any]:
     config = _mission(request).get("stage1")
@@ -212,8 +214,15 @@ def execute(request: dict[str, Any]) -> dict[str, Any]:
 
 
 def main() -> int:
+    request = json.load(sys.stdin)
+    if not isinstance(_mission(request).get("stage1"), dict):
+        # A mission that declares no live execution configuration is not a
+        # live mission, and answering it here would put this seam's real
+        # provider path behind a mission that never asked for it.  The local
+        # fixture provider owns that case and refuses a real mission itself.
+        return safe_provider.main_with(request)
     try:
-        response = execute(json.load(sys.stdin))
+        response = execute(request)
     except (KeyError, TypeError, ValueError, OSError, subprocess.TimeoutExpired) as exc:
         response = {"status": "retryable_error", "diagnostic": f"STAGE1_ADAPTER_ERROR: {exc}"}
     json.dump(response, sys.stdout, sort_keys=True)

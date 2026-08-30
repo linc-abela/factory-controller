@@ -975,20 +975,41 @@ class ShiftPlane:
     def outcomes(self, portfolio_: Portfolio) -> dict[str, str]:
         """Each portfolio mission's durable state, or absence of one.
 
-        Keyed on the mission's idempotency key rather than its generated id: a
-        portfolio names work, and the key is the only identifier a portfolio
-        author can know before the mission exists.
+        Keyed on the mission reference rather than the generated mission id: a
+        portfolio names work, and the reference is the only identifier a
+        portfolio author can know before the mission exists.
+
+        A mission's key is either the reference itself or the reference
+        followed by its bound context identity.  Both forms are matched here
+        because a *real* mission has no choice about which one it carries:
+        ``routing.expected_idempotency_key`` mandates
+        ``work_item_id:context_manifest_hash`` and the evidence layer refuses
+        anything else, so matching only the bare reference would have made
+        every real dogfood mission invisible to the portfolio that ordered it --
+        the sequence would restart at its first mission forever.
         """
 
         refs = [mission.mission_ref for mission in portfolio_.missions]
         if not refs:
             return {}
-        marks = ",".join("?" * len(refs))
+        clause = " OR ".join(
+            ["idempotency_key=? OR idempotency_key LIKE ? ESCAPE '\\'"] * len(refs))
+        arguments: list[str] = []
+        for ref in refs:
+            arguments.extend(
+                (ref, ref.replace("\\", "\\\\").replace("%", "\\%")
+                 .replace("_", "\\_") + ":%"))
         with self._store.transaction() as db:
             rows = db.execute(
-                "SELECT idempotency_key, state FROM missions"
-                " WHERE idempotency_key IN (%s)" % marks, refs).fetchall()
-        return {row["idempotency_key"]: row["state"] for row in rows}
+                "SELECT idempotency_key, state FROM missions WHERE %s" % clause,
+                arguments).fetchall()
+        by_ref: dict[str, str] = {}
+        for row in rows:
+            key = row["idempotency_key"]
+            reference = key if key in refs else key.split(":", 1)[0]
+            if reference in refs:
+                by_ref[reference] = row["state"]
+        return by_ref
 
     def observe(self, portfolio_: Portfolio, *, control_state: str,
                 gate_ready: bool, capacity_readings: Mapping[str, Any] | None = None,

@@ -13,6 +13,7 @@ import json
 import os
 import pwd
 import re
+import shlex
 import shutil
 import sys
 import time
@@ -22,7 +23,9 @@ from typing import Any, Callable, Mapping, Sequence
 
 from . import activation
 from . import capacity
+from . import context
 from . import dogfood
+from . import dogfood_intake
 from . import improvement
 from . import portfolio
 from . import production
@@ -107,6 +110,14 @@ class FactoryConfig:
     def runtime_receipt_path(self) -> Path:
         return self.state_dir / "supervisor-runtime.json"
 
+    @property
+    def evidence_root(self) -> Path:
+        return self.controller_root.parent / "factory-evidence-core"
+
+    @property
+    def mission_dir(self) -> Path:
+        return self.state_dir / "dogfood"
+
     @classmethod
     def default(cls, db_path: str | Path | None = None) -> "FactoryConfig":
         controller_root = Path(__file__).resolve().parents[1]
@@ -183,6 +194,8 @@ class FactoryLifecycle:
                 return self.start()
             if action == "stop":
                 return self.stop()
+            if action == "run":
+                return self.run()
             if action == "status":
                 return self.status()
             raise FactoryRefusal("ACTION_UNKNOWN", "That Factory action is not supported.")
@@ -340,6 +353,188 @@ class FactoryLifecycle:
             details={"drain": drain, "bridge": bridge},
         )
 
+    def run(self) -> FactoryResult:
+        """Submit the next frozen dogfood mission, and no more than one.
+
+        The Owner names nothing.  Which mission comes next is the portfolio's
+        own serial rule, read from durable mission state; everything the
+        mission needs is derived from the frozen contract, the frozen portfolio
+        and the execution layer's own project registry.  Invoked again while
+        that mission is still in flight, this reports it rather than
+        submitting a second one -- the mission's identity is derived, so the
+        second submission would collide with the first by construction.
+        """
+
+        self._require_owner()
+        contract, entry = self._load_contract_and_portfolio()
+        grant = self.shift.grant()
+        control = self.supervisor.control()
+        if grant is None or control.get("state") != "running" \
+                or not self._service_loaded(self.config.supervisor_label):
+            raise FactoryRefusal(
+                "FACTORY_NOT_READY",
+                "The Factory is not running. Run './dev factory start' first.")
+        doctor = self._bridge_doctor()
+        # Containment and the primary provider first: both have their own plain
+        # reason, and the general "not ready" message would hide either one.
+        self._check_primary_and_containment(contract, doctor)
+        if not self._service_loaded(self.config.bridge_label) \
+                or not self._bridge_is_healthy(doctor):
+            code, detail = self._bridge_problem(doctor)
+            raise FactoryRefusal(code, detail)
+
+        outcomes = self.shift.outcomes(entry)
+        mission = entry.next_mission(outcomes)
+        if mission is None:
+            return FactoryResult(
+                action="run", ok=True, state="complete",
+                lines=("DOGFOOD PORTFOLIO COMPLETE",
+                       "Every mission in the first portfolio has settled.",
+                       "Run './dev factory status' to review the results."),
+                details={"outcomes": outcomes})
+        settled = outcomes.get(mission.mission_ref)
+        if settled is not None:
+            return FactoryResult(
+                action="run", ok=True,
+                state="running" if settled != "admitted" else "queued",
+                lines=(self._work_headline(settled),
+                       "Mission: " + mission.objective.split(".")[0].strip() + ".",
+                       "Project: " + mission.project_id,
+                       "Nothing more to do. Run './dev factory status' to check on it."),
+                details={"mission_ref": mission.mission_ref, "state": settled})
+
+        intake = self._materialize(contract, entry, mission, doctor, grant)
+        try:
+            _, created = self.controller.submit(
+                intake.payload, intake.idempotency_key)
+        except Exception as exc:  # noqa: BLE001
+            raise FactoryRefusal(
+                "MISSION_NOT_ADMITTED",
+                "The next dogfood mission was refused before it started: %s"
+                % type(exc).__name__) from None
+        self._record_owner_act("run", grant.approval_ref, {
+            "mission_ref": intake.mission_ref,
+            "project_id": intake.project_id,
+            "created": created,
+        })
+        return FactoryResult(
+            action="run", ok=True, state="queued" if created else "running",
+            lines=("DOGFOOD MISSION QUEUED" if created
+                   else "DOGFOOD MISSION RUNNING",
+                   "Mission: " + mission.objective.split(".")[0].strip() + ".",
+                   "Project: " + intake.project_id,
+                   "The Factory will pick it up on its next cycle. "
+                   "Run './dev factory status' to follow it."),
+            details={"mission_ref": intake.mission_ref,
+                     "project_id": intake.project_id,
+                     "created": created})
+
+    def _materialize(self, contract, entry, mission, doctor, grant):
+        """Derive the whole mission, and refuse rather than guess any part."""
+
+        registry = self._registry_rows(doctor)
+        registry_digest = (doctor.get("registry") or {}).get("digest") \
+            if isinstance(doctor.get("registry"), Mapping) else None
+        if not isinstance(registry_digest, str) or not registry_digest:
+            raise FactoryRefusal(
+                "PROJECT_REGISTRY_UNIDENTIFIED",
+                "The execution layer's project registry has no identity the "
+                "mission could be bound to. Run './dev factory install'.")
+        interpreter = self._resolve_supported_python()
+        try:
+            intake = dogfood_intake.build(
+                mission,
+                portfolio_ref=entry.portfolio_ref, run_ref=contract.run_ref,
+                registry=registry, registry_digest=registry_digest,
+                provider_profiles=contract.provider_profiles,
+                corpus_identity="contract://%s@%s"
+                                % (entry.portfolio_ref,
+                                   self._portfolio_identity()),
+                owner=self.owner.username,  # type: ignore[union-attr]
+                approval_ref=grant.approval_ref,
+                granted_at=grant.granted_at, expires_at=grant.expires_at,
+                now=self.clock(),
+                stage1={
+                    "command": [interpreter, "-m", "src.cli.first_live"],
+                    "workdir": str(self.config.evidence_root),
+                    "admission": str(self._mission_path(
+                        mission.mission_ref, "admission")),
+                    "output": str(self._mission_path(
+                        mission.mission_ref, "result")),
+                    "timeout_seconds": 3600,
+                    "gate_timeout_seconds": 1800,
+                },
+            )
+        except dogfood_intake.IntakeError as refusal:
+            raise FactoryRefusal(refusal.code, refusal.detail) from None
+        # Whether the local copy sits at the mission's baseline is a git fact,
+        # and git facts are the execution layer's to re-derive -- the
+        # Controller asking would be the second candidate-truth authority
+        # `tests/test_authority_boundaries.py` exists to prevent.
+        self._write_mission_file(mission.mission_ref, "admission", intake.admission)
+        return intake
+
+    def _portfolio_identity(self) -> str:
+        """The frozen portfolio's own content identity, not a claim about it."""
+
+        try:
+            body = self.config.portfolio_path.read_bytes()
+        except OSError:
+            raise FactoryRefusal(
+                "PORTFOLIO_UNAVAILABLE",
+                "The frozen first-dogfood portfolio is unavailable.") from None
+        return context.sha256_hex(body.decode("utf-8", "replace"))
+
+    def _mission_path(self, mission_ref: str, kind: str) -> Path:
+        return self.config.mission_dir / ("%s-%s.json" % (mission_ref.lower(), kind))
+
+    def _write_mission_file(self, mission_ref: str, kind: str,
+                            body: Mapping[str, Any]) -> None:
+        path = self._mission_path(mission_ref, kind)
+        try:
+            self.config.mission_dir.mkdir(parents=True, exist_ok=True)
+            path.write_text(json.dumps(body, sort_keys=True, indent=2) + "\n")
+            os.chmod(path, 0o600)
+        except OSError:
+            raise FactoryRefusal(
+                "MISSION_NOT_RECORDED",
+                "The next dogfood mission could not be recorded safely. "
+                "Retry the command.") from None
+
+    @staticmethod
+    def _work_headline(state: str) -> str:
+        if state == "admitted":
+            return "DOGFOOD MISSION QUEUED"
+        if state == "completed":
+            return "DOGFOOD MISSION COMPLETE"
+        if state in {"refused", "failed", "cancelled", "escalated"}:
+            return "DOGFOOD MISSION STOPPED"
+        return "DOGFOOD MISSION RUNNING"
+
+    def _work_summary(self) -> tuple[str, ...]:
+        """What the Owner needs to know about work, with no internal ids.
+
+        Read-only and refusal-free: a status that could not be printed because
+        the portfolio was unreadable would hide the rest of the state as well.
+        """
+
+        try:
+            _, entry = self._load_contract_and_portfolio()
+            outcomes = self.shift.outcomes(entry)
+        except FactoryRefusal:
+            return ("Work: unknown",)
+        pending = entry.next_mission(outcomes)
+        if pending is None:
+            return ("Work: every first-dogfood mission has settled",)
+        state = outcomes.get(pending.mission_ref)
+        if state is None:
+            return ("Work: none started",
+                    "Next: %s, in %s" % (pending.mission_ref, pending.project_id),
+                    "Run './dev factory run' to start it.")
+        return ("Work: %s in %s is %s"
+                % (pending.mission_ref, pending.project_id,
+                   "waiting to start" if state == "admitted" else state),)
+
     def status(self) -> FactoryResult:
         owner = self.owner
         if owner is None or not owner.valid():
@@ -391,7 +586,7 @@ class FactoryLifecycle:
                    "Shift: " + shift_summary,
                    "Supervisor: " + supervisor_summary,
                    "Bridge: " + bridge_summary,
-                   "Primary: " + primary),
+                   "Primary: " + primary) + self._work_summary(),
             details={"control": control, "grant": None if live is None else live.as_row(),
                      "bridge": doctor},
         )
@@ -720,9 +915,16 @@ class FactoryLifecycle:
 
     def _service_plan(self) -> activation.ServicePlan:
         interpreter = self._resolve_supported_python()
+        # The default step adapter is the token-free local fixture, which
+        # refuses a real mission by design.  A dogfood mission declares its own
+        # execution configuration, and the seam below serves the fixture path
+        # for any mission that does not -- so naming it here changes what a
+        # real mission reaches and nothing else.
         invocation = (
             interpreter, "-m", "factory_controller.cli",
             "--db", str(Path(self.store.path).resolve()),
+            "--adapter", "%s -m factory_controller.stage1_adapter"
+            % shlex.quote(interpreter),
             "supervisor", "cycle",
         )
         contract = self.supervisor.service_contract(
@@ -745,7 +947,12 @@ class FactoryLifecycle:
     def _install_supervisor_definition(self) -> activation.ServicePlan:
         plan = self._service_plan()
         try:
-            activation.install(plan, apply=True, clock=self.clock)
+            outcome = activation.install(plan, apply=True, clock=self.clock)
+            # launchd holds the definition it was handed at bootstrap, so a
+            # rewritten definition that is never reloaded is a plan on disk the
+            # running service does not have.
+            if outcome.get("outcome") == "reinstalled":
+                self._bootout_if_loaded(plan.label)
         except (OSError, ValueError):
             raise FactoryRefusal(
                 "SUPERVISOR_INSTALL_FAILED",

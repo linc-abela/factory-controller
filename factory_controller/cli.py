@@ -366,9 +366,10 @@ def parser() -> argparse.ArgumentParser:
                                  "is written and the plan is printed")
 
     factory_parser = sub.add_parser(
-        "factory", help="the bounded Owner install/start/stop/status surface")
+        "factory", help="the bounded Owner install/start/run/stop/status surface")
     factory_parser.add_argument(
-        "factory_action", choices=("install", "start", "stop", "status"))
+        "factory_action",
+        choices=("install", "start", "run", "stop", "status"))
     return p
 
 

@@ -39,6 +39,10 @@ class FakeHost:
         self.calls = []
         self.capability_admits = 0
         self.observed_at = time.time()
+        self.checkouts = {
+            "factory-prototype-lab": "/labs/factory-prototype-lab",
+            "factory-bug-lab": "/labs/factory-bug-lab",
+        }
 
     def __call__(self, command, *, cwd=None, input_text=None,
                  timeout_seconds=300):
@@ -148,18 +152,20 @@ class FakeHost:
                 "expected_schemas": expected_schemas,
                 "installed_schemas": expected_schemas if compatible else None,
             },
-            "registry": {"projects": [
+            "registry": {"digest": "d" * 64, "projects": [
                 {
                     "project_id": "factory-prototype-lab",
                     "repository_remote_url": "https://github.com/linc-abela/factory-prototype-lab.git",
                     "resolution": "resolved",
                     "capabilities": ["prototype"],
+                    "checkout": self.checkouts["factory-prototype-lab"],
                 },
                 {
                     "project_id": "factory-bug-lab",
                     "repository_remote_url": "https://github.com/linc-abela/factory-bug-lab.git",
                     "resolution": "resolved",
                     "capabilities": ["bug"],
+                    "checkout": self.checkouts["factory-bug-lab"],
                 },
             ]},
             "registry_drift": "none" if self.installed else "not_applicable",
