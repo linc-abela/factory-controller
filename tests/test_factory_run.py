@@ -14,6 +14,7 @@ import time
 import unittest
 from contextlib import redirect_stdout
 from dataclasses import replace
+from pathlib import Path
 from unittest import mock
 
 from factory_controller import dogfood_intake, routing, shift as shift_plane
@@ -115,6 +116,26 @@ class FactoryRunTests(unittest.TestCase):
 
         self.assertIn("factory_controller.stage1_adapter", invocation)
         self.assertNotIn("safe_provider", invocation)
+
+    def test_run_reloads_a_supervisor_started_before_this_command(self):
+        """A stale definition on disk is not the one launchd is holding."""
+
+        self.ready()
+        plan = self.lifecycle._service_plan()
+        Path(plan.receipt_path).write_text(json.dumps({"plan_digest": "stale"}))
+        booted = len([1 for command, _ in self.host.calls
+                      if command[:2] == ("launchctl", "bootstrap")])
+
+        self.assertTrue(self.lifecycle.dispatch("run").ok)
+
+        reloaded = [command for command, _ in self.host.calls
+                    if command[:2] == ("launchctl", "bootout")
+                    and command[2].endswith(self.config.supervisor_label)]
+        self.assertTrue(reloaded)
+        self.assertGreater(len([1 for command, _ in self.host.calls
+                                if command[:2] == ("launchctl", "bootstrap")]),
+                           booted)
+        self.assertIn(self.config.supervisor_label, self.host.loaded)
 
     def test_the_admission_document_is_self_consistent_and_live(self):
         self.ready()

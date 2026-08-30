@@ -383,6 +383,12 @@ class FactoryLifecycle:
             code, detail = self._bridge_problem(doctor)
             raise FactoryRefusal(code, detail)
 
+        # A Factory started before this command existed is running a
+        # supervisor definition that names the fixture step adapter, and a
+        # real mission handed to that one is refused on its first leg.  The
+        # definition is rewritten and reloaded only when it actually differs.
+        self._bootstrap_service(self._install_supervisor_definition())
+
         outcomes = self.shift.outcomes(entry)
         mission = entry.next_mission(outcomes)
         if mission is None:
