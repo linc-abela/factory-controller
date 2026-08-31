@@ -9,14 +9,15 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from factory_controller.stage1_adapter import execute
+from factory_controller.stage1_adapter import _execution_mode, execute
 
 
 FAKE_STAGE1 = (
     "import json,sys\n"
     "p=sys.argv[sys.argv.index('--output')+1]\n"
     "json.dump({'status':'completed','fixture_only':True,"
-    "'execution_envelope':{'candidate_sha':'a'*40,'execution_id':'e1'},"
+    "'execution_envelope':{'candidate_sha':'a'*40,'execution_id':'e1',"
+    "'execution_mode':'fixture'},"
     "'execution_binding':{'work_item_id':'SF-135-T','context_manifest_hash':'c'*64},"
     "'candidate_commit_verification':{'verified':True},"
     "'gate_outcomes':[{'gate_id':'G1','passed':True}],"
@@ -82,7 +83,8 @@ class Stage1AdapterTest(unittest.TestCase):
             "p=sys.argv[sys.argv.index('--output')+1]\n"
             f"proof={proof!r}\n"
             "json.dump({'status':'completed','fixture_only':True,"
-            "'execution_envelope':{'candidate_sha':'a'*40,'execution_id':'e-proof'},"
+            "'execution_envelope':{'candidate_sha':'a'*40,'execution_id':'e-proof',"
+            "'execution_mode':'fixture'},"
             "'execution_binding':{'work_item_id':'SF-135-T',"
             "'context_manifest_hash':'c'*64,'candidate_workspace':proof},"
             "'candidate_commit_verification':{'verified':True},"
@@ -100,6 +102,30 @@ class Stage1AdapterTest(unittest.TestCase):
 
         dispatch = self._run("dispatch", {"mission": self._mission()})
         self.assertEqual(dispatch["receipt"]["execution_mode"], "fixture")
+
+    def test_real_mode_is_proven_by_the_nested_envelope(self):
+        """A top-level real hint cannot stand in for Bridge execution proof."""
+
+        self.assertEqual(
+            _execution_mode({"execution_mode": "real", "fixture_only": False}),
+            "unknown",
+        )
+        self.assertEqual(
+            _execution_mode({
+                "execution_mode": "real",
+                "fixture_only": False,
+                "execution_envelope": {"execution_mode": "real"},
+            }),
+            "real",
+        )
+        self.assertEqual(
+            _execution_mode({
+                "execution_mode": "real",
+                "fixture_only": False,
+                "execution_envelope": {"execution_mode": "fixture"},
+            }),
+            "unknown",
+        )
 
     def test_bound_idempotency_key_is_rederived_from_the_binding(self):
         """Evidence Core's own rule, re-derived rather than restated."""

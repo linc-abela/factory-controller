@@ -67,9 +67,19 @@ def _bound_idempotency_key(result: dict[str, Any]) -> str | None:
 
 
 def _execution_mode(result: dict[str, Any]) -> str:
-    if result.get("execution_mode") == "real" and result.get("fixture_only") is False:
+    """Project mode only from execution-layer proof, never from a request hint."""
+
+    modes = []
+    for source_name in ("execution_envelope", "execution_binding"):
+        source = result.get(source_name)
+        if isinstance(source, dict) and "execution_mode" in source:
+            modes.append(source["execution_mode"])
+    if not modes or len(set(modes)) != 1:
+        return "unknown"
+    mode = modes[0]
+    if mode == "real" and result.get("fixture_only") is False:
         return "real"
-    if result.get("fixture_only") is True:
+    if mode == "fixture" and result.get("fixture_only") is True:
         return "fixture"
     return "unknown"
 
