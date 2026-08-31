@@ -41,6 +41,7 @@ in the repository containers.
 ./dev factory install
 ./dev factory start
 ./dev factory run
+./dev factory status --watch [--interval SECONDS]
 ./dev factory stop
 ./dev factory status
 ```
@@ -54,10 +55,14 @@ portfolio and no more than one: which mission is next is the portfolio's own
 serial rule read from durable state, and the mission's identity, live admission
 document, provider candidates and per-gate commands are all derived from the
 frozen contract, the frozen portfolio and Bridge's project registry, so the
-Owner names nothing. Repeating it while that mission is in flight reports it
-rather than submitting a second. `stop` revokes admission, checkpoints and drains resumable work,
-then unloads the Factory supervisor while leaving a healthy Bridge loaded.
-Repeating any command is safe and status is read-only. Normal output is
+Owner names nothing. The installed Factory supervisor refreshes capacity,
+advances one existing mission, and hands off the next frozen mission after a
+settlement; repeating `run` while a mission is in flight reports it rather than
+submitting a second. `stop` revokes admission, checkpoints and drains resumable
+work, then unloads the Factory supervisor while leaving a healthy Bridge loaded.
+Repeating any command is safe. `status` is a one-shot read-only snapshot;
+`status --watch` repeats that observation every 30 seconds by default (or the
+supplied `--interval`) and Ctrl+C stops only the observer. Normal output is
 `FACTORY INSTALLED`, `FACTORY READY`, `FACTORY OFF`, `DOGFOOD MISSION QUEUED`,
 `DOGFOOD MISSION RUNNING`, or one actionable `BLOCKED: ...` line.
 

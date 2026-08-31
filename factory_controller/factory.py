@@ -46,6 +46,9 @@ SURFACES = {
     "release_authority": (".github/", "dev"),
 }
 
+DEFAULT_WATCH_INTERVAL_SECONDS = 30.0
+AUTOPILOT_WORKER_ID = "factory-autopilot"
+
 
 class FactoryRefusal(Exception):
     """One plain-English lifecycle blocker."""
@@ -203,6 +206,8 @@ class FactoryLifecycle:
                 return self.stop()
             if action == "run":
                 return self.run()
+            if action == "cycle":
+                return self.cycle()
             if action == "status":
                 return self.status()
             raise FactoryRefusal("ACTION_UNKNOWN", "That Factory action is not supported.")
@@ -390,11 +395,94 @@ class FactoryLifecycle:
             code, detail = self._bridge_problem(doctor)
             raise FactoryRefusal(code, detail)
 
+        # A queued mission is judged against the capacity observation the
+        # Owner just asked the Bridge for, rather than an old start-time
+        # reading.  This keeps the first handoff from waiting on the scheduler
+        # to discover that its durable capacity fact has expired.
+        self._refresh_capacity(contract)
+
         # A Factory started before this command existed is running a
         # supervisor definition that names the fixture step adapter, and a
         # real mission handed to that one is refused on its first leg.  The
         # definition is rewritten and reloaded only when it actually differs.
         self._bootstrap_service(self._install_supervisor_definition())
+
+        return self._queue_next(contract, entry, doctor, grant, owner_action=True)
+
+    def cycle(self) -> FactoryResult:
+        """Advance one bounded Factory cycle and hand off the next slot.
+
+        The generic supervisor remains one finite cycle over already-admitted
+        work.  This wrapper is the installed Factory service's narrow seam for
+        the frozen first-dogfood portfolio: it may refresh a provider reading,
+        submit the next portfolio mission, run one supervisor cycle, and then
+        submit one successor.  It cannot invent work or widen the Owner's
+        grant, and a terminal refusal that is not an explicitly safe retry
+        stops the handoff with an attention result.
+        """
+
+        self._require_owner()
+        contract, entry = self._load_contract_and_portfolio()
+        grant = self.shift.grant()
+        control = self.supervisor.control()
+        if grant is None or control.get("state") != "running" \
+                or not self._service_loaded(self.config.supervisor_label):
+            raise FactoryRefusal(
+                "FACTORY_NOT_READY",
+                "The Factory is not running. Run './dev factory start' first.")
+        doctor = self._bridge_doctor()
+        self._check_primary_and_containment(contract, doctor)
+        if not self._service_loaded(self.config.bridge_label) \
+                or not self._bridge_is_healthy(doctor):
+            code, detail = self._bridge_problem(doctor)
+            return self._attention_result(code, detail)
+        try:
+            self._refresh_capacity(contract)
+        except FactoryRefusal as refusal:
+            return self._attention_result(refusal.code, refusal.detail)
+
+        queued = self._queue_next(contract, entry, doctor, grant,
+                                  owner_action=False)
+        if not queued.ok or queued.state == "complete":
+            return queued
+        try:
+            report = self.supervisor.cycle(AUTOPILOT_WORKER_ID)
+        except supervisor.SupervisorRefusal as refusal:
+            return self._attention_result(
+                "SUPERVISOR_FAILURE",
+                "The Factory supervisor could not advance work. "
+                "Run './dev factory status' to review the current state.",
+                detail_type=type(refusal).__name__)
+        except Exception as exc:  # noqa: BLE001
+            return self._attention_result(
+                "SUPERVISOR_FAILURE",
+                "The Factory supervisor stopped unexpectedly. "
+                "Run './dev factory status' to review the current state.",
+                detail_type=type(exc).__name__)
+
+        refused = [row for row in report.get("refused", ())
+                   if row.get("reason") != "NO_RUNNABLE_MISSION"]
+        if report.get("outcome") == "refused" or refused:
+            return self._attention_result(
+                "SUPERVISOR_FAILURE",
+                "The Factory supervisor stopped advancing the validation run. "
+                "Run './dev factory status' to review the current state.",
+                cycle=report)
+
+        advanced = self._queue_next(contract, entry, doctor, grant,
+                                    owner_action=False)
+        if advanced.details:
+            return FactoryResult(
+                action="cycle", ok=advanced.ok, state=advanced.state,
+                lines=advanced.lines,
+                details={**advanced.details, "cycle": report})
+        return FactoryResult(
+            action="cycle", ok=advanced.ok, state=advanced.state,
+            lines=advanced.lines, details={"cycle": report})
+
+    def _queue_next(self, contract, entry, doctor, grant, *,
+                    owner_action: bool) -> FactoryResult:
+        """Submit the next frozen slot, or report why it cannot be handed off."""
 
         slots = self.shift.slots(entry)
         outcomes = {ref: reading.state for ref, reading in slots.items()
@@ -402,9 +490,17 @@ class FactoryLifecycle:
         retryable = frozenset(ref for ref, reading in slots.items()
                               if reading.retryable)
         mission = entry.next_mission(outcomes, retryable)
+        if not owner_action:
+            blocker = self._first_autopilot_attention(entry, slots)
+            if blocker is not None:
+                portfolio_mission, reading, attention = blocker
+                return self._attention_result(
+                    "AUTOPILOT_ATTENTION", attention,
+                    mission_ref=portfolio_mission.mission_ref,
+                    state=reading.state)
         if mission is None:
             return FactoryResult(
-                action="run", ok=True, state="complete",
+                action="run" if owner_action else "cycle", ok=True, state="complete",
                 lines=("DOGFOOD PORTFOLIO COMPLETE",
                        "Every mission in the first portfolio has settled.",
                        "Run './dev factory status' to review the results."),
@@ -420,7 +516,7 @@ class FactoryLifecycle:
         settled = outcomes.get(mission.mission_ref)
         if settled is not None and mission.mission_ref not in retryable:
             return FactoryResult(
-                action="run", ok=True,
+                action="run" if owner_action else "cycle", ok=True,
                 state="running" if settled != "admitted" else "queued",
                 lines=(self._work_headline(settled),
                        "Mission: " + mission.objective.split(".")[0].strip() + ".",
@@ -431,22 +527,29 @@ class FactoryLifecycle:
         intake = self._materialize(contract, entry, mission, doctor, grant,
                                    attempt)
         try:
-            _, created = self.controller.submit(
+            submitted, created = self.controller.submit(
                 intake.payload, intake.idempotency_key)
         except Exception as exc:  # noqa: BLE001
             raise FactoryRefusal(
                 "MISSION_NOT_ADMITTED",
                 "The next dogfood mission was refused before it started: %s"
                 % type(exc).__name__) from None
-        self._record_owner_act("run", grant.approval_ref, {
+        detail = {
             "mission_ref": intake.mission_ref,
             "project_id": intake.project_id,
             "attempt": intake.attempt,
             "idempotency_key": intake.idempotency_key,
             "created": created,
-        })
+        }
+        if owner_action:
+            self._record_owner_act("run", grant.approval_ref, detail)
+        elif created:
+            self.store.coordinate(
+                submitted["id"], intake.project_id, "factory",
+                "FACTORY_AUTOPILOT_ADVANCE", detail)
         return FactoryResult(
-            action="run", ok=True, state="queued" if created else "running",
+            action="run" if owner_action else "cycle", ok=True,
+            state="queued" if created else "running",
             lines=("DOGFOOD MISSION QUEUED" if created
                    else "DOGFOOD MISSION RUNNING",
                    "Mission: " + mission.objective.split(".")[0].strip() + ".",
@@ -454,12 +557,49 @@ class FactoryLifecycle:
                    *(("Retrying attempt %d; the earlier attempt was refused "
                       "by the execution layer and is kept."
                       % intake.attempt,) if intake.attempt > 1 else ()),
-                   "The Factory will pick it up on its next cycle. "
+                   "The supervisor will pick it up automatically. "
                    "Run './dev factory status' to follow it."),
             details={"mission_ref": intake.mission_ref,
                      "project_id": intake.project_id,
                      "attempt": intake.attempt,
                      "created": created})
+
+    @staticmethod
+    def _autopilot_attention(mission, reading) -> str | None:
+        """Return a blocker for an automatic handoff, if one is present."""
+
+        if reading.state not in {"refused", "failed", "cancelled", "escalated"} \
+                or reading.retryable:
+            return None
+        if (reading.state == "escalated"
+                and reading.terminal_reason.startswith("ACCEPTANCE_GATE_FAILED")
+                and mission.acceptance_gate_expectations):
+            # DF-2's declared non-zero evaluator result is evidence the
+            # portfolio explicitly asks for, not an infrastructure failure.
+            return None
+        reason = reading.terminal_reason or "the mission did not settle successfully"
+        return ("The %s validation mission needs Owner attention before the "
+                "Factory can continue (%s)." % (mission.mission_ref, reason))
+
+    def _first_autopilot_attention(self, entry, slots):
+        """Read the first settled portfolio blocker without changing state."""
+
+        for portfolio_mission in entry.missions:
+            reading = slots.get(portfolio_mission.mission_ref)
+            if reading is None or reading.state is None or reading.retryable:
+                break
+            attention = self._autopilot_attention(portfolio_mission, reading)
+            if attention is not None:
+                return portfolio_mission, reading, attention
+        return None
+
+    @staticmethod
+    def _attention_result(code: str, detail: str, **extra: Any) -> FactoryResult:
+        return FactoryResult(
+            action="cycle", ok=False, state="attention",
+            lines=("FACTORY ATTENTION", detail,
+                   "Run './dev factory status' to review the current state."),
+            details={"code": code, **extra})
 
     def _materialize(self, contract, entry, mission, doctor, grant, attempt=1):
         """Derive the whole mission, and refuse rather than guess any part."""
@@ -556,43 +696,94 @@ class FactoryLifecycle:
             return "DOGFOOD MISSION STOPPED"
         return "DOGFOOD MISSION RUNNING"
 
-    def _work_summary(self) -> tuple[str, ...]:
+    def _work_reading(self):
+        """Read the frozen portfolio once for status and handoff decisions."""
+
+        try:
+            _, entry = self._load_contract_and_portfolio()
+            slots = self.shift.slots(entry)
+        except FactoryRefusal:
+            return None
+        outcomes = {ref: reading.state for ref, reading in slots.items()
+                    if reading.state is not None}
+        retryable = frozenset(ref for ref, reading in slots.items()
+                              if reading.retryable)
+        return entry, slots, outcomes, retryable, entry.next_mission(outcomes, retryable)
+
+    def _work_summary(self) -> tuple[tuple[str, ...], str]:
         """What the Owner needs to know about work, with no internal ids.
 
         Read-only and refusal-free: a status that could not be printed because
         the portfolio was unreadable would hide the rest of the state as well.
         """
 
-        try:
-            _, entry = self._load_contract_and_portfolio()
-            slots = self.shift.slots(entry)
-        except FactoryRefusal:
-            return ("Work: unknown",)
-        outcomes = {ref: reading.state for ref, reading in slots.items()
-                    if reading.state is not None}
-        retryable = frozenset(ref for ref, reading in slots.items()
-                              if reading.retryable)
-        pending = entry.next_mission(outcomes, retryable)
+        reading = self._work_reading()
+        if reading is None:
+            return ("Work: unknown",), "unknown"
+        entry, slots, outcomes, retryable, pending = reading
         if pending is None:
-            return ("Work: every first-dogfood mission has settled",)
+            return ("Work: every first-dogfood mission has settled",), "complete"
+        blocker = self._first_autopilot_attention(entry, slots)
+        if blocker is not None:
+            _, _, attention = blocker
+            return ("Attention: " + attention,
+                    "Automatic validation is paused until the Owner reviews it."), "attention"
         state = outcomes.get(pending.mission_ref)
         if state is None:
             return ("Work: none started",
                     "Next: %s, in %s" % (pending.mission_ref, pending.project_id),
-                    "Run './dev factory run' to start it.")
+                    "The Factory will start it automatically."), "pending"
         if pending.mission_ref in retryable:
             reading = slots[pending.mission_ref]
             return ("Work: %s in %s was refused by the execution layer "
-                    "and can be retried"
+                    "and can be retried automatically"
                     % (pending.mission_ref, pending.project_id),
                     "Refusal kept: %s" % reading.terminal_reason,
                     "Next: %s, attempt %d of %d"
                     % (pending.mission_ref, reading.next_attempt,
-                       shift_plane.MAX_SLOT_ATTEMPTS),
-                    "Run './dev factory run' to start it.")
-        return ("Work: %s in %s is %s"
+                       shift_plane.MAX_SLOT_ATTEMPTS)), "pending"
+        return (("Work: %s in %s is %s"
                 % (pending.mission_ref, pending.project_id,
-                   "waiting to start" if state == "admitted" else state),)
+                   "waiting to start; the supervisor will pick it up automatically"
+                   if state == "admitted" else state),), "pending")
+
+    def _status_attention(self, doctor: Mapping[str, Any], *, live,
+                          bridge_healthy: bool, primary: str) -> tuple[str, ...]:
+        """Read-only warnings that explain why automatic progress may stop."""
+
+        if live is None:
+            return ()
+        lines: list[str] = []
+        if not bridge_healthy:
+            lines.append(
+                "Attention: The Factory Bridge/provider is not healthy; "
+                "automatic validation is paused.")
+        if primary == "Unavailable":
+            lines.append(
+                "Attention: The primary provider is unavailable; "
+                "automatic validation is paused.")
+        try:
+            unavailable = [reading for reading in self.store.capacity_readings().values()
+                           if not reading.usable]
+        except Exception:  # noqa: BLE001
+            unavailable = []
+        for reading in unavailable:
+            profile = self._display_profile(reading.runtime_id)
+            if reading.reason == "CAPACITY_OBSERVATION_STALE":
+                detail = "capacity is stale"
+            elif reading.reason == "CAPACITY_OBSERVATION_MISSING":
+                detail = "capacity has not been measured"
+            else:
+                detail = "capacity is unavailable"
+            lines.append(
+                "Attention: %s provider %s; automatic validation is waiting "
+                "for a fresh reading." % (profile, detail))
+        cycles = self.supervisor.cycles(limit=1)
+        if cycles and cycles[0].get("outcome") == "refused":
+            lines.append(
+                "Attention: The supervisor stopped unexpectedly; "
+                "automatic validation is paused.")
+        return tuple(lines)
 
     def status(self) -> FactoryResult:
         owner = self.owner
@@ -640,16 +831,50 @@ class FactoryLifecycle:
         label = "FACTORY READY" if ready else "FACTORY OFF"
         shift_summary = "Active" if live is not None else "Off"
         supervisor_summary = "Running" if supervisor_loaded else "Stopped"
+        work, work_state = self._work_summary()
+        status_attention = self._status_attention(
+            doctor, live=live, bridge_healthy=bridge_healthy, primary=primary)
+        if status_attention:
+            work_state = "attention"
         return FactoryResult(
             action="status", ok=True, state=state,
             lines=(label,
                    "Shift: " + shift_summary,
                    "Supervisor: " + supervisor_summary,
                    "Bridge: " + bridge_summary,
-                   "Primary: " + primary) + self._work_summary(),
+                   "Primary: " + primary)
+            + status_attention
+            + work,
             details={"control": control, "grant": None if live is None else live.as_row(),
-                     "bridge": doctor},
+                     "bridge": doctor, "work_state": work_state},
         )
+
+    def watch(self, interval_seconds: float = DEFAULT_WATCH_INTERVAL_SECONDS,
+              *, emit: Callable[[str], None] = print,
+              sleep: Callable[[float], None] = time.sleep) -> int:
+        """Observe status until completion, attention, or Ctrl+C.
+
+        This is deliberately outside the lifecycle mutation path.  Stopping
+        it only stops the observer; it never stops, drains, or changes Factory
+        work already handed to the supervisor.
+        """
+
+        if (isinstance(interval_seconds, bool)
+                or not isinstance(interval_seconds, (int, float))
+                or interval_seconds <= 0):
+            raise FactoryRefusal(
+                "WATCH_INTERVAL_INVALID",
+                "The status watch interval must be greater than zero seconds.")
+        try:
+            while True:
+                result = self.status()
+                emit(result.render())
+                if not result.ok or result.details.get("work_state") in {
+                        "complete", "attention"}:
+                    return 0 if result.ok else 1
+                sleep(float(interval_seconds))
+        except KeyboardInterrupt:
+            return 0
 
     # -- host edge ------------------------------------------------------ #
 
@@ -985,7 +1210,7 @@ class FactoryLifecycle:
             "--db", str(Path(self.store.path).resolve()),
             "--adapter", "%s -m factory_controller.stage1_adapter"
             % shlex.quote(interpreter),
-            "supervisor", "cycle",
+            "factory", "cycle",
         )
         contract = self.supervisor.service_contract(
             invocation=invocation,

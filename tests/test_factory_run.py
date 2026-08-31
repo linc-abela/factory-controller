@@ -665,5 +665,108 @@ class RetryRunTests(unittest.TestCase):
         self.assertNotIn("fm_", rendered)
 
 
+class FactoryAutopilotTests(unittest.TestCase):
+    """The installed Factory advances the frozen portfolio without babysitting."""
+
+    setUp = FactoryLifecycleTests.setUp
+
+    def ready(self):
+        self.assertTrue(self.lifecycle.dispatch("install").ok)
+        started = self.lifecycle.dispatch("start")
+        self.assertTrue(started.ok, started.render())
+        self.lifecycle.controller.adapter = LayerAdapter(mode="real")
+
+    def missions(self):
+        return [self.lifecycle.store.get(row["id"])
+                for row in self.lifecycle.store.all_missions()]
+
+    def test_service_invokes_the_factory_handoff_cycle(self):
+        self.ready()
+
+        invocation = self.lifecycle._service_plan().invocation
+
+        self.assertEqual(invocation[-2:], ("factory", "cycle"))
+
+    def test_one_owner_run_then_cycles_advances_every_frozen_slot(self):
+        self.ready()
+        started = self.lifecycle.dispatch("run")
+        self.assertTrue(started.ok, started.render())
+
+        expected = ["DF-1", "DF-2", "DF-3", "DF-4"]
+        for _ in expected:
+            advanced = self.lifecycle.dispatch("cycle")
+            self.assertTrue(advanced.ok, advanced.render())
+
+        missions = self.missions()
+        self.assertEqual([mission["payload"]["work_item_id"] for mission in missions],
+                         expected)
+        self.assertEqual([mission["state"] for mission in missions],
+                         ["completed", "escalated", "completed", "completed"])
+        self.assertEqual(
+            [row["detail"]["action"] for row in self.lifecycle.store.coordination()
+             if row["reason"] == "FACTORY_OWNER_ACTION"],
+            ["install", "start", "run"],
+        )
+
+    def test_a_retryable_refusal_is_retried_inside_the_bounded_handoff(self):
+        self.ready()
+        self.assertTrue(self.lifecycle.dispatch("run").ok)
+        first_id = self.missions()[0]["id"]
+        claimed = self.lifecycle.store.claim("test-refusal")
+        self.lifecycle.store.transition(
+            claimed["id"], claimed["lease_token"], "refused",
+            reason="EXECUTION_MODE_UNPROVEN: layer reported unknown",
+            release_lease=True,
+        )
+
+        advanced = self.lifecycle.dispatch("cycle")
+
+        self.assertTrue(advanced.ok, advanced.render())
+        missions = self.missions()
+        self.assertEqual(len(missions), 3)
+        self.assertEqual(self.lifecycle.store.get(first_id)["state"], "refused")
+        self.assertEqual(missions[1]["payload"]["work_item_id"], "DF-1")
+        self.assertEqual(missions[1]["state"], "completed")
+        self.assertEqual(missions[2]["payload"]["work_item_id"], "DF-2")
+        self.assertEqual(missions[2]["state"], "admitted")
+
+    def test_unexpected_refusal_stops_progression_for_owner_attention(self):
+        self.ready()
+        self.assertTrue(self.lifecycle.dispatch("run").ok)
+        claimed = self.lifecycle.store.claim("test-refusal")
+        self.lifecycle.store.transition(
+            claimed["id"], claimed["lease_token"], "refused",
+            reason="PROVIDER_POLICY_VIOLATION: codex-primary is denied",
+            release_lease=True,
+        )
+
+        attention = self.lifecycle.dispatch("cycle")
+
+        self.assertFalse(attention.ok)
+        self.assertEqual(attention.state, "attention")
+        self.assertIn("Owner attention", attention.render())
+        self.assertEqual(len(self.missions()), 1)
+
+        status = self.lifecycle.dispatch("status")
+        self.assertTrue(status.ok, status.render())
+        self.assertEqual(status.details["work_state"], "attention")
+        self.assertIn("Owner attention", status.render())
+
+    def test_status_watch_ctrl_c_does_not_stop_factory_work(self):
+        self.ready()
+        output = []
+
+        def interrupt(_):
+            raise KeyboardInterrupt
+
+        result = self.lifecycle.watch(5, emit=output.append, sleep=interrupt)
+
+        self.assertEqual(result, 0)
+        self.assertEqual(len(output), 1)
+        self.assertEqual(self.lifecycle.supervisor.control()["state"], "running")
+        self.assertIn(self.config.supervisor_label, self.host.loaded)
+        self.assertEqual(self.missions(), [])
+
+
 if __name__ == "__main__":
     unittest.main()

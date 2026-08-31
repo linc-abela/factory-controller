@@ -369,7 +369,14 @@ def parser() -> argparse.ArgumentParser:
         "factory", help="the bounded Owner install/start/run/stop/status surface")
     factory_parser.add_argument(
         "factory_action",
-        choices=("install", "start", "run", "stop", "status"))
+        choices=("install", "start", "run", "cycle", "stop", "status"))
+    factory_parser.add_argument(
+        "--watch", action="store_true",
+        help="keep observing status until completion, attention, or Ctrl+C")
+    factory_parser.add_argument(
+        "--interval", type=float,
+        default=factory_lifecycle.DEFAULT_WATCH_INTERVAL_SECONDS,
+        help="status refresh interval in seconds (default: 30)")
     return p
 
 
@@ -1168,6 +1175,15 @@ def main(argv: list[str] | None = None) -> int:
                        JsonProcessAdapter(shlex.split(args.adapter)),
                        retry_policy=RetryPolicy()),
             config=config)
+        if args.watch:
+            if args.factory_action != "status":
+                print("BLOCKED: --watch is only supported for factory status.")
+                return 1
+            try:
+                return lifecycle.watch(args.interval)
+            except factory_lifecycle.FactoryRefusal as refusal:
+                print("BLOCKED: " + refusal.detail)
+                return 1
         result = lifecycle.dispatch(args.factory_action)
         print(result.render())
         return 0 if result.ok else 1
