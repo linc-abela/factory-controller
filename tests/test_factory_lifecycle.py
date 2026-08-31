@@ -38,6 +38,7 @@ class FakeHost:
         self.loaded = {config.legacy_label}
         self.calls = []
         self.capability_admits = 0
+        self.health_error = None
         self.observed_at = time.time()
         self.checkouts = {
             "factory-prototype-lab": "/labs/factory-prototype-lab",
@@ -52,6 +53,11 @@ class FakeHost:
             return self._launchctl(command)
         if command and command[0] == str(self.config.bridge_root / "dev"):
             return self._bridge(command[1:], input_text)
+        if len(command) == 2 and command[1] == "health":
+            if self.health_error is not None:
+                return HostCommandResult(1, "", self.health_error)
+            return HostCommandResult(0, json.dumps(
+                {"status": "ok", "identity": Path(command[0]).parent.name}))
         return HostCommandResult(127, "", "unknown host command")
 
     def _launchctl(self, command):
@@ -331,6 +337,73 @@ class FactoryLifecycleTests(unittest.TestCase):
         blocked = self.lifecycle.dispatch("start")
         self.assertFalse(blocked.ok)
         self.assertIn("unavailable", blocked.render().lower())
+
+    def _lifecycle_reading_real_health(self):
+        """The same lifecycle, but collecting health from the sibling repos."""
+
+        return FactoryLifecycle(
+            self.lifecycle.controller,
+            config=self.config,
+            runner=self.host,
+            owner=OwnerIdentity(501, "owner"),
+            remote_reachability={
+                "factory-prototype-lab": (PROTOTYPE_SHA,),
+                "factory-bug-lab": (BUG_SHA,),
+            },
+        )
+
+    def test_a_stopped_container_runtime_is_named_instead_of_a_dead_end(self):
+        self.assertTrue(self.lifecycle.dispatch("install").ok)
+        lifecycle = self._lifecycle_reading_real_health()
+        self.host.health_error = (
+            "failed to connect to the docker API at "
+            "unix:///Users/owner/.orbstack/run/docker.sock; check if the path "
+            "is correct and if the daemon is running")
+
+        result = lifecycle.dispatch("start")
+
+        self.assertFalse(result.ok)
+        self.assertEqual("PREFLIGHT_NOT_READY", result.details["code"])
+        self.assertIn("container runtime is not running", result.render())
+        self.assertIn("Evidence Core and Context Broker", result.render())
+        self.assertEqual(lifecycle.shift.grants(), [])
+
+    def test_an_unhealthy_service_is_named_without_blaming_the_runtime(self):
+        self.assertTrue(self.lifecycle.dispatch("install").ok)
+        lifecycle = self._lifecycle_reading_real_health()
+        self.host.health_error = "broker health check failed"
+
+        result = lifecycle.dispatch("start")
+
+        self.assertFalse(result.ok)
+        self.assertIn("health could not be read", result.render())
+        self.assertNotIn("container runtime", result.render())
+
+    def test_collected_health_reaches_the_preflight(self):
+        self.assertTrue(self.lifecycle.dispatch("install").ok)
+        lifecycle = self._lifecycle_reading_real_health()
+
+        result = lifecycle.dispatch("start")
+
+        self.assertTrue(result.ok, result.render())
+        self.assertEqual({}, lifecycle.report_failures)
+
+    def test_an_unmapped_readiness_failure_names_its_own_check(self):
+        message = self.lifecycle._plain_preflight_blocker(
+            ({"check": "SOMETHING_ELSE"},))
+
+        self.assertIn("SOMETHING_ELSE", message)
+
+    def test_inconsistent_state_points_at_the_command_that_recovers_it(self):
+        self.assertTrue(self.lifecycle.dispatch("install").ok)
+        self.assertTrue(self.lifecycle.dispatch("start").ok)
+        self.host.loaded.discard(self.config.supervisor_label)
+
+        status = self.lifecycle.dispatch("status")
+
+        self.assertFalse(status.ok)
+        self.assertEqual("INCONSISTENT_SERVICE_STATE", status.details["code"])
+        self.assertIn("./dev factory stop", status.render())
 
     def test_registry_shape_adapter_accepts_list_and_keyed_projects(self):
         listed = FactoryLifecycle._registry_rows({

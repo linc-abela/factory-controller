@@ -154,6 +154,12 @@ class FactoryResult:
 
 Runner = Callable[..., HostCommandResult]
 
+#: Preflight checks fed by a sibling repository's own ``./dev health``.
+HEALTH_CHECKS = {
+    "EVIDENCE_CORE_HEALTH": "Evidence Core",
+    "CONTEXT_BROKER_HEALTH": "Context Broker",
+}
+
 
 class FactoryLifecycle:
     """Install, start, stop, and inspect one bounded local Factory."""
@@ -176,6 +182,7 @@ class FactoryLifecycle:
         self.remote_reachability = None if remote_reachability is None else {
             name: tuple(values) for name, values in remote_reachability.items()
         }
+        self.report_failures: dict[str, str] = {}
         self.supervisor = supervisor.OperationsSupervisor(
             controller, clock=self.store.clock)
         self.shift = shift_plane.ShiftPlane(self.store, clock=self.store.clock)
@@ -576,7 +583,8 @@ class FactoryLifecycle:
                 action="status", ok=False, state="blocked",
                 lines=("BLOCKED: The Factory services and durable shift state "
                        "are inconsistent.",
-                       "Run './dev factory start' to repair the state."),
+                       "Run './dev factory stop' to return to a safe state, "
+                       "then './dev factory start'."),
                 details={"code": "INCONSISTENT_SERVICE_STATE",
                          "control": control, "bridge": doctor},
             )
@@ -1152,14 +1160,20 @@ class FactoryLifecycle:
             "factory-context-broker",
         }
         output: dict[str, Mapping[str, Any]] = {}
+        self.report_failures = {}
         for name, root in roots.items():
             result = self._run((str(root / "dev"), "health"), cwd=root)
             try:
                 value = json.loads(result.stdout)
             except (TypeError, ValueError):
-                continue
+                value = None
             if isinstance(value, dict):
                 output[name] = value
+            else:
+                # A silently dropped report reaches the Owner as an unnamed
+                # readiness failure, so keep the reason the command gave.
+                self.report_failures[name] = (
+                    result.stderr or result.stdout or "").strip()
         return output
 
     def _remote_shas(self, entry, doctor) -> Mapping[str, Sequence[str]]:
@@ -1259,8 +1273,7 @@ class FactoryLifecycle:
         preview = self.shift.preview(facts, approval=approval)
         return facts, request, preview
 
-    @staticmethod
-    def _plain_preflight_blocker(unmet: Sequence[Mapping[str, Any]]) -> str:
+    def _plain_preflight_blocker(self, unmet: Sequence[Mapping[str, Any]]) -> str:
         names = {row.get("check") for row in unmet}
         if "REQUIRED_PROVIDER_READINESS" in names:
             return "The primary provider is unavailable. Complete its sign-in, then retry start."
@@ -1268,7 +1281,27 @@ class FactoryLifecycle:
             return "Primary provider capacity is unavailable. Try again later."
         if "SUPERVISOR_SERVICE_INSTALLED" in names:
             return "The Factory supervisor service could not be verified. Retry install."
-        return "Factory readiness checks are incomplete. Run './dev factory status' for the current state."
+        health = [label for check, label in HEALTH_CHECKS.items() if check in names]
+        if health:
+            services = " and ".join(health)
+            if self._container_runtime_unavailable():
+                return ("The container runtime is not running, so %s health "
+                        "could not be read. Start OrbStack (or Docker), then "
+                        "run './dev factory start' again." % services)
+            return ("%s health could not be read. Check that service, then "
+                    "retry start." % services)
+        return ("Factory readiness checks are incomplete: %s. Run "
+                "'./dev factory status' for the current state."
+                % ", ".join(sorted(str(name) for name in names if name)))
+
+    def _container_runtime_unavailable(self) -> bool:
+        """True when a health command failed because no daemon answered."""
+
+        return any(
+            marker in text.lower()
+            for text in self.report_failures.values()
+            for marker in ("docker.sock", "docker api", "docker daemon")
+        )
 
     @staticmethod
     def _plain_gate_blocker(blockers: Sequence[Mapping[str, Any]]) -> str:
