@@ -211,6 +211,10 @@ class HostCompatibilityTests(unittest.TestCase):
         self.assertEqual(production.COMPAT_SCHEMA,
                          "controller-release-bundle-compat-v1")
 
+    def test_the_compatibility_view_carries_the_immutable_artifact_identity(self):
+        self.assertEqual(self.view["artifact"],
+                         {"kind": "image", "identity": "sha256:" + "c" * 64})
+
 
 class EnvironmentRegistryTests(LedgerCase):
 

@@ -44,7 +44,7 @@ HOST_CONTROLLER_CONTRACT = "factory-controller/production/1.0"
 HOST_ROLLBACK_STRATEGY = "previous-recorded-healthy"
 HOST_BUNDLE_KEYS = {"schema_version", "release_id", "project_id", "service_id",
                     "candidate_sha", "release_policy_version", "evidence_refs",
-                    "environment_schema", "rollback", "provenance"}
+                    "environment_schema", "rollback", "provenance", "artifact"}
 HOST_ENV_SPEC_KEYS = {"type", "required", "description"}
 HOST_ENV_TYPES = {"string", "integer", "boolean"}
 HOST_ENV_NAME = re.compile(r"^[A-Z][A-Z0-9_]{0,63}$")

@@ -64,6 +64,37 @@ class Stage1AdapterTest(unittest.TestCase):
         self.assertTrue(evidence["accepted"])
         self.assertEqual(evidence["evidence_pointer"], "b" * 64)
 
+    def test_dispatch_projects_candidate_workspace_from_evidence_binding(self):
+        proof = {
+            "schema_version": "1.0",
+            "lane_id": "lane-controller-dispatch",
+            "worktree": "/tmp/controller-dispatch-worktree",
+            "source_checkout": "/tmp/controller-dispatch-source",
+            "candidate_ref": "refs/factory/lanes/lane-controller-dispatch",
+            "baseline_sha": "b" * 40,
+            "candidate_sha": "a" * 40,
+            "head_sha": "a" * 40,
+            "clean": True,
+        }
+        script = self.root / "proof_stage1.py"
+        script.write_text(
+            "import json,sys\n"
+            "p=sys.argv[sys.argv.index('--output')+1]\n"
+            f"proof={proof!r}\n"
+            "json.dump({'status':'completed','fixture_only':True,"
+            "'execution_envelope':{'candidate_sha':'a'*40,'execution_id':'e-proof'},"
+            "'execution_binding':{'work_item_id':'SF-135-T',"
+            "'context_manifest_hash':'c'*64,'candidate_workspace':proof},"
+            "'candidate_commit_verification':{'verified':True},"
+            "'evidence_result':{'status':'complete','artifact_hash':'b'*64}},"
+            "open(p,'w'))\n"
+        )
+        mission = {"stage1": dict(self.config, command=[sys.executable, str(script)])}
+
+        dispatch = self._run("dispatch", {"mission": mission})
+
+        self.assertEqual(dispatch["candidate_workspace"], proof)
+
     def test_dry_run_result_is_reported_as_a_fixture(self):
         """The SF-134 laundering path: a dry run must never look real."""
 
@@ -191,6 +222,41 @@ class Stage1AdapterTest(unittest.TestCase):
 
         self.assertFalse(evaluation["passed"])
         self.assertEqual(evaluation["diagnostic"], "CANDIDATE_SHA_UNAVAILABLE")
+        self.assertEqual(evaluation["gate_outcomes"][0]["detail"], "not_run")
+
+    def test_mutating_gate_refuses_a_workspace_proof_bound_to_another_candidate(self):
+        config = {
+            "repository": str(self.root),
+            "gate_workdir": str(self.root),
+            "gate_commands": {"G1": ["/bin/false"]},
+            "mutates_repository": True,
+        }
+        mission = {"stage1": config, "acceptance_gate_ids": ["G1"],
+                   "mutates_repository": True}
+        candidate = "a" * 40
+        dispatch = {
+            "candidate_sha": candidate,
+            "candidate_workspace": {
+                "schema_version": "1.0",
+                "lane_id": "lane-controller-1",
+                "worktree": "/tmp/controller-lane",
+                "source_checkout": "/tmp/controller-source",
+                "candidate_ref": "refs/factory/lanes/lane-controller-1",
+                "baseline_sha": "b" * 40,
+                "candidate_sha": "c" * 40,
+                "head_sha": "c" * 40,
+                "clean": True,
+            },
+            "stage1_result": {"execution_envelope": {"candidate_sha": candidate}},
+        }
+
+        evaluation = execute({
+            "step": "evaluate", "operation_key": "m:evaluate-workspace-proof",
+            "input": {"mission": mission, "dispatch": dispatch},
+        })
+
+        self.assertFalse(evaluation["passed"])
+        self.assertEqual(evaluation["diagnostic"], "CANDIDATE_WORKSPACE_BINDING_FAILED")
         self.assertEqual(evaluation["gate_outcomes"][0]["detail"], "not_run")
 
     def test_explicit_expected_failure_preserves_nonzero_exit_and_satisfies_mission(self):

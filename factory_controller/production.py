@@ -345,6 +345,10 @@ class ReleaseBundle:
             "project_id": self.project_id,
             "service_id": environment.service_ref,
             "candidate_sha": self.release_sha,
+            # The host must carry the immutable build identity alongside the
+            # commit. A commit proves source; this identity proves which bytes
+            # REVIEW and Production are meant to serve.
+            "artifact": self.artifact,
             "release_policy_version": self.release_policy_version,
             "evidence_refs": [*self.evidence_refs, *self.evaluator_receipts],
             "environment_schema": {name: dict(spec)

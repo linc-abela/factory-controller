@@ -121,6 +121,7 @@ def _dispatch(request: dict[str, Any], config: dict[str, Any]) -> dict[str, Any]
     envelope = result.get("execution_envelope", {})
     binding = result.get("execution_binding", {})
     candidate = envelope.get("candidate_sha") or binding.get("candidate_sha")
+    workspace = _candidate_workspace(result)
     status = result.get("status")
     if completed.returncode == 0 and status in {"completed", "passed"} and candidate:
         mapped = "completed"
@@ -131,6 +132,7 @@ def _dispatch(request: dict[str, Any], config: dict[str, Any]) -> dict[str, Any]
     return {
         "status": mapped,
         "candidate_sha": candidate,
+        "candidate_workspace": workspace,
         "execution_id": envelope.get("execution_id"),
         "diagnostic": result.get("refusal_code") or result.get("status"),
         "stage1_result": result,
@@ -181,6 +183,42 @@ def _candidate_sha(result: dict[str, Any]) -> str | None:
     candidate = (result.get("candidate_sha") or envelope.get("candidate_sha")
                  or binding.get("candidate_sha"))
     return candidate if isinstance(candidate, str) and _GIT_SHA.fullmatch(candidate) else None
+
+
+def _candidate_workspace(result: dict[str, Any]) -> Any:
+    """Read the lane/worktree proof carried by Evidence Core's binding."""
+
+    binding = result.get("execution_binding") or {}
+    envelope = result.get("execution_envelope") or {}
+    for source in (result, binding, envelope):
+        if isinstance(source, dict) and "candidate_workspace" in source:
+            return source["candidate_workspace"]
+    return None
+
+
+def _workspace_matches_candidate(value: Any, candidate_sha: str | None) -> bool:
+    """Check the additive workspace proof before projecting a gate result."""
+
+    expected = {"schema_version", "lane_id", "worktree", "source_checkout",
+                "candidate_ref", "baseline_sha", "candidate_sha", "head_sha",
+                "clean"}
+    if not isinstance(value, dict) or set(value) != expected:
+        return False
+    lane_id = value.get("lane_id")
+    if (not isinstance(lane_id, str)
+            or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._:-]{0,127}", lane_id)
+            or value.get("candidate_ref") != "refs/factory/lanes/%s" % lane_id):
+        return False
+    for field in ("worktree", "source_checkout"):
+        path = value.get(field)
+        if (not isinstance(path, str) or not path.startswith("/")
+                or len(path) > 1024 or "\n" in path or "\x00" in path):
+            return False
+    return (value.get("schema_version") == "1.0"
+            and value.get("candidate_sha") == candidate_sha
+            and value.get("head_sha") == candidate_sha
+            and isinstance(candidate_sha, str) and _GIT_SHA.fullmatch(candidate_sha)
+            and value.get("clean") is True)
 
 
 def _candidate_worktree(repository: Any, candidate_sha: str,
@@ -324,6 +362,13 @@ def _evaluate(request: dict[str, Any], config: dict[str, Any],
                     for gate in declared],
                 "diagnostic": "ACCEPTANCE_GATE_EXPECTATION_INVALID"}
     target_sha = _candidate_sha(result) if mutates_repository else None
+    workspace = _candidate_workspace(result) if mutates_repository else None
+    if workspace is not None and not _workspace_matches_candidate(workspace, target_sha):
+        outcomes = [_not_run_gate(gate, "CANDIDATE_WORKSPACE_BINDING_FAILED", target_sha)
+                    for gate in declared]
+        return {"passed": False, "gate_outcomes": outcomes,
+                "diagnostic": "CANDIDATE_WORKSPACE_BINDING_FAILED",
+                "target": "candidate", "target_sha": target_sha}
     candidate_context = None
     if mutates_repository:
         if target_sha is None:
@@ -412,12 +457,18 @@ def execute(request: dict[str, Any]) -> dict[str, Any]:
         # evaluation when an adapter supplies only the top-level field.
         if dispatch.get("candidate_sha") and "candidate_sha" not in result:
             result = {**result, "candidate_sha": dispatch["candidate_sha"]}
+        if (dispatch.get("candidate_workspace") is not None
+                and "candidate_workspace" not in result):
+            result = {**result, "candidate_workspace": dispatch["candidate_workspace"]}
         return _evaluate(request, config, result)
     if step == "evidence":
         mission = _mission(request)
         if (config.get("mutates_repository")
                 or mission.get("mutates_repository")):
             expected = dispatch.get("candidate_sha") or _candidate_sha(result)
+            workspace = (dispatch.get("candidate_workspace")
+                         if dispatch.get("candidate_workspace") is not None
+                         else _candidate_workspace(result))
             evaluation = request["input"].get("evaluation") or {}
             outcomes = evaluation.get("gate_outcomes") or ()
             target_shas = {item.get("target_sha") for item in outcomes
@@ -430,6 +481,10 @@ def execute(request: dict[str, Any]) -> dict[str, Any]:
                 return {"accepted": False, "retryable": False,
                         "evidence_pointer": None,
                         "diagnostic": "CANDIDATE_EVALUATION_BINDING_FAILED"}
+            if workspace is not None and not _workspace_matches_candidate(workspace, expected):
+                return {"accepted": False, "retryable": False,
+                        "evidence_pointer": None,
+                        "diagnostic": "CANDIDATE_WORKSPACE_BINDING_FAILED"}
         evidence = result.get("evidence_result", {})
         accepted = evidence.get("status") == "complete"
         return {"accepted": accepted, "retryable": False, "evidence_pointer": evidence.get("artifact_hash"), "evidence": evidence, "diagnostic": None if accepted else result.get("refusal_code", "EVIDENCE_REJECTED")}
