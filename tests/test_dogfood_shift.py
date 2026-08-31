@@ -199,6 +199,26 @@ class PortfolioTests(unittest.TestCase):
         self.assertIn("escalated", shift.TERMINAL_MISSION_STATES)
         self.assertNotIn("completed", shift.UNSUCCESSFUL_MISSION_STATES)
 
+    def test_the_infrastructure_vocabulary_has_one_definition(self):
+        """Two planes read it for two decisions; a private copy is how they drift."""
+
+        self.assertIs(supervisor.INFRASTRUCTURE_PREFIXES,
+                      ledger.INFRASTRUCTURE_REASON_PREFIXES)
+        for prefix in ledger.SIDE_EFFECT_POSSIBLE_PREFIXES:
+            self.assertIn(prefix, ledger.INFRASTRUCTURE_REASON_PREFIXES)
+
+    def test_a_retryable_slot_is_not_settled_for_the_walk_and_is_for_the_ledger(self):
+        """The default stays strictly serial: an unclassified caller sees no retry."""
+
+        outcomes = {"DF-1": "refused"}
+        self.assertEqual(PORTFOLIO.next_mission(outcomes).mission_ref, "DF-2")
+        self.assertEqual(
+            PORTFOLIO.next_mission(outcomes, {"DF-1"}).mission_ref, "DF-1")
+        self.assertIn("refused", shift.TERMINAL_MISSION_STATES)
+        done = {mission.mission_ref: "completed" for mission in PORTFOLIO.missions}
+        self.assertTrue(PORTFOLIO.complete(done))
+        self.assertFalse(PORTFOLIO.complete(done, {"DF-4"}))
+
     def test_an_escalated_mission_does_not_stall_the_sequence(self):
         """A person owns it now; the portfolio must not offer it forever."""
 

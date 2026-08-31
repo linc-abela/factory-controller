@@ -60,6 +60,7 @@ from . import improvement as improvement_plane
 from . import maintenance as maintenance_plane
 from . import portfolio as portfolio_policy
 from . import production
+from . import store as ledger
 
 
 CONTRACT_VERSION = "factory-controller/supervisor/1.0"
@@ -126,15 +127,11 @@ EXPERIMENT_PROMOTABLE = "baseline_measured"
 
 #: Terminal reasons that mean the execution layer could not serve the mission.
 #: These are infrastructure facts, not verdicts about the work, and they are the
-#: only thing that moves the suppression counter.
-INFRASTRUCTURE_PREFIXES = (
-    "NO_ADMISSIBLE_PROVIDER",
-    "PROVIDER_ROUTE_EXHAUSTED",
-    "PROVIDER_SWITCH_AFTER_",
-    "CONTEXT_BROKER_UNAVAILABLE",
-    "CONTEXT_BROKER_UNREADABLE",
-    "RETRIES_EXHAUSTED",
-)
+#: only thing that moves the suppression counter.  The set itself lives in the
+#: ledger that owns ``terminal_reason``: the shift plane reads the same one to
+#: decide whether a portfolio slot may be retried, and this module holding a
+#: private copy is how the two would drift apart.
+INFRASTRUCTURE_PREFIXES = ledger.INFRASTRUCTURE_REASON_PREFIXES
 
 #: Terminal reasons that mean an Owner ceiling refused the work.  Recorded, and
 #: deliberately *not* counted as infrastructure: a budget that is spent is a

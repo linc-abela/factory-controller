@@ -35,6 +35,9 @@
       "objective": "Run the same path against a declared gate that is known to fail, and prove the failure is recorded as a failure. At baseline 4072bfd7 dev reproduce exits 1 by design; the mission succeeds when the Factory reports that non-zero exit as an unmet gate with the exit status preserved, and fails if the run is reported healthy.",
       "baseline_sha": "4072bfd7c008d3b227e2e164ecbe6f58013c2733",
       "acceptance_gate_ids": ["dev-check", "dev-test", "dev-reproduce"],
+      "acceptance_gate_expectations": {
+        "dev-reproduce": {"passed": false, "exit_code": 1}
+      },
       "acceptance_gate_source": "https://github.com/linc-abela/factory-bug-lab.git@4072bfd7c008d3b227e2e164ecbe6f58013c2733:dev",
       "mutates_repository": false,
       "stop_conditions": [

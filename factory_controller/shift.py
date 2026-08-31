@@ -55,7 +55,7 @@ import json
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Mapping, Sequence
+from typing import Any, Collection, Mapping, Sequence
 
 from factory_controller import activation, dogfood, store as ledger
 
@@ -187,6 +187,36 @@ TERMINAL_MISSION_STATES = frozenset(ledger.TERMINAL) | {"escalated"}
 #: ``REPEATED_MISSION_FAILURE`` counts.
 UNSUCCESSFUL_MISSION_STATES = TERMINAL_MISSION_STATES - {"completed"}
 
+#: How many missions one portfolio slot may consume, counting the first.
+#: Bounded for the same reason ``MAX_MISSION_CEILING`` is: what is being
+#: repeated is a *dispatch*, and a repeat rule with no ceiling is an unattended
+#: loop.  Three matches the ledger's own ``max_attempts`` default, so a slot
+#: cannot outlive more rounds than the engine already allows inside one.
+MAX_SLOT_ATTEMPTS = 3
+
+#: Why a portfolio slot may or may not be attempted again.  Exactly one of
+#: these describes a slot, and only the first admits a retry.
+RETRY_CLASSES = (
+    #: The layer could not serve the mission, nothing it did survives, and the
+    #: slot has attempts left.
+    "retryable_infrastructure",
+    #: No attempt has settled yet -- the slot is live, not retryable.
+    "not_settled",
+    #: Terminal in a state that is not ``refused``: completed, failed,
+    #: cancelled, or escalated to a person.  None of those is an unanswered
+    #: question about the layer.
+    "settled",
+    #: The refusal is a reading of the mission itself.  Asking again with the
+    #: same frozen inputs asks the same question, so the answer is the same.
+    "deterministic_refusal",
+    #: Infrastructure, but a provider effect may already have happened.
+    #: ``engine`` refused to dispatch this work a second time for that reason;
+    #: reopening it one layer up would overrule a safety decision.
+    "side_effect_possible",
+    #: Infrastructure and safe, but the slot has spent MAX_SLOT_ATTEMPTS.
+    "attempts_exhausted",
+)
+
 #: A portfolio mission carries its own stop and rollback rules because the run
 #: contract's are about the *run*.  "Roll back the whole run" is not a boundary
 #: a first dogfood mission can act on.
@@ -195,6 +225,18 @@ REQUIRED_MISSION_KEYS = ("mission_ref", "project_id", "work_class",
                          "acceptance_gate_ids", "acceptance_gate_source",
                          "stop_conditions", "rollback_boundary",
                          "evidence_required")
+
+
+@dataclass(frozen=True)
+class GateExpectation:
+    """An explicit, recorded non-zero gate result that still proves the goal."""
+
+    gate_id: str
+    passed: bool
+    exit_code: int
+
+    def as_row(self) -> dict[str, Any]:
+        return {"passed": self.passed, "exit_code": self.exit_code}
 
 
 @dataclass(frozen=True)
@@ -212,6 +254,7 @@ class PortfolioMission:
     rollback_boundary: str
     evidence_required: tuple[str, ...]
     mutates_repository: bool
+    acceptance_gate_expectations: tuple[GateExpectation, ...] = ()
 
     def as_row(self) -> dict[str, Any]:
         return {"order": self.order, "mission_ref": self.mission_ref,
@@ -224,7 +267,83 @@ class PortfolioMission:
                 "stop_conditions": list(self.stop_conditions),
                 "rollback_boundary": self.rollback_boundary,
                 "evidence_required": list(self.evidence_required),
-                "mutates_repository": self.mutates_repository}
+                "mutates_repository": self.mutates_repository,
+                "acceptance_gate_expectations": {
+                    item.gate_id: item.as_row()
+                    for item in self.acceptance_gate_expectations}}
+
+
+@dataclass(frozen=True)
+class SlotReading:
+    """Everything the ledger knows about one portfolio slot, across attempts.
+
+    A slot is the position a frozen portfolio names; a mission is one attempt
+    at it.  Those were the same thing until the first live dispatch settled
+    ``refused`` on a defect in the seam between two repositories, and the
+    portfolio -- reading one attempt as the slot -- walked on to the next
+    mission with the first one never actually judged.
+    """
+
+    mission_ref: str
+    attempts: int
+    state: str | None
+    terminal_reason: str
+    retry_class: str
+
+    @property
+    def retryable(self) -> bool:
+        return self.retry_class == "retryable_infrastructure"
+
+    @property
+    def next_attempt(self) -> int:
+        return self.attempts + 1
+
+    def as_row(self) -> dict[str, Any]:
+        return {"mission_ref": self.mission_ref, "attempts": self.attempts,
+                "state": self.state or "not_run",
+                "terminal_reason": self.terminal_reason or "not_applicable",
+                "retry_class": self.retry_class, "retryable": self.retryable}
+
+
+def retry_classification(state: str | None, terminal_reason: str,
+                         attempts: int) -> str:
+    """Whether one settled slot may be attempted again, and why not.
+
+    Three conditions, and every one of them is read from a decision some other
+    module already made rather than re-derived here.
+
+    ``refused`` is the state ``engine.work_once`` writes when a mission stops
+    while it is still ``dispatching`` -- before the transition to ``dispatched``
+    that records a ``candidate_sha``.  So a refused mission produced no
+    candidate and nothing downstream was built on it.  ``failed``, ``escalated``
+    and ``cancelled`` are excluded by that same rule: they are the states that
+    mean the mission got further, or that a person now owns it.
+
+    The reason must be one the ledger lists as an execution-layer fact.  Every
+    other refusal is a verdict about the mission's own frozen inputs -- a denied
+    profile, an invalid policy, an undeclared gate -- and those are deterministic
+    in the strict sense: the same inputs reach the same answer, so a retry is a
+    slower way of being refused twice.  The default is therefore *final*, and
+    the allowlist is the only way out of it.
+
+    Finally, a reason that names a provider switch after a possible side effect
+    is excluded even though it is infrastructure.  ``engine`` reached it by
+    refusing to dispatch the same work again, and a portfolio that retried it
+    would be overruling that refusal from one layer up.
+    """
+
+    if state != "refused":
+        return "settled" if state in TERMINAL_MISSION_STATES else "not_settled"
+    reason = terminal_reason or ""
+    if not any(reason.startswith(prefix)
+               for prefix in ledger.INFRASTRUCTURE_REASON_PREFIXES):
+        return "deterministic_refusal"
+    if any(reason.startswith(prefix)
+           for prefix in ledger.SIDE_EFFECT_POSSIBLE_PREFIXES):
+        return "side_effect_possible"
+    if attempts >= MAX_SLOT_ATTEMPTS:
+        return "attempts_exhausted"
+    return "retryable_infrastructure"
 
 
 @dataclass(frozen=True)
@@ -250,20 +369,35 @@ class Portfolio:
                 "mission_count": len(self.missions),
                 "missions": [mission.as_row() for mission in self.missions]}
 
-    def next_mission(self, outcomes: Mapping[str, str]) -> PortfolioMission | None:
+    def next_mission(self, outcomes: Mapping[str, str],
+                     retryable: Collection[str] = ()) -> PortfolioMission | None:
         """The first mission not yet terminal, or ``None`` when all are.
 
         A mission whose predecessor has not settled is not returned, which is
         what makes the sequence a sequence rather than a set.
+
+        ``retryable`` names slots whose settlement was the execution layer
+        failing to serve them rather than an answer about the work -- see
+        :func:`retry_classification`, which is the only thing allowed to put a
+        reference in that set.  A slot named there is not settled for the
+        purpose of *this* walk, and is settled for every other purpose: the
+        ledger keeps ``refused``, the attempt stays terminal, and nothing here
+        can make a mission that already ran count as in flight.  Defaulting to
+        empty is deliberate -- a caller that has not classified anything gets
+        the strictly serial rule it had before.
         """
 
         for mission in self.missions:
+            if mission.mission_ref in retryable:
+                return mission
             if outcomes.get(mission.mission_ref) not in TERMINAL_MISSION_STATES:
                 return mission
         return None
 
-    def complete(self, outcomes: Mapping[str, str]) -> bool:
-        return all(outcomes.get(mission.mission_ref) in TERMINAL_MISSION_STATES
+    def complete(self, outcomes: Mapping[str, str],
+                 retryable: Collection[str] = ()) -> bool:
+        return all(mission.mission_ref not in retryable
+                   and outcomes.get(mission.mission_ref) in TERMINAL_MISSION_STATES
                    for mission in self.missions)
 
 
@@ -310,6 +444,26 @@ def portfolio_from_payload(body: Any) -> Portfolio:
                                for item in value)):
                 raise ShiftError("mission %s: %s must be a non-empty list of "
                                  "names" % (mission_ref, key))
+        raw_expectations = row.get("acceptance_gate_expectations", {})
+        if not isinstance(raw_expectations, Mapping):
+            raise ShiftError("mission %s: acceptance_gate_expectations must be "
+                             "an object" % mission_ref)
+        expectations = []
+        for gate_id, expectation in raw_expectations.items():
+            if gate_id not in row["acceptance_gate_ids"]:
+                raise ShiftError(
+                    "mission %s: expectation names undeclared gate %r"
+                    % (mission_ref, gate_id))
+            if (not isinstance(expectation, Mapping)
+                    or expectation.get("passed") is not False
+                    or type(expectation.get("exit_code")) is not int
+                    or not 0 <= expectation["exit_code"] <= 255):
+                raise ShiftError(
+                    "mission %s: %s expectation must explicitly require a "
+                    "non-zero exit code and passed=false" % (mission_ref, gate_id))
+            expectations.append(GateExpectation(
+                gate_id=gate_id, passed=False,
+                exit_code=expectation["exit_code"]))
         missions.append(PortfolioMission(
             order=index + 1, mission_ref=mission_ref,
             project_id=row["project_id"], work_class=row["work_class"],
@@ -320,7 +474,8 @@ def portfolio_from_payload(body: Any) -> Portfolio:
             stop_conditions=tuple(row["stop_conditions"]),
             rollback_boundary=row["rollback_boundary"],
             evidence_required=tuple(row["evidence_required"]),
-            mutates_repository=bool(row.get("mutates_repository", True))))
+            mutates_repository=bool(row.get("mutates_repository", True)),
+            acceptance_gate_expectations=tuple(expectations)))
     return Portfolio(portfolio_ref=ref,
                      rationale=str(body.get("rationale", "unknown")),
                      missions=tuple(missions))
@@ -856,7 +1011,8 @@ def state(grant: Grant | None, facts: ShiftFacts, now: float) -> str:
 
 
 def admission(grant: Grant | None, portfolio_: Portfolio, facts: ShiftFacts,
-              outcomes: Mapping[str, str], now: float) -> dict[str, Any]:
+              outcomes: Mapping[str, str], now: float,
+              retryable: Collection[str] = ()) -> dict[str, Any]:
     """Whether one more mission may start, and which one it would be.
 
     Deliberately the only place that says yes.  Everything else in this module
@@ -879,7 +1035,7 @@ def admission(grant: Grant | None, portfolio_: Portfolio, facts: ShiftFacts,
                 "detail": "the first portfolio is strictly serial and one "
                           "mission is already running",
                 "drain_reasons": [], "mission": None}
-    mission = portfolio_.next_mission(outcomes)
+    mission = portfolio_.next_mission(outcomes, retryable)
     if mission is None:
         return {"admitted": False, "state": current,
                 "code": "SHIFT_PORTFOLIO_COMPLETE",
@@ -972,8 +1128,8 @@ class ShiftPlane:
                    (request_ref, event, actor,
                     json.dumps(dict(detail), sort_keys=True), self.clock()))
 
-    def outcomes(self, portfolio_: Portfolio) -> dict[str, str]:
-        """Each portfolio mission's durable state, or absence of one.
+    def slots(self, portfolio_: Portfolio) -> dict[str, SlotReading]:
+        """Every attempt at every portfolio slot, read as one row per slot.
 
         Keyed on the mission reference rather than the generated mission id: a
         portfolio names work, and the reference is the only identifier a
@@ -987,6 +1143,12 @@ class ShiftPlane:
         anything else, so matching only the bare reference would have made
         every real dogfood mission invisible to the portfolio that ordered it --
         the sequence would restart at its first mission forever.
+
+        A slot may hold more than one mission, because a retry is a new mission
+        bound to the same reference under a different context identity.  The
+        ordering is therefore load-bearing rather than incidental: the *latest*
+        attempt is the slot's state, and until SF-151 this method took whichever
+        row SQLite happened to return last.
         """
 
         refs = [mission.mission_ref for mission in portfolio_.missions]
@@ -1001,15 +1163,46 @@ class ShiftPlane:
                  .replace("_", "\\_") + ":%"))
         with self._store.transaction() as db:
             rows = db.execute(
-                "SELECT idempotency_key, state FROM missions WHERE %s" % clause,
+                "SELECT idempotency_key, state, terminal_reason FROM missions"
+                " WHERE %s ORDER BY created_at, rowid" % clause,
                 arguments).fetchall()
-        by_ref: dict[str, str] = {}
+        attempts: dict[str, list[Any]] = {}
         for row in rows:
             key = row["idempotency_key"]
             reference = key if key in refs else key.split(":", 1)[0]
             if reference in refs:
-                by_ref[reference] = row["state"]
-        return by_ref
+                attempts.setdefault(reference, []).append(row)
+        readings: dict[str, SlotReading] = {}
+        for reference, tries in attempts.items():
+            latest = tries[-1]
+            reason = latest["terminal_reason"] or ""
+            readings[reference] = SlotReading(
+                mission_ref=reference, attempts=len(tries),
+                state=latest["state"], terminal_reason=reason,
+                retry_class=retry_classification(
+                    latest["state"], reason, len(tries)))
+        return readings
+
+    def outcomes(self, portfolio_: Portfolio) -> dict[str, str]:
+        """Each portfolio slot's latest durable state, or absence of one.
+
+        Truthful about the ledger and nothing more: a slot whose latest attempt
+        was refused reports ``refused`` here even when it is retryable, because
+        this mapping is also what ``missions_in_flight`` and the Owner's brief
+        are read from, and a settled mission reported as unsettled would count
+        as running.  Whether the *slot* may be attempted again is a separate
+        reading -- :meth:`slots` -- deliberately not folded into this one.
+        """
+
+        return {reference: reading.state
+                for reference, reading in self.slots(portfolio_).items()
+                if reading.state is not None}
+
+    def retryable(self, portfolio_: Portfolio) -> frozenset[str]:
+        """The slots ``next_mission`` may offer again despite being settled."""
+
+        return frozenset(reference for reference, reading
+                         in self.slots(portfolio_).items() if reading.retryable)
 
     def observe(self, portfolio_: Portfolio, *, control_state: str,
                 gate_ready: bool, capacity_readings: Mapping[str, Any] | None = None,
@@ -1030,7 +1223,11 @@ class ShiftPlane:
         """
 
         readings = dict(capacity_readings or {})
-        settled = self.outcomes(portfolio_)
+        slots = self.slots(portfolio_)
+        settled = {reference: reading.state for reference, reading in slots.items()
+                   if reading.state is not None}
+        retryable = frozenset(reference for reference, reading in slots.items()
+                              if reading.retryable)
         refs = {mission.mission_ref for mission in portfolio_.missions}
         in_flight = sum(1 for ref, state_ in settled.items()
                         if ref in refs and state_ not in TERMINAL_MISSION_STATES)
@@ -1051,7 +1248,7 @@ class ShiftPlane:
             missions_in_flight=in_flight, missions_admitted=len(settled),
             spend=float(spend) if isinstance(spend, float) else 0.0,
             emergency_stop=emergency_stop,
-            portfolio_complete=portfolio_.complete(settled),
+            portfolio_complete=portfolio_.complete(settled, retryable),
             protected_surface_conflict=protected_surface_conflict,
             unresolved_uncertain_dispatches=unresolved_uncertain_dispatches,
             consecutive_failures=max(streak, consecutive_failures),
@@ -1296,7 +1493,8 @@ def brief(grant: Grant | None, facts: ShiftFacts, reading: Mapping[str, Any],
           admitted_projects: Sequence[str] = (),
           admitted_capabilities: Sequence[str] = (),
           checkpoints: Sequence[Mapping[str, Any]] = (),
-          owner_actions: Sequence[Mapping[str, str]] = ()) -> dict[str, Any]:
+          owner_actions: Sequence[Mapping[str, str]] = (),
+          retryable: Collection[str] = ()) -> dict[str, Any]:
     """The eleven answers an Owner needs, and the one act that follows them.
 
     Assembled rather than computed: every value here is produced by the module
@@ -1341,7 +1539,8 @@ def brief(grant: Grant | None, facts: ShiftFacts, reading: Mapping[str, Any],
              "outcome": outcomes.get(mission.mission_ref, "not_run")}
             for mission in portfolio_.missions],
         "next_mission": (lambda mission: None if mission is None
-                         else mission.as_row())(portfolio_.next_mission(outcomes)),
+                         else mission.as_row())(
+                             portfolio_.next_mission(outcomes, retryable)),
         "risk": {"drain_reasons": list(reasons),
                  "stop_conditions_armed": list(DRAIN_REASONS)},
         "checkpoints": [dict(item) for item in checkpoints],

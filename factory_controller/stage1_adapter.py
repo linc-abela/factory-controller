@@ -14,14 +14,19 @@ which the Controller turns into a refusal rather than a guess:
   ``_bound_idempotency_key``.
 * **acceptance gate outcomes** -- produced by running the target repository's own
   declared evaluator commands.  A declared gate with no command is ``not_run``,
-  which is a failure and never a pass.
+  which is a failure and never a pass.  Mutating missions are the strict form:
+  their commands run only in a detached worktree at the verified candidate
+  SHA, never in the admitted baseline checkout.
 """
 
 from __future__ import annotations
 
 import json
+import os
+import re
 import subprocess
 import sys
+import tempfile
 import time
 from pathlib import Path
 from typing import Any
@@ -164,6 +169,129 @@ def _run_gate(gate_id: str, argv: Any, workdir: Any, timeout: float) -> dict[str
     }
 
 
+_GIT_SHA = re.compile(r"^[0-9a-f]{40}$")
+_GIT_CLEAN_ENV = {"GIT_TERMINAL_PROMPT": "0"}
+
+
+def _candidate_sha(result: dict[str, Any]) -> str | None:
+    """Read the already-verified candidate identity from the dispatch result."""
+
+    envelope = result.get("execution_envelope") or {}
+    binding = result.get("execution_binding") or {}
+    candidate = (result.get("candidate_sha") or envelope.get("candidate_sha")
+                 or binding.get("candidate_sha"))
+    return candidate if isinstance(candidate, str) and _GIT_SHA.fullmatch(candidate) else None
+
+
+def _candidate_worktree(repository: Any, candidate_sha: str,
+                         timeout: float) -> tuple[tempfile.TemporaryDirectory, Path]:
+    """Materialize a detached candidate worktree without touching the source tree.
+
+    The Bridge's disposable provider lane is gone by the time Controller
+    evaluates the mission, but it imports the exact candidate object into the
+    registered checkout.  A detached worktree is therefore the smallest safe
+    handoff: the source checkout remains on its original branch, while every
+    gate sees the candidate commit and only that commit.
+    """
+
+    if not isinstance(repository, (str, os.PathLike)):
+        raise OSError("candidate source checkout is unavailable")
+    source = Path(repository).resolve()
+    if not source.is_dir():
+        raise OSError("candidate source checkout is not a directory")
+    temporary = tempfile.TemporaryDirectory(prefix="factory-candidate-")
+    worktree = Path(temporary.name) / "checkout"
+    try:
+        completed = subprocess.run(
+            ("git", "-C", str(source), "worktree", "add", "--force",
+             "--quiet", "--detach", str(worktree), candidate_sha),
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+            env=_GIT_CLEAN_ENV,
+            check=False,
+        )
+        if completed.returncode != 0 or not worktree.is_dir():
+            detail = completed.stderr.strip() or "git worktree add failed"
+            raise OSError(detail)
+        return temporary, worktree
+    except Exception:
+        temporary.cleanup()
+        raise
+
+
+def _remove_candidate_worktree(repository: Any, worktree: Path,
+                                temporary: tempfile.TemporaryDirectory) -> None:
+    """Release only the disposable candidate checkout, best effort."""
+
+    try:
+        subprocess.run(
+            ("git", "-C", str(Path(repository).resolve()), "worktree", "remove",
+             "--force", str(worktree)),
+            capture_output=True,
+            text=True,
+            timeout=30,
+            env=_GIT_CLEAN_ENV,
+            check=False,
+        )
+    finally:
+        temporary.cleanup()
+
+
+def _render_candidate_command(argv: Any, baseline: Any,
+                              candidate: Path) -> list[str] | None:
+    """Redirect source-checkout paths in a derived command to the candidate."""
+
+    if (not isinstance(argv, list) or not argv
+            or not all(isinstance(item, str) for item in argv)):
+        return None
+    if not isinstance(baseline, (str, os.PathLike)):
+        return None
+    source = str(Path(baseline).resolve())
+    target = str(candidate)
+    rendered: list[str] = []
+    for item in argv:
+        if "{candidate_worktree}" in item:
+            rendered.append(item.replace("{candidate_worktree}", target))
+        elif item == source or item.startswith(source + os.sep):
+            rendered.append(target + item[len(source):])
+        else:
+            rendered.append(item)
+    return rendered
+
+
+def _not_run_gate(gate_id: str, diagnostic: str,
+                  candidate_sha: str | None = None) -> dict[str, Any]:
+    outcome = {"gate_id": gate_id, "passed": False, "detail": "not_run",
+               "diagnostic": diagnostic, "evidence_class": "rederived"}
+    if candidate_sha is not None:
+        outcome["target_sha"] = candidate_sha
+    return outcome
+
+
+def _gate_expectations(config: dict[str, Any],
+                       mission: dict[str, Any]) -> dict[str, Any]:
+    """Return the immutable expected-result policy carried by intake."""
+
+    value = config.get("gate_expectations", mission.get(
+        "acceptance_gate_expectations", {}))
+    return value
+
+
+def _expected_gate_satisfied(outcome: dict[str, Any], expectation: Any) -> bool:
+    """Match an explicit expected result without rewriting the raw outcome."""
+
+    if expectation is None:
+        return outcome.get("passed") is True
+    return (
+        isinstance(expectation, dict)
+        and expectation.get("passed") is False
+        and type(expectation.get("exit_code")) is int
+        and outcome.get("passed") is False
+        and outcome.get("exit_code") == expectation.get("exit_code")
+    )
+
+
 def _evaluate(request: dict[str, Any], config: dict[str, Any],
               result: dict[str, Any]) -> dict[str, Any]:
     """Execute the gates this mission declared, in the target repository.
@@ -175,22 +303,95 @@ def _evaluate(request: dict[str, Any], config: dict[str, Any],
     """
 
     declared = tuple(_mission(request).get("acceptance_gate_ids") or ())
-    carried = {item.get("gate_id"): item
-               for item in (result.get("gate_outcomes")
-                            or result.get("evaluation", {}).get("gate_outcomes") or ())
-               if isinstance(item, dict)}
+    mutates_repository = bool(
+        config.get("mutates_repository")
+        or _mission(request).get("mutates_repository"))
+    carried = {} if mutates_repository else {
+        item.get("gate_id"): item
+        for item in (result.get("gate_outcomes")
+                     or result.get("evaluation", {}).get("gate_outcomes") or ())
+        if isinstance(item, dict)}
     if not declared:
         return {"passed": False, "gate_outcomes": [],
                 "diagnostic": "ACCEPTANCE_GATE_UNDECLARED"}
     commands = config.get("gate_commands") or {}
     workdir = config.get("gate_workdir", config.get("repository", config.get("workdir")))
     timeout = float(config.get("gate_timeout_seconds", 1800))
-    outcomes = [carried[gate] if gate in carried
-                else _run_gate(gate, commands.get(gate), workdir, timeout)
-                for gate in declared]
-    passed = all(outcome.get("passed") is True for outcome in outcomes)
-    return {"passed": passed, "gate_outcomes": outcomes,
-            "diagnostic": None if passed else "ACCEPTANCE_GATE_FAILED"}
+    expectations = _gate_expectations(config, _mission(request))
+    if not isinstance(expectations, dict):
+        return {"passed": False, "gate_outcomes": [
+                    _not_run_gate(gate, "ACCEPTANCE_GATE_EXPECTATION_INVALID")
+                    for gate in declared],
+                "diagnostic": "ACCEPTANCE_GATE_EXPECTATION_INVALID"}
+    target_sha = _candidate_sha(result) if mutates_repository else None
+    candidate_context = None
+    if mutates_repository:
+        if target_sha is None:
+            outcomes = [_not_run_gate(gate, "CANDIDATE_SHA_UNAVAILABLE")
+                        for gate in declared]
+            return {"passed": False, "gate_outcomes": outcomes,
+                    "diagnostic": "CANDIDATE_SHA_UNAVAILABLE",
+                    "target": "candidate"}
+        try:
+            candidate_context = _candidate_worktree(
+                config.get("repository", workdir), target_sha, timeout)
+        except (OSError, subprocess.TimeoutExpired) as exc:
+            outcomes = [_not_run_gate(
+                gate, "CANDIDATE_CHECKOUT_UNAVAILABLE: %s" % exc, target_sha)
+                        for gate in declared]
+            return {"passed": False, "gate_outcomes": outcomes,
+                    "diagnostic": "CANDIDATE_CHECKOUT_UNAVAILABLE",
+                    "target": "candidate", "target_sha": target_sha}
+        candidate_temp, candidate_worktree = candidate_context
+        try:
+            outcomes = []
+            for gate in declared:
+                command = _render_candidate_command(
+                    commands.get(gate), config.get("repository", workdir),
+                    candidate_worktree)
+                if command is None:
+                    outcome = _not_run_gate(
+                        gate, "ACCEPTANCE_GATE_COMMAND_UNDECLARED", target_sha)
+                    outcome["target"] = "candidate"
+                else:
+                    outcome = _run_gate(
+                        gate, command, candidate_worktree, timeout)
+                    outcome["target_sha"] = target_sha
+                    outcome["target"] = "candidate"
+                outcomes.append(outcome)
+        finally:
+            _remove_candidate_worktree(
+                config.get("repository", workdir), candidate_worktree,
+                candidate_temp)
+    else:
+        outcomes = [carried[gate] if gate in carried
+                    else _run_gate(gate, commands.get(gate), workdir, timeout)
+                    for gate in declared]
+    invalid_expectations = set(expectations) - set(declared)
+    if invalid_expectations:
+        return {"passed": False, "gate_outcomes": outcomes,
+                "diagnostic": "ACCEPTANCE_GATE_EXPECTATION_INVALID: "
+                + ", ".join(sorted(invalid_expectations))}
+    for gate, expectation in expectations.items():
+        if (not isinstance(expectation, dict)
+                or expectation.get("passed") is not False
+                or type(expectation.get("exit_code")) is not int
+                or not 0 <= expectation["exit_code"] <= 255):
+            return {"passed": False, "gate_outcomes": outcomes,
+                    "diagnostic": "ACCEPTANCE_GATE_EXPECTATION_INVALID: " + gate}
+    for outcome in outcomes:
+        expectation = expectations.get(outcome.get("gate_id"))
+        if expectation is not None:
+            outcome["expected_failure"] = True
+            outcome["satisfied"] = _expected_gate_satisfied(outcome, expectation)
+    passed = all(_expected_gate_satisfied(
+        outcome, expectations.get(outcome.get("gate_id")))
+                  for outcome in outcomes)
+    answer = {"passed": passed, "gate_outcomes": outcomes,
+              "diagnostic": None if passed else "ACCEPTANCE_GATE_FAILED"}
+    if mutates_repository:
+        answer.update({"target": "candidate", "target_sha": target_sha})
+    return answer
 
 
 def execute(request: dict[str, Any]) -> dict[str, Any]:
@@ -205,8 +406,30 @@ def execute(request: dict[str, Any]) -> dict[str, Any]:
         verified = verification.get("verified") is True
         return {"verified": verified, "verification": verification, "diagnostic": None if verified else result.get("refusal_code", "CANDIDATE_VERIFICATION_FAILED")}
     if step == "evaluate":
+        # ``candidate_sha`` is normally also present inside the Evidence Core
+        # envelope.  Preserve the Controller dispatch projection here so a
+        # candidate identity cannot disappear between verification and gate
+        # evaluation when an adapter supplies only the top-level field.
+        if dispatch.get("candidate_sha") and "candidate_sha" not in result:
+            result = {**result, "candidate_sha": dispatch["candidate_sha"]}
         return _evaluate(request, config, result)
     if step == "evidence":
+        mission = _mission(request)
+        if (config.get("mutates_repository")
+                or mission.get("mutates_repository")):
+            expected = dispatch.get("candidate_sha") or _candidate_sha(result)
+            evaluation = request["input"].get("evaluation") or {}
+            outcomes = evaluation.get("gate_outcomes") or ()
+            target_shas = {item.get("target_sha") for item in outcomes
+                           if isinstance(item, dict)}
+            if (not expected or evaluation.get("target") != "candidate"
+                    or evaluation.get("target_sha") != expected
+                    or target_shas != {expected}
+                    or any(item.get("target") != "candidate"
+                           for item in outcomes if isinstance(item, dict))):
+                return {"accepted": False, "retryable": False,
+                        "evidence_pointer": None,
+                        "diagnostic": "CANDIDATE_EVALUATION_BINDING_FAILED"}
         evidence = result.get("evidence_result", {})
         accepted = evidence.get("status") == "complete"
         return {"accepted": accepted, "retryable": False, "evidence_pointer": evidence.get("artifact_hash"), "evidence": evidence, "diagnostic": None if accepted else result.get("refusal_code", "EVIDENCE_REJECTED")}

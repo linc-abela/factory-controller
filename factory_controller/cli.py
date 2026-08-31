@@ -1073,7 +1073,8 @@ def _shift(args, controller) -> int:
         return 0
     if args.action == "admit":
         print(json.dumps(shift_plane.admission(grant, entry, observed,
-                                               plane.outcomes(entry), now),
+                                               plane.outcomes(entry), now,
+                                               plane.retryable(entry)),
                          sort_keys=True))
         return 0
     owner_actions = [{"check": row["check"], "detail": row["detail"]}
@@ -1082,7 +1083,8 @@ def _shift(args, controller) -> int:
         grant, observed, reading, entry, plane.outcomes(entry), now,
         admitted_projects=sorted(controller.store.projects()),
         admitted_capabilities=sorted(contract.work_classes),
-        owner_actions=owner_actions), sort_keys=True, default=str))
+        owner_actions=owner_actions,
+        retryable=plane.retryable(entry)), sort_keys=True, default=str))
     return 0
 
 

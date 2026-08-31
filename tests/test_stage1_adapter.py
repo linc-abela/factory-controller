@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import os
 import stat
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -116,6 +117,113 @@ class Stage1AdapterTest(unittest.TestCase):
                           "input": {"mission": mission, "dispatch": dispatch}})
         self.assertFalse(failed["passed"])
         self.assertEqual(failed["gate_outcomes"][0]["exit_code"], 1)
+
+    def test_mutating_gate_runs_against_the_verified_candidate_not_the_baseline(self):
+        """A green candidate gate must not be a green baseline gate in disguise."""
+
+        repository = self.root / "candidate-repository"
+        repository.mkdir()
+        self._git(repository, "init", "--quiet")
+        self._git(repository, "config", "user.email", "factory-test@example.invalid")
+        self._git(repository, "config", "user.name", "Factory Test")
+        (repository / "state.txt").write_text("baseline\n")
+        gate = repository / "gate.sh"
+        gate.write_text(
+            "#!/bin/sh\n"
+            "test \"$(cat state.txt)\" = candidate\n")
+        gate.chmod(gate.stat().st_mode | stat.S_IEXEC)
+        self._git(repository, "add", "state.txt", "gate.sh")
+        self._git(repository, "commit", "--quiet", "-m", "baseline")
+        baseline = self._git(repository, "rev-parse", "HEAD")
+
+        (repository / "state.txt").write_text("candidate\n")
+        self._git(repository, "commit", "--quiet", "-am", "candidate")
+        candidate = self._git(repository, "rev-parse", "HEAD")
+        self._git(repository, "checkout", "--quiet", "--detach", baseline)
+
+        config = {
+            "repository": str(repository),
+            "gate_workdir": str(repository),
+            "gate_commands": {"G1": ["{candidate_worktree}/gate.sh"]},
+            "mutates_repository": True,
+        }
+        mission = {"stage1": config, "acceptance_gate_ids": ["G1"],
+                   "mutates_repository": True}
+        dispatch = {
+            "candidate_sha": candidate,
+            "stage1_result": {
+                "execution_envelope": {"candidate_sha": candidate},
+                # A carried pass is deliberately ignored for a mutating mission.
+                "gate_outcomes": [{"gate_id": "G1", "passed": True}],
+            },
+        }
+
+        evaluation = execute({
+            "step": "evaluate", "operation_key": "m:evaluate-candidate",
+            "input": {"mission": mission, "dispatch": dispatch},
+        })
+
+        self.assertTrue(evaluation["passed"])
+        self.assertEqual(evaluation["target"], "candidate")
+        self.assertEqual(evaluation["target_sha"], candidate)
+        self.assertEqual(evaluation["gate_outcomes"][0]["target_sha"], candidate)
+        self.assertEqual(evaluation["gate_outcomes"][0]["target"], "candidate")
+        self.assertNotEqual((repository / "state.txt").read_text(), "candidate\n")
+        self.assertEqual(self._git(repository, "rev-parse", "HEAD"), baseline)
+
+    def test_mutating_gate_refuses_without_a_candidate_and_does_not_run_baseline(self):
+        gate = self.root / "baseline-only.sh"
+        gate.write_text("#!/bin/sh\nexit 0\n")
+        gate.chmod(gate.stat().st_mode | stat.S_IEXEC)
+        config = {
+            "repository": str(self.root),
+            "gate_workdir": str(self.root),
+            "gate_commands": {"G1": [str(gate)]},
+            "mutates_repository": True,
+        }
+        mission = {"stage1": config, "acceptance_gate_ids": ["G1"],
+                   "mutates_repository": True}
+
+        evaluation = execute({
+            "step": "evaluate", "operation_key": "m:evaluate-missing-candidate",
+            "input": {"mission": mission, "dispatch": {}},
+        })
+
+        self.assertFalse(evaluation["passed"])
+        self.assertEqual(evaluation["diagnostic"], "CANDIDATE_SHA_UNAVAILABLE")
+        self.assertEqual(evaluation["gate_outcomes"][0]["detail"], "not_run")
+
+    def test_explicit_expected_failure_preserves_nonzero_exit_and_satisfies_mission(self):
+        gate = self.root / "expected-failure.sh"
+        gate.write_text("#!/bin/sh\nexit 1\n")
+        gate.chmod(gate.stat().st_mode | stat.S_IEXEC)
+        config = dict(
+            self.config,
+            gate_commands={"G-EXPECTED": [str(gate)]},
+            gate_workdir=str(self.root),
+            gate_expectations={"G-EXPECTED": {"passed": False, "exit_code": 1}},
+        )
+        mission = {"stage1": config, "acceptance_gate_ids": ["G-EXPECTED"]}
+
+        evaluation = execute({
+            "step": "evaluate", "operation_key": "m:evaluate-expected-failure",
+            "input": {"mission": mission, "dispatch": {}},
+        })
+
+        self.assertTrue(evaluation["passed"])
+        outcome = evaluation["gate_outcomes"][0]
+        self.assertFalse(outcome["passed"])
+        self.assertEqual(outcome["exit_code"], 1)
+        self.assertTrue(outcome["expected_failure"])
+        self.assertTrue(outcome["satisfied"])
+
+    @staticmethod
+    def _git(repository: Path, *arguments: str) -> str:
+        completed = subprocess.run(
+            ("git", "-C", str(repository), *arguments),
+            check=True, capture_output=True, text=True,
+        )
+        return completed.stdout.strip()
 
 
 if __name__ == "__main__":

@@ -32,6 +32,40 @@ ALLOWED_TRANSITIONS = {
     "escalated": {"failed", "cancelled"},
 }
 
+#: Terminal reasons that mean the execution layer could not serve the mission.
+#: These are facts about the host, not verdicts about the work.
+#:
+#: Stated here, beside the state vocabulary they qualify, because two planes
+#: read them for two different decisions -- the supervisor's project
+#: suppression and the shift plane's portfolio-slot retry -- and a second copy
+#: would be the seventh fork of a set in this package.  ``supervisor`` held the
+#: only copy until SF-151 needed the same fact one plane over.
+#:
+#: The four seam entries were added by SF-151 from the first live dogfood
+#: dispatch, where DF-1 settled ``EXECUTION_MODE_UNPROVEN: layer reported
+#: unknown`` because two dataclasses in two repositories claimed one schema
+#: version.  Every one of them is a statement about what the *layer* proved,
+#: raised by ``engine._verify_receipt``; none is a reading of the mission.
+INFRASTRUCTURE_REASON_PREFIXES = (
+    "NO_ADMISSIBLE_PROVIDER",
+    "PROVIDER_ROUTE_EXHAUSTED",
+    "PROVIDER_SWITCH_AFTER_",
+    "CONTEXT_BROKER_UNAVAILABLE",
+    "CONTEXT_BROKER_UNREADABLE",
+    "RETRIES_EXHAUSTED",
+    "EXECUTION_MODE_UNPROVEN",
+    "EXECUTION_MODE_MISMATCH",
+    "IDEMPOTENCY_KEY_UNPROVEN",
+    "IDEMPOTENCY_KEY_DIVERGED",
+)
+
+#: The subset of the above that leaves a provider effect possible.  ``engine``
+#: writes these exactly when ``gateway.may_reroute`` refused a second dispatch
+#: because the layer could not prove no process started -- so a caller deciding
+#: whether to dispatch the same work again must honour that refusal rather than
+#: reopen it one layer up.
+SIDE_EFFECT_POSSIBLE_PREFIXES = ("PROVIDER_SWITCH_AFTER_",)
+
 
 class ConflictError(ValueError):
     """An idempotency key was reused with different immutable input."""

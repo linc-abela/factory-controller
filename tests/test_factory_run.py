@@ -20,6 +20,7 @@ from unittest import mock
 from factory_controller import dogfood_intake, routing, shift as shift_plane
 from factory_controller.context import sha256_hex
 
+from tests.support import LayerAdapter, RouteTestCase, mission_payload
 from tests.test_factory_lifecycle import PROTOTYPE_SHA, FactoryLifecycleTests
 
 
@@ -195,12 +196,9 @@ class FactoryRunTests(unittest.TestCase):
         settled = self.lifecycle.dispatch("run")
 
         self.assertEqual(running.details["mission_ref"], "DF-1")
-        self.assertFalse(settled.ok, settled.render())
-        # DF-2 targets a project registered for a capability the evidence
-        # layer does not admit, so the serial rule advances and the next
-        # mission refuses on its own merits rather than being skipped.
-        self.assertEqual(settled.details["code"], "CAPABILITY_NOT_ADMISSIBLE")
-        self.assertEqual(len(self.missions()), 1)
+        self.assertTrue(settled.ok, settled.render())
+        self.assertEqual(settled.details["mission_ref"], "DF-2")
+        self.assertEqual(len(self.missions()), 2)
 
     def test_status_reports_work_without_naming_an_internal_id(self):
         self.ready()
@@ -273,15 +271,15 @@ class IntakeRefusalTests(unittest.TestCase):
         return next(item for item in self.entry.missions
                     if item.mission_ref == reference)
 
-    def test_a_mission_that_changes_a_repository_is_not_materialized(self):
-        with self.assertRaises(dogfood_intake.IntakeError) as raised:
-            self.build(self.mission("DF-3"))
-
-        self.assertEqual(raised.exception.code, "MISSION_CHANGES_A_REPOSITORY")
+    def test_a_mutating_mission_is_materialized_with_candidate_target(self):
+        intake = self.build(self.mission("DF-3"))
+        self.assertEqual(intake.mission_ref, "DF-3")
+        self.assertTrue(intake.payload["stage1"]["mutates_repository"])
 
     def test_a_capability_the_evidence_layer_refuses_is_caught_first(self):
+        self.registry[0] = {**self.registry[0], "capabilities": ["unknown_capability"]}
         with self.assertRaises(dogfood_intake.IntakeError) as raised:
-            self.build(self.mission("DF-2"))
+            self.build(self.mission("DF-1"))
 
         self.assertEqual(raised.exception.code, "CAPABILITY_NOT_ADMISSIBLE")
 
@@ -343,6 +341,328 @@ class AdapterSeamTests(unittest.TestCase):
         self.assertEqual(answer["status"], "refused")
         self.assertEqual(answer["diagnostic"],
                          "FIXTURE_PROVIDER_REFUSES_REAL_MISSION")
+
+
+class RetryClassificationTests(unittest.TestCase):
+    """The one rule that says whether a settled slot may be attempted again.
+
+    The default is *final*.  Everything below is either the narrow allowlist
+    that lets a slot out of that default, or one of the three ways back into it.
+    """
+
+    def test_an_infrastructure_refusal_before_the_boundary_is_retryable(self):
+        """DF-1's own refusal, verbatim from the first live dispatch."""
+
+        self.assertEqual(
+            shift_plane.retry_classification(
+                "refused", "EXECUTION_MODE_UNPROVEN: layer reported unknown", 1),
+            "retryable_infrastructure")
+
+    def test_every_seam_refusal_the_engine_can_raise_is_classified(self):
+        for reason in ("EXECUTION_MODE_UNPROVEN: layer reported unknown",
+                       "EXECUTION_MODE_MISMATCH: mission declares real, "
+                       "layer reported fixture",
+                       "IDEMPOTENCY_KEY_UNPROVEN: layer echoed no key",
+                       "IDEMPOTENCY_KEY_DIVERGED: layer bound x, mission is y",
+                       "NO_ADMISSIBLE_PROVIDER: considered 1 candidate(s)",
+                       "PROVIDER_ROUTE_EXHAUSTED: considered 2 candidate(s)",
+                       "CONTEXT_BROKER_UNAVAILABLE",
+                       "RETRIES_EXHAUSTED"):
+            with self.subTest(reason=reason):
+                self.assertEqual(
+                    shift_plane.retry_classification("refused", reason, 1),
+                    "retryable_infrastructure")
+
+    def test_a_refusal_about_the_mission_itself_stays_settled(self):
+        """A verdict on frozen inputs reaches the same verdict next time."""
+
+        for reason in ("PROVIDER_POLICY_VIOLATION: beta is denied by this mission",
+                       "INVALID_EXECUTION_MODE: 'sideways'",
+                       "ACCEPTANCE_GATE_UNDECLARED",
+                       "REAL_MISSION_CONTEXT_MANIFEST_MISSING",
+                       "MISSION_BUDGET_EXHAUSTED: known spend 5 of ceiling 5",
+                       "UNCERTAIN_DISPATCH_OUTCOME_UNRESOLVED",
+                       "DISPATCHED_RESULT_UNRECOVERABLE: provider_unavailable",
+                       ""):
+            with self.subTest(reason=reason):
+                self.assertEqual(
+                    shift_plane.retry_classification("refused", reason, 1),
+                    "deterministic_refusal")
+
+    def test_an_infrastructure_refusal_that_may_have_run_stays_settled(self):
+        """The engine refused a second dispatch; the portfolio may not reopen it."""
+
+        for reason in ("PROVIDER_SWITCH_AFTER_SIDE_EFFECT: recovery changed "
+                       "provider 'a' -> 'b'",
+                       "PROVIDER_SWITCH_AFTER_UNCERTAIN_OUTCOME: alpha did not "
+                       "prove no process started (UNKNOWABLE)"):
+            with self.subTest(reason=reason):
+                self.assertEqual(
+                    shift_plane.retry_classification("refused", reason, 1),
+                    "side_effect_possible")
+
+    def test_only_refused_is_eligible_at_all(self):
+        infrastructure = "EXECUTION_MODE_UNPROVEN: layer reported unknown"
+        for state in ("completed", "failed", "cancelled", "escalated"):
+            with self.subTest(state=state):
+                self.assertEqual(
+                    shift_plane.retry_classification(state, infrastructure, 1),
+                    "settled")
+        for state in (None, "admitted", "dispatching", "dispatched"):
+            with self.subTest(state=state):
+                self.assertEqual(
+                    shift_plane.retry_classification(state, "", 1),
+                    "not_settled")
+
+    def test_a_slot_stops_being_retryable_once_its_attempts_are_spent(self):
+        reason = "EXECUTION_MODE_UNPROVEN: layer reported unknown"
+        self.assertEqual(
+            shift_plane.retry_classification(
+                "refused", reason, shift_plane.MAX_SLOT_ATTEMPTS - 1),
+            "retryable_infrastructure")
+        self.assertEqual(
+            shift_plane.retry_classification(
+                "refused", reason, shift_plane.MAX_SLOT_ATTEMPTS),
+            "attempts_exhausted")
+
+
+class RefusalBoundaryTests(RouteTestCase, unittest.TestCase):
+    """The safety property the retry rule rests on.
+
+    ``engine.work_once`` writes ``refused`` only while the mission is still
+    ``dispatching``.  Past that boundary the same non-retryable failure settles
+    ``failed`` instead -- which the rule reads as ``settled`` and never retries.
+    If that ever inverted a retry could duplicate a provider effect, so it is
+    pinned here rather than assumed.
+    """
+
+    def test_a_refused_mission_never_recorded_a_candidate(self):
+        controller, store, _ = self.build(LayerAdapter(verified=False))
+        mission, _ = controller.submit(mission_payload(), "post-boundary")
+
+        result = controller.work_once("w1")
+
+        self.assertEqual(result["state"], "failed")
+        self.assertEqual(result["terminal_reason"], "ANCESTRY_FAILED")
+        self.assertEqual(
+            shift_plane.retry_classification(
+                result["state"], result["terminal_reason"], 1),
+            "settled")
+        self.assertEqual(store.get(mission["id"])["state"], "failed")
+
+
+class SlotReadingTests(unittest.TestCase):
+    """A slot holds attempts; its state is the latest one, not an arbitrary one."""
+
+    def plane(self):
+        import tempfile
+        from pathlib import Path
+
+        from factory_controller.store import MissionStore
+
+        temp = tempfile.TemporaryDirectory()
+        self.addCleanup(temp.cleanup)
+        store = MissionStore(Path(temp.name) / "controller.db")
+        return store, shift_plane.ShiftPlane(store), shift_plane.load_portfolio(PORTFOLIO)
+
+    def settle(self, store, key, state, reason):
+        mission, _ = store.submit({"work_item_id": key.split(":")[0]}, key)
+        claimed = store.claim("w")
+        store.transition(claimed["id"], claimed["lease_token"], state,
+                         reason=reason, release_lease=True)
+        return mission["id"]
+
+    def test_the_latest_attempt_is_the_slots_state(self):
+        store, plane, entry = self.plane()
+        refusal = "EXECUTION_MODE_UNPROVEN: layer reported unknown"
+        self.settle(store, "DF-1:" + "a" * 64, "refused", refusal)
+        store.submit({"work_item_id": "DF-1"}, "DF-1:" + "b" * 64)
+
+        reading = plane.slots(entry)["DF-1"]
+
+        self.assertEqual(reading.attempts, 2)
+        self.assertEqual(reading.state, "admitted")
+        self.assertEqual(reading.retry_class, "not_settled")
+        self.assertEqual(plane.outcomes(entry), {"DF-1": "admitted"})
+        self.assertEqual(plane.retryable(entry), frozenset())
+
+    def test_a_retryable_slot_is_offered_again_rather_than_the_next_one(self):
+        store, plane, entry = self.plane()
+        self.settle(store, "DF-1:" + "a" * 64, "refused",
+                    "EXECUTION_MODE_UNPROVEN: layer reported unknown")
+
+        outcomes, retryable = plane.outcomes(entry), plane.retryable(entry)
+
+        # The ledger is unchanged: the attempt is settled and stays settled.
+        self.assertEqual(outcomes, {"DF-1": "refused"})
+        self.assertEqual(retryable, frozenset({"DF-1"}))
+        self.assertEqual(entry.next_mission(outcomes).mission_ref, "DF-2")
+        self.assertEqual(
+            entry.next_mission(outcomes, retryable).mission_ref, "DF-1")
+        self.assertFalse(entry.complete(outcomes, retryable))
+        self.assertEqual(plane.slots(entry)["DF-1"].next_attempt, 2)
+
+    def test_a_deterministic_refusal_lets_the_sequence_advance(self):
+        store, plane, entry = self.plane()
+        self.settle(store, "DF-1:" + "a" * 64, "refused",
+                    "PROVIDER_POLICY_VIOLATION: codex-primary is denied")
+
+        outcomes, retryable = plane.outcomes(entry), plane.retryable(entry)
+
+        self.assertEqual(retryable, frozenset())
+        self.assertEqual(
+            entry.next_mission(outcomes, retryable).mission_ref, "DF-2")
+
+
+class RetryRunTests(unittest.TestCase):
+    """`./dev factory run` over a slot whose first attempt the layer refused."""
+
+    setUp = FactoryLifecycleTests.setUp
+    ready = FactoryRunTests.ready
+    missions = FactoryRunTests.missions
+
+    INFRASTRUCTURE = "EXECUTION_MODE_UNPROVEN: layer reported unknown"
+
+    #: The ledger's own path from a claim to success.  A refusal is one step
+    #: because that is exactly what makes it retryable: the mission stopped
+    #: while it was still `dispatching`, before a candidate was recorded.
+    TO_COMPLETED = ("dispatched", "candidate_verified", "evaluated",
+                    "evidence_sealed", "completed")
+
+    def settle(self, state, reason=None):
+        """Settle the mission the Owner just started, the way the engine does."""
+
+        store = self.lifecycle.store
+        claimed = store.claim("supervisor")
+        steps = self.TO_COMPLETED if state == "completed" else (state,)
+        for index, step in enumerate(steps):
+            store.transition(claimed["id"], claimed["lease_token"], step,
+                             reason=reason,
+                             release_lease=index == len(steps) - 1)
+        return claimed["id"]
+
+    def first_attempt(self, reason=None):
+        self.ready()
+        started = self.lifecycle.dispatch("run")
+        self.assertTrue(started.ok, started.render())
+        self.assertEqual(started.details["attempt"], 1)
+        return started, self.settle("refused", reason or self.INFRASTRUCTURE)
+
+    # -- the re-offer ----------------------------------------------------- #
+
+    def test_an_infrastructure_refusal_is_re_offered_as_a_second_attempt(self):
+        first, _ = self.first_attempt()
+
+        retry = self.lifecycle.dispatch("run")
+
+        self.assertTrue(retry.ok, retry.render())
+        self.assertEqual(retry.details["mission_ref"], "DF-1")
+        self.assertEqual(retry.details["attempt"], 2)
+        self.assertTrue(retry.details["created"])
+        self.assertIn("Retrying attempt 2", retry.render())
+        self.assertEqual(len(self.missions()), 2)
+
+    def test_the_retry_is_a_new_identity_bound_to_the_same_work_item(self):
+        """A reused key would replay the stored refusal forever."""
+
+        self.first_attempt()
+        self.lifecycle.dispatch("run")
+
+        keys = [row["idempotency_key"] for row in self.missions()]
+        self.assertEqual(len(set(keys)), 2)
+        for key in keys:
+            work_item, _, manifest = key.partition(":")
+            # The shape `routing.expected_idempotency_key` mandates and the
+            # evidence layer refuses anything else for.
+            self.assertEqual(work_item, "DF-1")
+            self.assertEqual(len(manifest), 64)
+        payloads = [row["payload"] for row in self.missions()]
+        self.assertEqual(sorted(item["attempt"] for item in payloads), [1, 2])
+        self.assertEqual({item["work_item_id"] for item in payloads}, {"DF-1"})
+
+    def test_the_refused_attempt_and_its_admission_file_are_untouched(self):
+        first, mission_id = self.first_attempt()
+        before = dict(self.lifecycle.store.get(mission_id))
+        original = self.lifecycle.config.mission_dir / "df-1-admission.json"
+        original_body = original.read_text()
+
+        self.lifecycle.dispatch("run")
+
+        after = dict(self.lifecycle.store.get(mission_id))
+        self.assertEqual(after["state"], "refused")
+        self.assertEqual(after["terminal_reason"], self.INFRASTRUCTURE)
+        self.assertEqual(after["idempotency_key"], before["idempotency_key"])
+        self.assertEqual(after["payload_hash"], before["payload_hash"])
+        self.assertEqual(original.read_text(), original_body)
+        retry_file = self.lifecycle.config.mission_dir / "df-1-attempt-2-admission.json"
+        self.assertTrue(retry_file.exists())
+        self.assertNotEqual(json.loads(retry_file.read_text()),
+                            json.loads(original_body))
+
+    def test_repeating_run_while_the_retry_is_pending_submits_nothing_more(self):
+        self.first_attempt()
+        retry = self.lifecycle.dispatch("run")
+
+        again = self.lifecycle.dispatch("run")
+        third = self.lifecycle.dispatch("run")
+
+        self.assertTrue(again.ok, again.render())
+        self.assertTrue(third.ok, third.render())
+        self.assertEqual(len(self.missions()), 2)
+        self.assertEqual(again.details["mission_ref"], "DF-1")
+        self.assertEqual(retry.details["attempt"], 2)
+
+    # -- the ways back to settled ----------------------------------------- #
+
+    def test_a_deterministic_refusal_advances_the_portfolio(self):
+        self.first_attempt("PROVIDER_POLICY_VIOLATION: codex-primary is denied")
+
+        after = self.lifecycle.dispatch("run")
+
+        # DF-2 is registered for capability bug which is lawfully admitted,
+        # so the portfolio advances and DF-2 is queued.
+        self.assertTrue(after.ok, after.render())
+        self.assertEqual(after.details["mission_ref"], "DF-2")
+        self.assertEqual(len(self.missions()), 2)
+
+    def test_a_completed_retry_advances_the_portfolio(self):
+        self.first_attempt()
+        self.assertTrue(self.lifecycle.dispatch("run").ok)
+        self.settle("completed", None)
+
+        after = self.lifecycle.dispatch("run")
+
+        self.assertTrue(after.ok, after.render())
+        self.assertEqual(after.details["mission_ref"], "DF-2")
+        self.assertEqual(len(self.missions()), 3)
+
+    def test_a_slot_is_not_retried_past_its_bound(self):
+        self.first_attempt()
+        for attempt in range(2, shift_plane.MAX_SLOT_ATTEMPTS + 1):
+            offered = self.lifecycle.dispatch("run")
+            self.assertEqual(offered.details["attempt"], attempt, offered.render())
+            self.settle("refused", self.INFRASTRUCTURE)
+
+        after = self.lifecycle.dispatch("run")
+
+        self.assertTrue(after.ok, after.render())
+        self.assertEqual(after.details["mission_ref"], "DF-2")
+        self.assertEqual(len(self.missions()), shift_plane.MAX_SLOT_ATTEMPTS + 1)
+
+    # -- what the Owner is told ------------------------------------------- #
+
+    def test_status_says_the_slot_can_be_retried_and_keeps_the_refusal(self):
+        self.first_attempt()
+
+        status = self.lifecycle.dispatch("status")
+
+        self.assertTrue(status.ok, status.render())
+        rendered = status.render()
+        self.assertIn("DF-1", rendered)
+        self.assertIn("can be retried", rendered)
+        self.assertIn(self.INFRASTRUCTURE, rendered)
+        self.assertIn("attempt 2 of %d" % shift_plane.MAX_SLOT_ATTEMPTS, rendered)
+        self.assertNotIn("fm_", rendered)
 
 
 if __name__ == "__main__":

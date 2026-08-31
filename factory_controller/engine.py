@@ -12,7 +12,7 @@ from __future__ import annotations
 from dataclasses import asdict, replace
 import threading
 from dataclasses import dataclass
-from typing import Any, Protocol
+from typing import Any, Mapping, Protocol
 
 from . import capacity, context, gateway, routing
 from .context import ContextBudget, ContextError, ContextRequest
@@ -725,6 +725,18 @@ def _gate_refusal(payload: dict[str, Any], evaluation: dict[str, Any]) -> str | 
     declared = _declared_gates(payload)
     if not declared:
         return None
+    expectations = payload.get("acceptance_gate_expectations", {})
+    if not isinstance(expectations, Mapping):
+        return "ACCEPTANCE_GATE_EXPECTATION_INVALID"
+    invalid = set(expectations) - set(declared)
+    if invalid:
+        return "ACCEPTANCE_GATE_EXPECTATION_INVALID: " + ", ".join(sorted(invalid))
+    for gate, expectation in expectations.items():
+        if (not isinstance(expectation, Mapping)
+                or expectation.get("passed") is not False
+                or type(expectation.get("exit_code")) is not int
+                or not 0 <= expectation["exit_code"] <= 255):
+            return "ACCEPTANCE_GATE_EXPECTATION_INVALID: " + str(gate)
     outcomes = evaluation.get("gate_outcomes") or ()
     if not isinstance(outcomes, (list, tuple)):
         return "ACCEPTANCE_GATE_UNEVALUATED: gate_outcomes is not a list"
@@ -732,7 +744,17 @@ def _gate_refusal(payload: dict[str, Any], evaluation: dict[str, Any]) -> str | 
     missing = [gate for gate in declared if gate not in seen]
     if missing:
         return "ACCEPTANCE_GATE_UNEVALUATED: " + ", ".join(missing)
-    failed = [gate for gate in declared if seen[gate].get("passed") is not True]
+    failed = []
+    for gate in declared:
+        outcome = seen[gate]
+        expectation = expectations.get(gate)
+        if expectation is None:
+            satisfied = outcome.get("passed") is True
+        else:
+            satisfied = (outcome.get("passed") is False
+                          and outcome.get("exit_code") == expectation["exit_code"])
+        if not satisfied:
+            failed.append(gate)
     if failed:
         return "ACCEPTANCE_GATE_FAILED: " + ", ".join(failed)
     return None

@@ -396,8 +396,12 @@ class FactoryLifecycle:
         # definition is rewritten and reloaded only when it actually differs.
         self._bootstrap_service(self._install_supervisor_definition())
 
-        outcomes = self.shift.outcomes(entry)
-        mission = entry.next_mission(outcomes)
+        slots = self.shift.slots(entry)
+        outcomes = {ref: reading.state for ref, reading in slots.items()
+                    if reading.state is not None}
+        retryable = frozenset(ref for ref, reading in slots.items()
+                              if reading.retryable)
+        mission = entry.next_mission(outcomes, retryable)
         if mission is None:
             return FactoryResult(
                 action="run", ok=True, state="complete",
@@ -405,8 +409,16 @@ class FactoryLifecycle:
                        "Every mission in the first portfolio has settled.",
                        "Run './dev factory status' to review the results."),
                 details={"outcomes": outcomes})
+        # A retryable slot is settled in the ledger and unsettled for the
+        # portfolio, so it is the one settled state that does not stop here.
+        # The attempt is derived from durable rows, so two invocations in the
+        # same state derive the same attempt, the same manifest and the same
+        # key -- and the second submission is the first one, exactly as it was
+        # before retries existed.
+        attempt = slots[mission.mission_ref].next_attempt \
+            if mission.mission_ref in retryable else 1
         settled = outcomes.get(mission.mission_ref)
-        if settled is not None:
+        if settled is not None and mission.mission_ref not in retryable:
             return FactoryResult(
                 action="run", ok=True,
                 state="running" if settled != "admitted" else "queued",
@@ -416,7 +428,8 @@ class FactoryLifecycle:
                        "Nothing more to do. Run './dev factory status' to check on it."),
                 details={"mission_ref": mission.mission_ref, "state": settled})
 
-        intake = self._materialize(contract, entry, mission, doctor, grant)
+        intake = self._materialize(contract, entry, mission, doctor, grant,
+                                   attempt)
         try:
             _, created = self.controller.submit(
                 intake.payload, intake.idempotency_key)
@@ -428,6 +441,8 @@ class FactoryLifecycle:
         self._record_owner_act("run", grant.approval_ref, {
             "mission_ref": intake.mission_ref,
             "project_id": intake.project_id,
+            "attempt": intake.attempt,
+            "idempotency_key": intake.idempotency_key,
             "created": created,
         })
         return FactoryResult(
@@ -436,13 +451,17 @@ class FactoryLifecycle:
                    else "DOGFOOD MISSION RUNNING",
                    "Mission: " + mission.objective.split(".")[0].strip() + ".",
                    "Project: " + intake.project_id,
+                   *(("Retrying attempt %d; the earlier attempt was refused "
+                      "by the execution layer and is kept."
+                      % intake.attempt,) if intake.attempt > 1 else ()),
                    "The Factory will pick it up on its next cycle. "
                    "Run './dev factory status' to follow it."),
             details={"mission_ref": intake.mission_ref,
                      "project_id": intake.project_id,
+                     "attempt": intake.attempt,
                      "created": created})
 
-    def _materialize(self, contract, entry, mission, doctor, grant):
+    def _materialize(self, contract, entry, mission, doctor, grant, attempt=1):
         """Derive the whole mission, and refuse rather than guess any part."""
 
         registry = self._registry_rows(doctor)
@@ -471,12 +490,13 @@ class FactoryLifecycle:
                     "command": [interpreter, "-m", "src.cli.first_live"],
                     "workdir": str(self.config.evidence_root),
                     "admission": str(self._mission_path(
-                        mission.mission_ref, "admission")),
+                        mission.mission_ref, "admission", attempt)),
                     "output": str(self._mission_path(
-                        mission.mission_ref, "result")),
+                        mission.mission_ref, "result", attempt)),
                     "timeout_seconds": 3600,
                     "gate_timeout_seconds": 1800,
                 },
+                attempt=attempt,
             )
         except dogfood_intake.IntakeError as refusal:
             raise FactoryRefusal(refusal.code, refusal.detail) from None
@@ -484,7 +504,8 @@ class FactoryLifecycle:
         # and git facts are the execution layer's to re-derive -- the
         # Controller asking would be the second candidate-truth authority
         # `tests/test_authority_boundaries.py` exists to prevent.
-        self._write_mission_file(mission.mission_ref, "admission", intake.admission)
+        self._write_mission_file(mission.mission_ref, "admission",
+                                 intake.admission, attempt)
         return intake
 
     def _portfolio_identity(self) -> str:
@@ -498,12 +519,23 @@ class FactoryLifecycle:
                 "The frozen first-dogfood portfolio is unavailable.") from None
         return context.sha256_hex(body.decode("utf-8", "replace"))
 
-    def _mission_path(self, mission_ref: str, kind: str) -> Path:
-        return self.config.mission_dir / ("%s-%s.json" % (mission_ref.lower(), kind))
+    def _mission_path(self, mission_ref: str, kind: str, attempt: int = 1) -> Path:
+        """One admission and one result file per *attempt*, not per slot.
+
+        A retry that wrote to the same two paths would overwrite the admission
+        document and the provider result of the attempt it is replacing, which
+        is the history the retry exists to preserve.  Attempt 1 keeps the
+        original name so files already on a host stay where their mission's
+        payload says they are.
+        """
+
+        suffix = "" if attempt <= 1 else "-attempt-%d" % attempt
+        return self.config.mission_dir / (
+            "%s%s-%s.json" % (mission_ref.lower(), suffix, kind))
 
     def _write_mission_file(self, mission_ref: str, kind: str,
-                            body: Mapping[str, Any]) -> None:
-        path = self._mission_path(mission_ref, kind)
+                            body: Mapping[str, Any], attempt: int = 1) -> None:
+        path = self._mission_path(mission_ref, kind, attempt)
         try:
             self.config.mission_dir.mkdir(parents=True, exist_ok=True)
             path.write_text(json.dumps(body, sort_keys=True, indent=2) + "\n")
@@ -533,16 +565,30 @@ class FactoryLifecycle:
 
         try:
             _, entry = self._load_contract_and_portfolio()
-            outcomes = self.shift.outcomes(entry)
+            slots = self.shift.slots(entry)
         except FactoryRefusal:
             return ("Work: unknown",)
-        pending = entry.next_mission(outcomes)
+        outcomes = {ref: reading.state for ref, reading in slots.items()
+                    if reading.state is not None}
+        retryable = frozenset(ref for ref, reading in slots.items()
+                              if reading.retryable)
+        pending = entry.next_mission(outcomes, retryable)
         if pending is None:
             return ("Work: every first-dogfood mission has settled",)
         state = outcomes.get(pending.mission_ref)
         if state is None:
             return ("Work: none started",
                     "Next: %s, in %s" % (pending.mission_ref, pending.project_id),
+                    "Run './dev factory run' to start it.")
+        if pending.mission_ref in retryable:
+            reading = slots[pending.mission_ref]
+            return ("Work: %s in %s was refused by the execution layer "
+                    "and can be retried"
+                    % (pending.mission_ref, pending.project_id),
+                    "Refusal kept: %s" % reading.terminal_reason,
+                    "Next: %s, attempt %d of %d"
+                    % (pending.mission_ref, reading.next_attempt,
+                       shift_plane.MAX_SLOT_ATTEMPTS),
                     "Run './dev factory run' to start it.")
         return ("Work: %s in %s is %s"
                 % (pending.mission_ref, pending.project_id,

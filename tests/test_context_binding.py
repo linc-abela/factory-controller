@@ -270,11 +270,11 @@ class StickinessTests(RouteTestCase, unittest.TestCase):
                                 measurement={"built_at": time.time()})
         controller, store, path = self.build(adapter, lease_seconds=0.02)
         mission, _ = controller.submit(
-            payload(context_request={"max_age_seconds": 0.08}), "ctx:stale-after")
+            payload(context_request={"max_age_seconds": 0.4}), "ctx:stale-after")
         with self.assertRaises(ProcessDeath):
             controller.work_once("w1")
         # The manifest is now older than the mission's own freshness requirement.
-        time.sleep(0.1)
+        time.sleep(0.5)
         later = self.reopen(path, BrokerAdapter(), lease_seconds=1)
         request = context.ContextRequest.from_payload(store.get(mission["id"])["payload"])
         package = context.package_from_row(store.step_output(mission["id"], "context"))

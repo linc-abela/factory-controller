@@ -8,13 +8,14 @@ the run contract, the mission portfolio, and the Bridge's own project registry.
 No value below is invented, and every derivation that cannot be shown to follow
 from those three raises rather than guessing.
 
-Three refusals are deliberate and fail closed:
+Two derivations still refuse deliberately and fail closed:
 
-* **A mission that changes a repository is not materialized.**  A gate outcome
-  for such a mission has to be re-derived at the *candidate* commit, in the
-  isolated worktree the execution layer creates, and no layer reports that path
-  back to the Controller.  Running the gates against the baseline checkout
-  instead would report the mission's own change as untested and call it a pass.
+* **A mission that changes a repository is materialized with candidate-targeted
+  gates.**  The execution layer returns an immutable candidate commit, and
+  ``stage1_adapter`` materializes a detached checkout of that commit before
+  running any declared evaluator.  Running the gates against the baseline
+  checkout instead would report the mission's own change as untested and call
+  it a pass.
 * **A capability the evidence layer does not admit is refused here**, where the
   Owner can read why, rather than at dispatch as an opaque provider refusal.
 * **An acceptance gate whose command cannot be derived from its declared source
@@ -40,7 +41,7 @@ from .context import CONTEXT_SCHEMA_VERSION, mission_input_hash, sha256_hex
 #: from ``factory-evidence-core`` ``src/orchestration/admission.py``
 #: ``SUPPORTED_CAPABILITIES``; a project registered for anything else is
 #: refused before a provider is contacted rather than after.
-ADMISSIBLE_CAPABILITIES = ("development", "prototype")
+ADMISSIBLE_CAPABILITIES = ("bug", "development", "prototype")
 
 #: The two decisions the admission guard requires an Owner authority to name.
 DECISION_IDS = ("7b", "8b")
@@ -67,6 +68,7 @@ class Intake:
     """Everything one Owner invocation needs, and nothing derived twice."""
 
     mission_ref: str
+    attempt: int
     project_id: str
     objective: str
     capability: str
@@ -149,19 +151,48 @@ def registry_row(rows: Sequence[Mapping[str, Any]], project_id: str) -> Mapping[
         "Run './dev factory install'.")
 
 
+def gate_expectations(mission: Any) -> dict[str, dict[str, Any]]:
+    """Serialize the portfolio's explicit expected-failure policy."""
+
+    values = getattr(mission, "acceptance_gate_expectations", ())
+    if isinstance(values, Mapping):
+        return {str(gate): dict(expectation)
+                for gate, expectation in values.items()
+                if isinstance(expectation, Mapping)}
+    return {
+        item.gate_id: {"passed": item.passed, "exit_code": item.exit_code}
+        for item in values
+        if hasattr(item, "gate_id") and hasattr(item, "exit_code")
+    }
+
+
 def build(mission, *, portfolio_ref: str, run_ref: str,
           registry: Sequence[Mapping[str, Any]], registry_digest: str,
           provider_profiles: Sequence[str], corpus_identity: str,
           owner: str, approval_ref: str, granted_at: float, expires_at: float,
-          now: float, stage1: Mapping[str, Any]) -> Intake:
-    """Turn one frozen portfolio mission into one submittable real mission."""
+          now: float, stage1: Mapping[str, Any], attempt: int = 1) -> Intake:
+    """Turn one frozen portfolio mission into one submittable real mission.
 
-    if mission.mutates_repository:
-        raise IntakeError(
-            "MISSION_CHANGES_A_REPOSITORY",
-            "The next mission changes a repository, and its acceptance gates "
-            "would have to run against the changed commit. That path is not "
-            "built yet, so this command will not start it.")
+    ``attempt`` is the slot's attempt number, counting the first.  It reaches
+    the mission's identity through the context manifest's ``policy_identity``
+    and nowhere else, which is what makes a retry a distinct mission without
+    inventing a second identity scheme:
+
+    * ``work_item_id`` stays the portfolio reference.  The slot *is* the work
+      item; a second name for it would be a second work item.
+    * the manifest hash therefore differs per attempt, so the idempotency key
+      ``<ref>:<manifest_hash>`` is unique per attempt while still carrying the
+      shape ``routing.expected_idempotency_key`` mandates and Evidence Core
+      refuses anything else for.
+    * because the key differs, the execution layer's memo of the previous
+      attempt is neither replayed nor overwritten -- a stored refusal answers
+      forever for the key it was stored under, which is exactly why a retry may
+      not reuse one.
+
+    Attempt 1 is byte-identical to what this module produced before retries
+    existed, so the identity of a mission already in the ledger cannot move
+    under it.
+    """
 
     row = registry_row(registry, mission.project_id)
     if row.get("resolution") not in (None, "resolved"):
@@ -200,18 +231,27 @@ def build(mission, *, portfolio_ref: str, run_ref: str,
             "NO_PROVIDER_DECLARED",
             "The run contract declares no provider for this mission.")
 
+    expectations = gate_expectations(mission)
     identity = {
         "work_item_id": mission.mission_ref,
         "capability": capability,
         "repository_remote_url": remote_url,
         "baseline_sha": mission.baseline_sha,
         "acceptance_gate_ids": list(mission.acceptance_gate_ids),
+        "acceptance_gate_expectations": expectations,
         "execution_mode": "real",
     }
+    if not isinstance(attempt, int) or isinstance(attempt, bool) or attempt < 1:
+        raise IntakeError(
+            "MISSION_ATTEMPT_INVALID",
+            "A mission attempt is counted from one; this one was not.")
+    policy_identity = "%s:%s" % (portfolio_ref, mission.mission_ref)
+    if attempt > 1:
+        policy_identity += "#%d" % attempt
     manifest = context_manifest(
         identity,
         corpus_identity=corpus_identity,
-        policy_identity="%s:%s" % (portfolio_ref, mission.mission_ref),
+        policy_identity=policy_identity,
         selected_refs=[gate_script(mission.acceptance_gate_source)],
     )
     manifest_hash = manifest["manifest_hash"]
@@ -283,9 +323,13 @@ def build(mission, *, portfolio_ref: str, run_ref: str,
 
     payload = {
         **identity,
+        # The slot's lineage, durable and readable without recomputing a hash.
+        # `work_item_id` already names the slot; this says which try it is.
+        "attempt": attempt,
         "project_id": mission.project_id,
         "repository": remote_url,
         "context_manifest_hash": manifest_hash,
+        "acceptance_gate_expectations": expectations,
         "work_class": mission.work_class,
         "environment_class": mission.environment_class,
         "portfolio_ref": portfolio_ref,
@@ -298,6 +342,8 @@ def build(mission, *, portfolio_ref: str, run_ref: str,
             **dict(stage1),
             "mode": "real",
             "operator_opt_in": True,
+            "mutates_repository": mission.mutates_repository,
+            "gate_expectations": expectations,
             "repository": checkout,
             "gate_workdir": checkout,
             "gate_commands": gate_commands(
@@ -306,7 +352,8 @@ def build(mission, *, portfolio_ref: str, run_ref: str,
         },
     }
     return Intake(
-        mission_ref=mission.mission_ref, project_id=mission.project_id,
+        mission_ref=mission.mission_ref, attempt=attempt,
+        project_id=mission.project_id,
         objective=mission.objective, capability=capability,
         repository_remote_url=remote_url, checkout=checkout,
         baseline_sha=mission.baseline_sha, idempotency_key=key,
@@ -316,4 +363,5 @@ def build(mission, *, portfolio_ref: str, run_ref: str,
 
 
 __all__ = ["Intake", "IntakeError", "build", "context_manifest",
-           "gate_commands", "gate_script", "iso_utc", "registry_row"]
+           "gate_commands", "gate_expectations", "gate_script", "iso_utc",
+           "registry_row"]
