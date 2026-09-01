@@ -16,6 +16,7 @@ import re
 import shlex
 import shutil
 import sys
+import tempfile
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -26,12 +27,14 @@ from . import capacity
 from . import context
 from . import context_adapter
 from . import dogfood
+from . import dogfood_improvement
 from . import dogfood_intake
 from . import improvement
 from . import portfolio
 from . import production
 from . import shift as shift_plane
 from . import shift_runtime
+from . import stage1_adapter
 from . import supervisor
 from .adapter import HostCommandResult, run_host_command
 
@@ -46,6 +49,17 @@ SURFACES = {
     "emergency_stop": ("factory_controller/portfolio.py",),
     "release_authority": (".github/", "dev"),
 }
+
+#: How long one declared acceptance gate may take when it is being run as a
+#: measurement rather than as a mission's own gate.  Matched to the mission
+#: gate ceiling in ``_materialize`` rather than to the Controller's ordinary
+#: host-command timeout: the same container, the same command, the same clock.
+GATE_MEASUREMENT_TIMEOUT_SECONDS = 1800
+
+#: Who judges an improvement candidate.  Never the producer: `seal_candidate`
+#: records the provider profile the route actually selected and
+#: `evaluate_candidate` refuses when the two are the same string.
+IMPROVEMENT_EVALUATOR_IDENTITY = "factory-controller/dogfood-improvement"
 
 DEFAULT_WATCH_INTERVAL_SECONDS = 30.0
 AUTOPILOT_WORKER_ID = "factory-autopilot"
@@ -141,6 +155,17 @@ class FactoryConfig:
     def mission_dir(self) -> Path:
         return self.state_dir / "dogfood"
 
+    @property
+    def improvement_objective_path(self) -> Path:
+        """The Owner objective the frozen portfolio's improvement slot carries.
+
+        Derived from the portfolio's own directory rather than configured
+        separately: an improvement objective that could point somewhere else
+        would be a second place a mission's intent comes from.
+        """
+
+        return self.portfolio_path.parent / "first-dogfood-improvement-objective.json"
+
     @classmethod
     def default(cls, db_path: str | Path | None = None) -> "FactoryConfig":
         controller_root = Path(__file__).resolve().parents[1]
@@ -214,8 +239,38 @@ class FactoryLifecycle:
         self.shift = shift_plane.ShiftPlane(self.store, clock=self.store.clock)
         self.runtime = shift_runtime.ShiftRuntime(
             controller, supervisor_plane=self.supervisor)
-        self.improvement = improvement.ImprovementPlane(
-            self.store, production.ProductionLedger(self.store))
+        self.production = production.ProductionLedger(self.store)
+        self.improvement = improvement.ImprovementPlane(self.store, self.production)
+        self._improvement_contract: Any = False
+
+    # -- the frozen improvement objective ------------------------------- #
+
+    def improvement_contract(self):
+        """The Owner objective the improvement slot carries, or None.
+
+        Read once per lifecycle and cached, including the absence: a portfolio
+        with no improvement objective is a legitimate configuration, and asking
+        the file system about it on every slot would make the answer depend on
+        when it was asked.
+        """
+
+        if self._improvement_contract is False:
+            try:
+                self._improvement_contract = dogfood_improvement.load(
+                    self.config.improvement_objective_path)
+            except dogfood_improvement.ObjectiveError:
+                self._improvement_contract = None
+        return self._improvement_contract
+
+    def _improvement_for(self, mission):
+        """The contract this portfolio mission is an improvement candidate for."""
+
+        if getattr(mission, "work_class", None) != dogfood_improvement.WORK_CLASS:
+            return None
+        contract = self.improvement_contract()
+        if contract is None or contract.project_id != mission.project_id:
+            return None
+        return contract
 
     # -- public surface ------------------------------------------------- #
 
@@ -501,21 +556,22 @@ class FactoryLifecycle:
                 "Run './dev factory status' to review the current state.",
                 cycle=report)
 
+        settled = self._settle_improvement(contract, grant)
         if blocked is not None:
             return FactoryResult(
                 action="cycle", ok=False, state="attention",
                 lines=blocked.lines,
-                details={**dict(blocked.details), "cycle": report})
+                details={**dict(blocked.details), "cycle": report,
+                         **({} if settled is None else {"improvement": settled})})
         advanced = self._queue_next(contract, entry, doctor, grant,
                                     owner_action=False)
-        if advanced.details:
-            return FactoryResult(
-                action="cycle", ok=advanced.ok, state=advanced.state,
-                lines=advanced.lines,
-                details={**advanced.details, "cycle": report})
+        extra = {"cycle": report}
+        if settled is not None:
+            extra["improvement"] = settled
         return FactoryResult(
             action="cycle", ok=advanced.ok, state=advanced.state,
-            lines=advanced.lines, details={"cycle": report})
+            lines=advanced.lines,
+            details={**(advanced.details or {}), **extra})
 
     def _queue_next(self, contract, entry, doctor, grant, *,
                     owner_action: bool) -> FactoryResult:
@@ -561,22 +617,55 @@ class FactoryLifecycle:
                        "Nothing more to do. Run './dev factory status' to check on it."),
                 details={"mission_ref": mission.mission_ref, "state": settled})
 
+        objective = self._improvement_for(mission)
+        experiment_ref = None
+        if objective is not None:
+            # The baseline is measured and pinned before the candidate exists,
+            # which is Stage 8's ordering and its anti-gaming property: a
+            # baseline recorded afterwards could be chosen to flatter what the
+            # provider produced.  `record_baseline` refuses once a mission
+            # exists and `create_candidate_mission` refuses without a baseline,
+            # so the order below is enforced by the plane and not by this call.
+            experiment_ref = self._open_improvement(
+                objective, mission, doctor, attempt)
         intake = self._materialize(contract, entry, mission, doctor, grant,
-                                   attempt)
+                                   attempt,
+                                   brief=None if objective is None
+                                   else objective.objective.statement)
         try:
-            submitted, created = self.controller.submit(
-                intake.payload, intake.idempotency_key)
+            if experiment_ref is None:
+                submitted, created = self.controller.submit(
+                    intake.payload, intake.idempotency_key)
+            else:
+                submitted, created = self.improvement.create_candidate_mission(
+                    experiment_ref, self.controller,
+                    acceptance_gate_ids=list(mission.acceptance_gate_ids),
+                    extra=intake.payload)
         except Exception as exc:  # noqa: BLE001
             raise FactoryRefusal(
                 "MISSION_NOT_ADMITTED",
                 "The next dogfood mission was refused before it started: %s"
                 % type(exc).__name__) from None
+        if experiment_ref is not None:
+            # The experiment payload is the dogfood payload; the key the plane
+            # derived from it must therefore be the key the seam derived, or
+            # the mission the experiment is bound to is not the mission the
+            # portfolio admitted.  Checked rather than assumed: a silent
+            # divergence here would bind an experiment to a second identity.
+            bound = self.improvement.lineage(experiment_ref)["idempotency_key"]
+            if bound != intake.idempotency_key:
+                raise FactoryRefusal(
+                    "IMPROVEMENT_BINDING_MISMATCH",
+                    "The improvement candidate was admitted under a different "
+                    "identity than the portfolio slot it belongs to.")
         detail = {
             "mission_ref": intake.mission_ref,
             "project_id": intake.project_id,
             "attempt": intake.attempt,
             "idempotency_key": intake.idempotency_key,
             "created": created,
+            **({} if experiment_ref is None
+               else {"experiment_ref": experiment_ref}),
         }
         if owner_action:
             self._record_owner_act("run", grant.approval_ref, detail)
@@ -638,7 +727,142 @@ class FactoryLifecycle:
                    "Run './dev factory status' to review the current state."),
             details={"code": code, **extra})
 
-    def _materialize(self, contract, entry, mission, doctor, grant, attempt=1):
+    # -- the improvement slot ------------------------------------------- #
+
+    def _measure(self, checkout: str, gate_commands, gate_ids, sha: str):
+        """Run the declared gates at one commit and report what they said.
+
+        In a detached worktree, never the registered checkout: the measurement
+        has to be of the commit the mission pins, and a checkout that had moved
+        would otherwise be measured silently as if it had not.  The worktree is
+        also what keeps this read-only -- the lab's own tree is untouched, which
+        DF-1 and DF-2's stop conditions require of every mission here.
+        """
+
+        worktree = Path(tempfile.mkdtemp(prefix="factory-baseline-"))
+        target = worktree / "checkout"
+        added = self._run(
+            ("git", "-C", checkout, "worktree", "add", "--force", "--quiet",
+             "--detach", str(target), sha))
+        if added.returncode != 0:
+            shutil.rmtree(worktree, ignore_errors=True)
+            raise FactoryRefusal(
+                "IMPROVEMENT_BASELINE_UNAVAILABLE",
+                "The Factory could not check out the baseline this "
+                "improvement mission is measured against.")
+        try:
+            outcomes = []
+            for gate in gate_ids:
+                command = stage1_adapter._render_candidate_command(
+                    gate_commands.get(gate), checkout, target)
+                if command is None:
+                    outcomes.append({"gate_id": gate, "passed": False,
+                                     "detail": "not_run",
+                                     "evidence_class": "rederived"})
+                    continue
+                result = self.runner(
+                    tuple(command), cwd=str(target), input_text=None,
+                    timeout_seconds=GATE_MEASUREMENT_TIMEOUT_SECONDS)
+                result = self._normalize_result(result)
+                outcomes.append({
+                    "gate_id": gate, "passed": result.returncode == 0,
+                    "exit_code": result.returncode,
+                    "detail": " ".join(command),
+                    "evidence_class": "rederived",
+                    "stdout_tail": result.stdout[-2000:] or "not_applicable",
+                    "stderr_tail": result.stderr[-2000:] or "not_applicable",
+                })
+            return outcomes
+        finally:
+            self._run(("git", "-C", checkout, "worktree", "remove", "--force",
+                       str(target)))
+            shutil.rmtree(worktree, ignore_errors=True)
+
+    def _settle_improvement(self, contract, grant):
+        """Compare, stage and close a completed improvement candidate.
+
+        Runs after the supervisor cycle because that is when the candidate's
+        own gate evidence exists, and the post-change measurement is read from
+        that evidence rather than measured again -- the same gates, in the same
+        container, at the candidate commit the mission verified.  Measuring it
+        a second time here would be a second evaluator with a second answer.
+        """
+
+        objective = self.improvement_contract()
+        if objective is None:
+            return None
+        row = dogfood_improvement.open_for(self.improvement, objective)
+        if row is None or not row["mission_ref"] or row["candidate_sha"]:
+            return None
+        mission = self.store.get(row["mission_ref"])
+        if mission is None or mission["state"] != "completed":
+            return None
+        evaluation = self.store.step_output(mission["id"], "evaluate")
+        evaluation = evaluation if isinstance(evaluation, Mapping) else {}
+        route = self.store.route_history(mission["id"])
+        producer = route.get("selected_provider_profile")
+        outcome = dogfood_improvement.settle(
+            self.improvement, self.production, objective,
+            experiment_ref=row["experiment_ref"], mission=mission,
+            producer_identity=("unknown" if not producer
+                               else "provider:%s" % producer),
+            evaluator_identity=IMPROVEMENT_EVALUATOR_IDENTITY,
+            changed_paths=evaluation.get("changed_paths"),
+            candidate=dogfood_improvement.measurements(
+                objective, evaluation.get("gate_outcomes") or ()),
+            approval_ref=grant.approval_ref,
+            release_policy_version=contract.run_ref,
+            provenance_at=dogfood_intake.iso_utc(self.clock()))
+        # The promotion decision, with the reference that authorized it.  The
+        # improvement plane records that a promotion was staged and the
+        # production ledger records what was admitted; neither holds the
+        # Owner's grant, and DF-4's evidence asks for the decision *with* its
+        # approval reference.
+        self.store.coordinate(
+            mission["id"], mission.get("project_id"), "factory",
+            "FACTORY_IMPROVEMENT_SETTLED",
+            {"approval_ref": grant.approval_ref,
+             "objective_ref": row["objective_ref"],
+             "contract_digest": objective.contract_digest,
+             **{key: value for key, value in outcome.items()
+                if key != "deployment"}})
+        return outcome
+
+    def _open_improvement(self, objective, mission, doctor, attempt: int) -> str:
+        """Measure the pinned baseline and open generation 1 against it."""
+
+        registered = dogfood_intake.registry_row(
+            self._registry_rows(doctor), mission.project_id)
+        checkout = registered.get("checkout")
+        remote = registered.get("repository_remote_url")
+        if not isinstance(checkout, str) or not isinstance(remote, str):
+            raise FactoryRefusal(
+                "PROJECT_CHECKOUT_UNAVAILABLE",
+                "The project this improvement mission targets has no local "
+                "working copy its baseline could be measured in.")
+        dogfood_improvement.abandon_spent(self.improvement, objective, self.store)
+        commands = dogfood_intake.gate_commands(
+            objective.gate_ids, mission.acceptance_gate_source, checkout)
+        baseline = dogfood_improvement.measurements(
+            objective,
+            self._measure(checkout, commands, objective.gate_ids,
+                          mission.baseline_sha))
+        try:
+            row = dogfood_improvement.open_experiment(
+                self.improvement, objective, repository=remote,
+                baseline_sha=mission.baseline_sha,
+                isolation_ref="lane://%s/%s#%d"
+                              % (mission.project_id, mission.mission_ref, attempt),
+                baseline=baseline, attempt=attempt)
+        except (improvement.ImprovementRefusal, improvement.PolicyError) as refusal:
+            raise FactoryRefusal(
+                getattr(refusal, "code", "IMPROVEMENT_NOT_ADMITTED"),
+                "The improvement this mission carries could not be opened: %s"
+                % refusal) from None
+        return row["experiment_ref"]
+
+    def _materialize(self, contract, entry, mission, doctor, grant, attempt=1,
+                     brief=None):
         """Derive the whole mission, and refuse rather than guess any part."""
 
         registry = self._registry_rows(doctor)
@@ -678,6 +902,7 @@ class FactoryLifecycle:
                         mission.mission_ref, "result", attempt)),
                     "timeout_seconds": 3600,
                     "gate_timeout_seconds": 1800,
+                    **({} if brief is None else {"mission_brief": brief}),
                 },
                 attempt=attempt,
                 context_builder=builder,
@@ -1216,9 +1441,19 @@ class FactoryLifecycle:
             if current is None or current.as_row() != project.as_row():
                 self.store.register_project(project)
 
+            # The supervisor may not promote an improvement here.  Its
+            # promotion path builds an experiment's own payload, and a frozen
+            # portfolio slot must carry the dogfood admission document, the
+            # context manifest and the derived gate commands -- which only the
+            # portfolio seam produces.  Two admitters for one slot is the
+            # identity divergence this corpus already records, so the class is
+            # narrowed rather than raced.  Execution is untouched: `_advance`
+            # claims a mission whatever its class.
             policy = supervisor.SupervisorPolicy(
                 project_id=project_id, enabled=True,
-                work_classes=tuple(contract.work_classes),
+                work_classes=tuple(
+                    name for name in contract.work_classes
+                    if name != dogfood_improvement.WORK_CLASS),
                 missions_per_cycle=1, maintenance_admissions=1,
                 improvement_admissions=1,
                 window_start_hour=contract.window_start_hour,
@@ -1229,16 +1464,30 @@ class FactoryLifecycle:
             if existing_policy is None or existing_policy.as_row() != policy.as_row():
                 self.supervisor.set_policy(policy)
 
+            # Enabled only for the project the frozen improvement objective
+            # names, and only while that objective loads.  Every other dogfood
+            # project keeps the disabled policy: `_admission` refuses
+            # IMPROVEMENT_DISABLED, so an experiment cannot be opened against a
+            # project whose Owner declared no objective for it.
+            objective = self.improvement_contract()
+            improving = objective is not None and objective.project_id == project_id
             improvement_policy = improvement.ImprovementPolicy(
-                project_id=project_id, enabled=False,
+                project_id=project_id, enabled=improving,
                 environment_classes=("local-sim", "staging"),
-                protected_surfaces=SURFACES,
+                protected_surfaces=(
+                    dogfood_improvement.merged_surfaces(
+                        SURFACES, objective.protected_surfaces)
+                    if improving else SURFACES),
                 policy_version=contract.run_ref,
             )
             existing_improvement = self.improvement.policy(project_id)
             if existing_improvement is None \
                     or existing_improvement.as_row() != improvement_policy.as_row():
                 self.improvement.set_policy(improvement_policy)
+            if improving:
+                dogfood_improvement.ensure_environment(
+                    self.production, objective, repository=repository,
+                    policy_version=contract.run_ref)
 
         current_portfolio = self.store.portfolio_policy()
         desired_portfolio = portfolio.PortfolioPolicy(

@@ -118,7 +118,9 @@ def _dispatch(request: dict[str, Any], config: dict[str, Any]) -> dict[str, Any]
     output = Path(config.get("output", f"/tmp/factory-stage1-{request['operation_key'].replace(':', '-')}.json"))
     argv = [*command, "--dry-run" if mode == "dry_run" else "--real", "--output", str(output)]
     if mode == "real":
-        for key, flag in (("admission", "--admission"), ("repository", "--repository")):
+        for key, flag in (("admission", "--admission"),
+                          ("repository", "--repository"),
+                          ("mission_brief", "--mission-brief")):
             if config.get(key):
                 argv.extend((flag, str(config[key])))
         argv.append("--operator-opt-in")
@@ -191,12 +193,20 @@ def _run_gate(gate_id: str, argv: Any, workdir: Any, timeout: float) -> dict[str
     # exits like any other failing command.  What was missing was the evidence
     # to tell those apart afterwards -- a bare 127 with no output cost a whole
     # session -- so the process's own last words travel with the status.
+    #
+    # Both streams travel, because an evaluator's own numbers are on standard
+    # output and `unittest` writes its count to standard error.  An improvement
+    # is measured from what the project's declared gate said about itself; a
+    # gate outcome that carried only a number left the Controller no honest
+    # measurement to compare, and inventing a second evaluator to get one would
+    # put a measurement authority here that belongs to the project.
     return {
         "gate_id": gate_id,
         "passed": completed.returncode == 0,
         "detail": " ".join(argv),
         "exit_code": completed.returncode,
         "evidence_class": "rederived",
+        "stdout_tail": _tail(completed.stdout),
         "stderr_tail": _tail(completed.stderr),
     }
 
@@ -312,6 +322,35 @@ def _remove_candidate_worktree(repository: Any, worktree: Path,
         )
     finally:
         temporary.cleanup()
+
+
+def _changed_paths(repository: Any, baseline_sha: Any, candidate_sha: str,
+                   timeout: float) -> Any:
+    """What the candidate changed, named by the layer that owns candidate truth.
+
+    Git is the candidate authority and this is its seam, so the list is taken
+    from the repository rather than from anything the provider said about
+    itself.  An unknown change set is a typed absence and never an empty list:
+    `improvement.check_change_set` refuses an empty one outright rather than
+    reading it as "nothing protected was touched", and that refusal only works
+    if this function never manufactures the empty case.
+    """
+
+    if not isinstance(repository, (str, os.PathLike)) \
+            or not isinstance(baseline_sha, str) or not _GIT_SHA.match(baseline_sha):
+        return "unknown"
+    try:
+        completed = subprocess.run(
+            ("git", "-C", str(Path(repository).resolve()), "diff",
+             "--name-only", baseline_sha, candidate_sha),
+            capture_output=True, text=True, timeout=timeout,
+            env=_GIT_CLEAN_ENV, check=False)
+    except (OSError, subprocess.TimeoutExpired):
+        return "unknown"
+    if completed.returncode != 0:
+        return "unknown"
+    return sorted({line.strip() for line in completed.stdout.splitlines()
+                   if line.strip()})
 
 
 def _render_candidate_command(argv: Any, baseline: Any,
@@ -473,7 +512,11 @@ def _evaluate(request: dict[str, Any], config: dict[str, Any],
     answer = {"passed": passed, "gate_outcomes": outcomes,
               "diagnostic": None if passed else "ACCEPTANCE_GATE_FAILED"}
     if mutates_repository:
-        answer.update({"target": "candidate", "target_sha": target_sha})
+        answer.update({"target": "candidate", "target_sha": target_sha,
+                       "changed_paths": _changed_paths(
+                           config.get("repository", workdir),
+                           _mission(request).get("baseline_sha"),
+                           target_sha, timeout)})
     return answer
 
 

@@ -1,0 +1,73 @@
+{
+  "schema_version": "factory.controller.internal_dogfood_improvement_objective.v1",
+  "objective_ref": "SF-144-DF-4-prototype-lab-quality-1",
+  "project_id": "factory-prototype-lab",
+  "improvement_class": "quality",
+  "objective_version": "1.0",
+  "authority": "owner",
+  "trigger_class": "owner_objective",
+  "statement": "Raise this lab quality bar: strengthen lab/prototype.py against noisy labels, and add unit tests under tests/ that prove the new behaviour. Do not change lab/evaluate.py or fixtures/. dev check, dev test and dev evaluate must all still exit 0.",
+  "rationale": "DF-4 is the frozen portfolio's improvement slot and the only mission there that changes a project's quality bar rather than its behaviour. It had no objective, and that absence was not cosmetic: the provider's only instruction is the repository's own MISSION.md, which at factory-prototype-lab 229b923b describes work that is finished. The first live DF-4 therefore returned an empty commit and the improvement plane was never entered -- no baseline measurement, no post-change measurement, no promotion decision, which is three of the five things DF-4's evidence_required names. This objective is the Owner act that gives the slot something to be about. It is deliberately not an accuracy objective: the lab's evaluator already reports 5 of 5 correct with 0 false matches at the baseline, so an accuracy metric could only ever be not_improved, and stating one would be asking the Factory to prove something that is already true. The measurable thing that is genuinely absent is test coverage of the matcher: two tests exist and both are about the evaluation contract, neither about lab.prototype.match. Raising that count is a quality-bar change, and holding the evaluator's own two numbers as non-regression metrics is what stops it being bought with behaviour.",
+  "metrics": [
+    {
+      "metric_id": "passing_tests",
+      "direction": "increase",
+      "role": "objective",
+      "min_delta_ratio": 0.5,
+      "rationale": "The lab's own dev test gate reports how many tests ran and whether they all passed. At the baseline that is 2, so a ratio of 0.5 requires at least 3 -- one genuinely new passing test, and not a rounding error. The ceiling of this metric is that it counts tests rather than what they assert; the two non-regression metrics below are what make a test that asserts nothing worthless, because the candidate must still link every label correctly."
+    },
+    {
+      "metric_id": "evaluate_correct",
+      "direction": "increase",
+      "role": "non_regression",
+      "tolerance_ratio": 0.0,
+      "rationale": "The lab's frozen decision boundary, read from its own evaluator. 5 of 5 at the baseline, and no tolerance: a candidate that links one fewer label correctly has regressed the thing this lab exists to measure, whatever it did to the test count."
+    },
+    {
+      "metric_id": "evaluate_false_matches",
+      "direction": "decrease",
+      "role": "non_regression",
+      "tolerance_ratio": 0.0,
+      "rationale": "0 at the baseline. A relative tolerance has no meaning against zero, so the comparison falls back to the sign of the change and any false match at all is a regression -- which is the correct reading of the decision boundary's second half."
+    }
+  ],
+  "measurement": {
+    "note": "Every metric is read from an acceptance gate the mission already declares and runs. Nothing here introduces a second evaluator, and nothing measures the lab by any command the project did not declare in its own gate source.",
+    "readings": [
+      {
+        "metric_id": "passing_tests",
+        "gate_id": "dev-test",
+        "reader": "unittest_ran",
+        "note": "unittest prints 'Ran N tests' followed by OK or FAILED. A run that did not end OK reports not_measurable rather than N: tests that ran are not tests that passed."
+      },
+      {
+        "metric_id": "evaluate_correct",
+        "gate_id": "dev-evaluate",
+        "reader": "json_field",
+        "field": "correct"
+      },
+      {
+        "metric_id": "evaluate_false_matches",
+        "gate_id": "dev-evaluate",
+        "reader": "json_field",
+        "field": "false_matches"
+      }
+    ]
+  },
+  "protected_surfaces": {
+    "evaluator_independence": [
+      "lab/evaluate.py",
+      "fixtures/"
+    ]
+  },
+  "promotion": {
+    "environment_id": "factory-prototype-lab-staging",
+    "environment_class": "staging",
+    "service_ref": "factory-prototype-lab-evaluator",
+    "approver_refs": [
+      "owner"
+    ],
+    "autonomous": true,
+    "note": "Staging and ungated, because the improvement plane refuses to stage into a gated class at all -- releasing there is approved by a person and has no autonomous path. The approval reference recorded against the promotion is the Owner's own shift grant, which is what authorized this portfolio, and the promotion is staged rather than deployed: this lab declares no deployment target, and the only DeploymentPort in the corpus reports that no environment was contacted."
+  }
+}

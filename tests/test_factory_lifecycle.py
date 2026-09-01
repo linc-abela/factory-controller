@@ -75,6 +75,19 @@ class FakeHost:
             "factory-prototype-lab": "/labs/factory-prototype-lab",
             "factory-bug-lab": "/labs/factory-bug-lab",
         }
+        # What the prototype lab's own gates say at the frozen baseline,
+        # copied from a real run of them: two tests, five of five labels
+        # linked, no false matches.  The improvement slot measures its
+        # baseline by running these, so a fake that answered nothing would
+        # make every measurement `not_measurable` and prove nothing.
+        self.baseline_ok = True
+        self.gate_streams = {
+            "test": ("", "test_x (t.T) ... ok\n\n"
+                         "----------\nRan 2 tests in 0.001s\n\nOK\n"),
+            "check": ("", ""),
+            "evaluate": (json.dumps({"correct": 5, "false_matches": 0,
+                                     "proceed": True, "total": 5}), ""),
+        }
 
     def __call__(self, command, *, cwd=None, input_text=None,
                  timeout_seconds=300):
@@ -84,12 +97,32 @@ class FakeHost:
             return self._launchctl(command)
         if command and command[0] == str(self.config.bridge_root / "dev"):
             return self._bridge(command[1:], input_text)
+        if command[:1] == ("git",):
+            return self._git(command)
+        if len(command) == 2 and command[1].split("/")[-1] in self.gate_streams \
+                and command[0].endswith("/dev"):
+            if not self.baseline_ok:
+                return HostCommandResult(1, "", "gate failed")
+            stdout, stderr = self.gate_streams[command[1]]
+            return HostCommandResult(0, stdout, stderr)
         if len(command) == 2 and command[1] == "health":
             if self.health_error is not None:
                 return HostCommandResult(1, "", self.health_error)
             return HostCommandResult(0, json.dumps(
                 {"status": "ok", "identity": Path(command[0]).parent.name}))
         return HostCommandResult(127, "", "unknown host command")
+
+    def _git(self, command):
+        """Only the two worktree verbs the measurement seam materializes with."""
+
+        if "worktree" in command and "add" in command:
+            target = Path(command[command.index("--detach") + 1])
+            target.mkdir(parents=True, exist_ok=True)
+            (target / "dev").write_text("#!/bin/sh\n")
+            return HostCommandResult(0)
+        if "worktree" in command and "remove" in command:
+            return HostCommandResult(0)
+        return HostCommandResult(127, "", "unknown git command")
 
     def _launchctl(self, command):
         action = command[1]

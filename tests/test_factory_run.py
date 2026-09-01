@@ -18,7 +18,10 @@ from pathlib import Path
 from unittest import mock
 
 from factory_controller import adapter as adapter_mod
-from factory_controller import context_adapter, dogfood_intake, routing, shift as shift_plane
+from factory_controller import (
+    context_adapter, dogfood_improvement, dogfood_intake, improvement,
+    routing, shift as shift_plane,
+)
 from factory_controller.context import sha256_hex
 
 from tests.support import LayerAdapter, RouteTestCase, mission_payload
@@ -876,3 +879,250 @@ class FactoryAutopilotTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class _LabLayer(LayerAdapter):
+    """A layer that answers DF-4 the way the two labs' own gates do.
+
+    Only the improvement slot is special-cased, because only it is measured:
+    every other mission keeps the generic outcomes the rest of this file
+    depends on.
+    """
+
+    CANDIDATE = "ee816e5c45a1eed7714c998060792a643c5dd4cb"
+
+    def __init__(self, *, ran=4, correct=5, false_matches=0,
+                 changed=("lab/prototype.py", "tests/test_prototype.py"),
+                 **kwargs):
+        super().__init__(mode="real", **kwargs)
+        self.ran = ran
+        self.correct = correct
+        self.false_matches = false_matches
+        self.changed = list(changed)
+
+    def _dispatch(self, operation_key, value):
+        result = super()._dispatch(operation_key, value)
+        if result.get("status") == "completed" \
+                and value.get("mission", {}).get("work_item_id") == "DF-4":
+            result["candidate_sha"] = self.CANDIDATE
+        return result
+
+    def execute(self, step, operation_key, value):
+        if step == "evaluate" and value["mission"].get("work_item_id") == "DF-4":
+            return {
+                "passed": True, "target": "candidate",
+                "target_sha": self.CANDIDATE,
+                "changed_paths": self.changed,
+                "gate_outcomes": [
+                    {"gate_id": "dev-check", "passed": True, "exit_code": 0},
+                    {"gate_id": "dev-test", "passed": True, "exit_code": 0,
+                     "stdout_tail": "not_applicable",
+                     "stderr_tail": "\nRan %d tests in 0.003s\n\nOK\n" % self.ran},
+                    {"gate_id": "dev-evaluate", "passed": True, "exit_code": 0,
+                     "stdout_tail": json.dumps(
+                         {"correct": self.correct,
+                          "false_matches": self.false_matches,
+                          "proceed": True, "total": 5}),
+                     "stderr_tail": "not_applicable"}]}
+        return super().execute(step, operation_key, value)
+
+
+class FactoryImprovementSlotTests(unittest.TestCase):
+    """DF-4 through the installed Factory, from baseline to promotion.
+
+    `test_dogfood_improvement.py` holds the seam's own bounds.  What is checked
+    here is the wiring the first live run did not have: that the frozen
+    improvement slot opens a real experiment against a measured baseline before
+    a mission exists, that the objective reaches the provider, and that only
+    one thing admits it.
+    """
+
+    setUp = FactoryLifecycleTests.setUp
+
+    def ready(self, adapter=None):
+        self.assertTrue(self.lifecycle.dispatch("install").ok)
+        started = self.lifecycle.dispatch("start")
+        self.assertTrue(started.ok, started.render())
+        self.lifecycle.controller.adapter = adapter or _LabLayer()
+
+    def to_improvement(self, adapter=None):
+        """Advance the portfolio until DF-4 is the slot being handed off."""
+
+        self.ready(adapter)
+        self.assertTrue(self.lifecycle.dispatch("run").ok)
+        for _ in ("DF-1", "DF-2", "DF-3"):
+            advanced = self.lifecycle.dispatch("cycle")
+            self.assertTrue(advanced.ok, advanced.render())
+        return [mission for mission in
+                (self.lifecycle.store.get(row["id"])
+                 for row in self.lifecycle.store.all_missions())
+                if mission["payload"]["work_item_id"] == "DF-4"]
+
+    def lineage(self):
+        contract = self.lifecycle.improvement_contract()
+        row = dogfood_improvement.open_for(self.lifecycle.improvement, contract)
+        if row is None:
+            rows = self.lifecycle.improvement.experiments(contract.project_id)
+            row = rows[-1] if rows else None
+        return None if row is None else self.lifecycle.improvement.lineage(
+            row["experiment_ref"])
+
+    # -- provisioning ----------------------------------------------------- #
+
+    def test_improvement_is_enabled_only_where_an_objective_declares_it(self):
+        self.ready()
+        plane = self.lifecycle.improvement
+
+        self.assertTrue(plane.policy("factory-prototype-lab").enabled)
+        self.assertFalse(plane.policy("factory-bug-lab").enabled)
+
+    def test_the_project_protected_surfaces_reach_the_stored_policy(self):
+        self.ready()
+        surfaces = self.lifecycle.improvement.policy(
+            "factory-prototype-lab").protected_surfaces
+
+        self.assertIn("lab/evaluate.py", surfaces["evaluator_independence"])
+        self.assertIn("fixtures/", surfaces["evaluator_independence"])
+        self.assertNotIn(
+            "lab/evaluate.py",
+            self.lifecycle.improvement.policy(
+                "factory-bug-lab").protected_surfaces["evaluator_independence"])
+
+    def test_the_promotion_environment_is_registered_and_ungated(self):
+        self.ready()
+        environment = self.lifecycle.production.environment(
+            "factory-prototype-lab-staging")
+
+        self.assertEqual(environment.environment_class, "staging")
+        self.assertFalse(environment.gated)
+
+    def test_the_supervisor_is_not_a_second_admitter_of_this_slot(self):
+        """Two admitters for one slot would be two mission identities."""
+
+        self.ready()
+        policy = self.lifecycle.supervisor.policy("factory-prototype-lab")
+
+        self.assertNotIn("improvement", policy.work_classes)
+        self.assertIn("backlog", policy.work_classes)
+        self.assertIn("maintenance", policy.work_classes)
+
+    # -- the slot itself --------------------------------------------------- #
+
+    def test_the_baseline_is_measured_from_the_lab_before_the_mission_exists(self):
+        missions = self.to_improvement()
+        lineage = self.lineage()
+
+        self.assertEqual(len(missions), 1)
+        self.assertEqual(lineage["baseline"],
+                         {"passing_tests": 2, "evaluate_correct": 5,
+                          "evaluate_false_matches": 0})
+        self.assertEqual(lineage["baseline_sha"], PROTOTYPE_SHA)
+        transitions = [event["kind"] for event in lineage["transitions"]]
+        self.assertLess(transitions.index("baseline_measured"),
+                        transitions.index("candidate_mission_created"))
+
+    def test_the_baseline_is_measured_in_a_worktree_and_not_the_lab(self):
+        self.to_improvement()
+        git = [command for command, _ in self.host.calls if command[0] == "git"]
+
+        self.assertTrue(any("worktree" in command and "add" in command
+                            for command in git))
+        self.assertTrue(any("worktree" in command and "remove" in command
+                            for command in git))
+
+    def test_a_baseline_the_lab_will_not_produce_stops_the_slot(self):
+        """A measurement that failed is not a measurement of zero."""
+
+        self.ready()
+        self.host.baseline_ok = False
+        self.assertTrue(self.lifecycle.dispatch("run").ok)
+
+        outcomes = [self.lifecycle.dispatch("cycle") for _ in range(3)]
+        blocked = [result for result in outcomes if not result.ok]
+
+        self.assertTrue(blocked, [result.render() for result in outcomes])
+        self.assertEqual(blocked[0].details["code"],
+                         "IMPROVEMENT_BASELINE_NOT_MEASURABLE")
+        # Nothing is left holding the project's one concurrency slot.
+        self.assertEqual(self.lineage()["disposition"], "abandoned")
+        self.assertIsNone(dogfood_improvement.open_for(
+            self.lifecycle.improvement, self.lifecycle.improvement_contract()))
+
+    def test_the_objective_reaches_the_provider_as_the_mission_brief(self):
+        missions = self.to_improvement()
+        stage1 = missions[0]["payload"]["stage1"]
+
+        self.assertEqual(
+            stage1["mission_brief"],
+            self.lifecycle.improvement_contract().objective.statement)
+        self.assertLessEqual(len(stage1["mission_brief"]), 256)
+
+    def test_only_the_improvement_slot_carries_a_brief(self):
+        self.ready()
+        self.assertTrue(self.lifecycle.dispatch("run").ok)
+        first = [self.lifecycle.store.get(row["id"])
+                 for row in self.lifecycle.store.all_missions()][0]
+
+        self.assertEqual(first["payload"]["work_item_id"], "DF-1")
+        self.assertNotIn("mission_brief", first["payload"]["stage1"])
+
+    def test_the_experiment_and_the_slot_share_one_mission_identity(self):
+        missions = self.to_improvement()
+        lineage = self.lineage()
+
+        self.assertEqual(lineage["mission_ref"], missions[0]["id"])
+        self.assertEqual(lineage["idempotency_key"], missions[0]["idempotency_key"])
+        self.assertEqual(
+            missions[0]["idempotency_key"],
+            routing.expected_idempotency_key(
+                "DF-4", missions[0]["payload"]["context_manifest_hash"]))
+
+    def test_repeated_cycles_open_one_experiment_and_one_mission(self):
+        self.to_improvement()
+        for _ in range(3):
+            self.lifecycle.dispatch("cycle")
+
+        contract = self.lifecycle.improvement_contract()
+        experiments = self.lifecycle.improvement.experiments(contract.project_id)
+        missions = [row for row in self.lifecycle.store.all_missions()
+                    if self.lifecycle.store.get(row["id"])
+                    ["payload"]["work_item_id"] == "DF-4"]
+
+        self.assertEqual(len(experiments), 1)
+        self.assertEqual(len(missions), 1)
+
+    def test_a_completed_candidate_is_compared_and_the_decision_recorded(self):
+        """The whole of DF-4's evidence, produced by one cycle."""
+
+        self.to_improvement()
+        settled = self.lifecycle.dispatch("cycle")
+        lineage = self.lineage()
+
+        self.assertTrue(settled.ok, settled.render())
+        improvement_detail = settled.details["improvement"]
+        self.assertEqual(lineage["state"], "closed")
+        self.assertEqual(sorted(lineage["candidate_measurements"]),
+                         sorted(lineage["baseline"]))
+        self.assertEqual(lineage["verdict"], "improved")
+        self.assertEqual(lineage["disposition"], "accepted")
+        self.assertNotEqual(lineage["promotion_deployment_id"], "not_applicable")
+        self.assertEqual(lineage["promotion_environment_id"],
+                         "factory-prototype-lab-staging")
+        self.assertEqual(improvement_detail["experiment_ref"],
+                         lineage["experiment_ref"])
+        recorded = [row for row in self.lifecycle.store.coordination()
+                    if row["reason"] == "FACTORY_IMPROVEMENT_SETTLED"]
+        self.assertEqual(len(recorded), 1)
+        self.assertTrue(recorded[0]["detail"]["approval_ref"])
+        self.assertEqual(recorded[0]["detail"]["objective_ref"],
+                         lineage["objective_ref"])
+
+    def test_the_portfolio_still_completes_around_the_improvement_slot(self):
+        self.to_improvement()
+        self.lifecycle.dispatch("cycle")
+
+        complete = self.lifecycle.dispatch("cycle")
+
+        self.assertTrue(complete.ok, complete.render())
+        self.assertEqual(complete.render().splitlines()[0],
+                         "DOGFOOD PORTFOLIO COMPLETE")
