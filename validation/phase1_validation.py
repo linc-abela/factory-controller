@@ -59,6 +59,9 @@ LABEL = "com.softwarefactory.supervisor.sf157"
 MAX_CYCLES = 24
 REPOSITORIES = ("factory-controller", "factory-bridge", "factory-context-broker",
                 "factory-evidence-core", "factory-bug-lab", "factory-prototype-lab")
+#: Copied beside the validation portfolio, because `FactoryConfig` derives the
+#: objective's path from the portfolio's own directory.
+OBJECTIVE_FILE = "first-dogfood-improvement-objective.json"
 
 
 class Blocked(Exception):
@@ -133,6 +136,12 @@ def prepare(state_dir: Path) -> tuple[FactoryConfig, FactoryLifecycle]:
     cfg.agents_dir.mkdir(parents=True, exist_ok=True)
     cfg.portfolio_path.write_text(
         json.dumps(portfolio_body(state_dir), indent=2, sort_keys=True))
+    # The Owner objective the improvement slot carries travels with the
+    # portfolio and is copied byte for byte: its content is the digest the
+    # experiment pins, so an edited copy would be a different objective and the
+    # validation would not be running the frozen one.
+    shutil.copyfile(ROOT / "contracts" / OBJECTIVE_FILE,
+                    cfg.improvement_objective_path)
     life = lifecycle(cfg)
     # The step adapter is a child process, and in production every variable it
     # needs arrives from the installed job definition.  Reading them off the
@@ -205,6 +214,32 @@ def verify(state_dir: Path) -> dict:
                              mission["baseline_sha"][:12], mission["mission_ref"]))
     facts["portfolio_ref"] = body["portfolio_ref"]
     facts["missions"] = [row["mission_ref"] for row in body["missions"]]
+
+    # The improvement slot needs an objective the provider can actually be
+    # told, and a bridge build that renders it.  Both are checked here, where
+    # the answer is a sentence, rather than at dispatch as an empty candidate.
+    from factory_controller import dogfood_improvement                # noqa: E402
+    try:
+        objective = dogfood_improvement.load(ROOT / "contracts" / OBJECTIVE_FILE)
+    except dogfood_improvement.ObjectiveError as error:
+        raise Blocked("the improvement objective is unusable: %s" % error) from None
+    improving = [row for row in body["missions"]
+                 if row["work_class"] == dogfood_improvement.WORK_CLASS]
+    if len(improving) != 1 or improving[0]["project_id"] != objective.project_id:
+        raise Blocked("the improvement objective does not name the portfolio's "
+                      "own improvement slot")
+    profiles = json.loads((bridge / "providers.json").read_text())["profiles"]
+    unbriefed = sorted(name for name, profile in profiles.items()
+                       if "{mission_brief}" not in " ".join(profile["argv"]))
+    if unbriefed:
+        raise Blocked("the Bridge would not tell the provider this mission's "
+                      "brief; profiles without it: " + ", ".join(unbriefed))
+    facts["improvement_objective"] = {
+        "objective_ref": objective.objective.objective_ref,
+        "objective_digest": objective.objective.objective_digest,
+        "contract_digest": objective.contract_digest,
+        "metrics": [metric.metric_id for metric in objective.objective.metrics],
+        "environment_id": objective.environment}
     return facts
 
 
@@ -224,9 +259,35 @@ def slots(life: FactoryLifecycle) -> list[dict]:
     return rows
 
 
+def improvement(life: FactoryLifecycle) -> dict:
+    """DF-4's own evidence, read from the durable rows rather than claimed."""
+
+    contract = life.improvement_contract()
+    if contract is None:
+        return {"state": "not_applicable"}
+    rows = life.improvement.experiments(contract.project_id)
+    if not rows:
+        return {"state": "not_run"}
+    lineage = life.improvement.lineage(rows[-1]["experiment_ref"])
+    answer = {name: lineage[name] for name in (
+        "experiment_ref", "objective_ref", "state", "disposition", "verdict",
+        "baseline", "candidate_measurements", "candidate_sha",
+        "producer_identity", "evaluator_identity", "change_set",
+        "promotion_deployment_id", "promotion_environment_id", "reverted_to")}
+    answer["objective_digest"] = lineage["objective_digest"]
+    if lineage["promotion_deployment_id"] != "not_applicable":
+        answer["deployment"] = life.production.receipt(
+            lineage["promotion_deployment_id"])
+    answer["approval_refs"] = sorted({
+        row["detail"].get("approval_ref") for row in life.store.coordination()
+        if row["reason"] == "FACTORY_IMPROVEMENT_SETTLED"} - {None})
+    return answer
+
+
 def emit(step: str, result, life: FactoryLifecycle) -> None:
     print(json.dumps({"step": step, "ok": result.ok, "state": result.state,
-                      "lines": list(result.lines), "slots": slots(life)},
+                      "lines": list(result.lines), "slots": slots(life),
+                      "improvement": improvement(life)},
                      sort_keys=True), flush=True)
 
 
@@ -242,7 +303,7 @@ def run(state_dir: Path) -> dict:
         emit("cycle-%d" % (index + 1), result, life)
         if result.state == "complete":
             return {"outcome": "complete", "cycles": index + 1,
-                    "slots": slots(life)}
+                    "slots": slots(life), "improvement": improvement(life)}
         if not result.ok:
             raise Blocked(result.render().replace("BLOCKED: ", ""))
     raise Blocked("the portfolio did not settle within %d cycles" % MAX_CYCLES)
