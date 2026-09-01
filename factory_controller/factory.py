@@ -50,6 +50,25 @@ SURFACES = {
 DEFAULT_WATCH_INTERVAL_SECONDS = 30.0
 AUTOPILOT_WORKER_ID = "factory-autopilot"
 
+#: The supervisor service's own PATH, written into the job definition.
+#:
+#: launchd hands a LaunchAgent that names no PATH the bare
+#: ``/usr/bin:/bin:/usr/sbin:/sbin``, which holds neither a container runtime
+#: nor a provider CLI.  Under it every containerised acceptance gate exits 127
+#: and every provider readiness probe resolves nothing -- and neither failure
+#: says so: the first is recorded as the mission failing its own gates, the
+#: second as the Owner needing to sign in again.  Both were live on this host.
+#:
+#: The Bridge's LaunchAgent has always named its PATH
+#: (``factory_bridge.install.launchagent_plist``); this one did not, and worked
+#: only for as long as it happened to be bootstrapped from an interactive
+#: shell.  A host refresh is what takes that away, which is why the failure
+#: arrived looking like a durable-state contradiction rather than an
+#: environment one.  Naming it here puts it inside ``plan.digest``, so the
+#: installed job is drift-checked against it like every other plan field.
+SUPERVISOR_PATH_DIRS = ("/usr/local/bin", "/opt/homebrew/bin",
+                        "/usr/bin", "/bin", "/usr/sbin", "/sbin")
+
 
 class FactoryRefusal(Exception):
     """One plain-English lifecycle blocker."""
@@ -447,8 +466,17 @@ class FactoryLifecycle:
 
         queued = self._queue_next(contract, entry, doctor, grant,
                                   owner_action=False)
-        if not queued.ok or queued.state == "complete":
+        if queued.state == "complete":
             return queued
+        # An attention on an earlier slot stops *submission*, not execution.
+        # Returning here left every already-admitted mission admitted forever:
+        # the Owner's own `./dev factory run` had authorized DF-3 before the
+        # blocker existed, and no verb would ever reach it again.  Work past
+        # the dispatch boundary is worse than stranded -- it is unreconciled,
+        # and reconciling it is the one thing that must not wait for a person.
+        # So the cycle still runs, nothing new is handed off, and the blocker
+        # is what the Owner is told.
+        blocked = None if queued.ok else queued
         try:
             report = self.supervisor.cycle(AUTOPILOT_WORKER_ID)
         except supervisor.SupervisorRefusal as refusal:
@@ -473,6 +501,11 @@ class FactoryLifecycle:
                 "Run './dev factory status' to review the current state.",
                 cycle=report)
 
+        if blocked is not None:
+            return FactoryResult(
+                action="cycle", ok=False, state="attention",
+                lines=blocked.lines,
+                details={**dict(blocked.details), "cycle": report})
         advanced = self._queue_next(contract, entry, doctor, grant,
                                     owner_action=False)
         if advanced.details:
@@ -1000,6 +1033,8 @@ class FactoryLifecycle:
             return False
         if doctor.get("registry_drift") not in {"none", "not_applicable"}:
             return False
+        if doctor.get("serving_drift") not in {"none", "not_applicable", None}:
+            return False
         if doctor.get("unresolved_projects"):
             return False
         containment = doctor.get("containment")
@@ -1029,6 +1064,12 @@ class FactoryLifecycle:
                 "BRIDGE_REGISTRY_DRIFT",
                 "Factory project configuration has drifted. Run './dev factory install'.",
             )
+        if doctor.get("serving_drift") not in {"none", "not_applicable", None}:
+            return (
+                "BRIDGE_SERVING_DRIFT",
+                "The running Factory Bridge is serving an older configuration. "
+                "Run './dev factory start' to reload it.",
+            )
         return (
             "BRIDGE_NOT_READY",
             "The Factory Bridge is not ready. Run './dev factory install'.",
@@ -1047,6 +1088,15 @@ class FactoryLifecycle:
             raise FactoryRefusal(
                 "SANDBOX_CONTAINMENT_UNAVAILABLE",
                 "macOS sandbox containment is unavailable. Check system security settings.")
+
+        # A serving posture that is merely stale needs the service restarted,
+        # not reinstalled: the files on disk are already the ones the Owner
+        # wants served, and only the process that read them is behind.  Doing
+        # it here, before the install decision, keeps `start` from refusing
+        # with an install instruction for something a reload fixes.
+        if load and bool((doctor.get("service") or {}).get("plist_present")) \
+                and doctor.get("serving_drift") not in {"none", "not_applicable", None}:
+            doctor = self._reload_bridge()
 
         need_install = (
             not self._bridge_is_healthy(doctor)
@@ -1224,6 +1274,7 @@ class FactoryLifecycle:
             "factory", "cycle",
         )
         environment = (
+            ("PATH", self._supervisor_path(interpreter)),
             (context_adapter.COMMAND_ENV,
              self._context_broker_command(interpreter)),
             (context_adapter.CACHE_ENV, str(self._context_broker_cache())),
@@ -1245,6 +1296,25 @@ class FactoryLifecycle:
             raise FactoryRefusal(
                 "SUPERVISOR_PLAN_INVALID",
                 "The Factory supervisor service definition is invalid.") from None
+
+    def _supervisor_path(self, interpreter: str) -> str:
+        """The PATH the unattended supervisor runs under, named not inherited.
+
+        The interpreter's own directory leads because a Factory installed
+        against a managed Python must reach that Python's neighbours, and the
+        Owner's ``~/.local/bin`` follows it because that is where the provider
+        CLIs this host admits are installed.  The rest is the same standard set
+        the Bridge's job definition already names, so the two services do not
+        disagree about where a host tool lives.
+        """
+
+        leading = (os.path.dirname(interpreter),
+                   os.path.expanduser("~/.local/bin"))
+        ordered: list[str] = []
+        for entry in (*leading, *SUPERVISOR_PATH_DIRS):
+            if entry and entry not in ordered:
+                ordered.append(entry)
+        return ":".join(ordered)
 
     def _context_broker_cache(self) -> Path:
         return self.config.state_dir / "context-broker-cache"
@@ -1437,7 +1507,23 @@ class FactoryLifecycle:
                 raise FactoryRefusal(
                     "CAPABILITY_APPLY_BLOCKED",
                     "The Factory capability admission could not be applied safely.")
+            # The admission is an overlay the Bridge reads once, at start, so
+            # the service that is running now was not widened by it.  Reload it
+            # here, where the widening happened, rather than leaving a shift to
+            # dispatch against a posture the Owner has already replaced.
+            self._reload_bridge()
         return self._bridge_doctor(), preview
+
+    def _reload_bridge(self) -> dict[str, Any]:
+        """Restart the Bridge service so it binds the files that are here now."""
+
+        doctor = self._bridge_doctor()
+        service = doctor.get("service")
+        service = service if isinstance(service, Mapping) else {}
+        plist = Path(str(service.get("plist_path") or self.config.bridge_plist))
+        self._bootout_if_loaded(self.config.bridge_label)
+        self._bootstrap(self.config.bridge_label, plist)
+        return self._bridge_doctor()
 
     def _refresh_capacity(self, contract):
         for profile in contract.provider_profiles:

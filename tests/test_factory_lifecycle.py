@@ -65,6 +65,7 @@ class FakeHost:
         self.capacity_fresh = True
         self.source_drift = False
         self.capability_admitted = False
+        self.serving_drift = "none"
         self.loaded = {config.legacy_label}
         self.calls = []
         self.capability_admits = 0
@@ -99,7 +100,12 @@ class FakeHost:
             self.loaded.discard(command[2].rsplit("/", 1)[-1])
             return HostCommandResult(0)
         if action == "bootstrap":
-            self.loaded.add(Path(command[3]).stem)
+            label = Path(command[3]).stem
+            self.loaded.add(label)
+            # A restarted Bridge binds the files that are there now, which is
+            # the whole point of restarting it.
+            if label == self.config.bridge_label:
+                self.serving_drift = "none"
             return HostCommandResult(0)
         return HostCommandResult(1, "", "unsupported launchctl action")
 
@@ -205,6 +211,7 @@ class FakeHost:
                 },
             ]},
             "registry_drift": "none" if self.installed else "not_applicable",
+            "serving_drift": self.serving_drift,
             "unresolved_projects": [],
             "capabilities": ["prototype", "bug"] if self.capability_admitted
             else ["prototype"],
@@ -287,10 +294,17 @@ class FactoryLifecycleTests(unittest.TestCase):
         self.assertEqual(len(self.lifecycle.store.capacity_observations()), 1)
         self.assertIn("FACTORY OFF", stopped.render())
         self.assertIn(self.config.bridge_label, self.host.loaded)
-        self.assertFalse(any(
-            command[:2] == ("launchctl", "bootout")
-            and command[2].endswith(self.config.bridge_label)
-            for command, _ in self.host.calls))
+        # The Bridge is never left down, and it is only ever taken down for a
+        # reason the Owner's own command created.  It used to be that the
+        # lifecycle never touched a healthy Bridge at all -- which is how
+        # `start` came to widen a capability the running service could not see:
+        # an admission is an overlay the Bridge reads once, at start, so
+        # applying one and not reloading records a posture nobody serves.
+        bootouts = [command for command, _ in self.host.calls
+                    if command[:2] == ("launchctl", "bootout")
+                    and command[2].endswith(self.config.bridge_label)]
+        self.assertEqual(len(bootouts), 1)
+        self.assertEqual(self.host.capability_admits, 1)
 
         acts = [row for row in self.lifecycle.store.coordination()
                 if row["reason"] == "FACTORY_OWNER_ACTION"]
@@ -436,6 +450,77 @@ class FactoryLifecycleTests(unittest.TestCase):
         self.assertFalse(status.ok)
         self.assertEqual("INCONSISTENT_SERVICE_STATE", status.details["code"])
         self.assertIn("./dev factory stop", status.render())
+
+    def test_the_supervisor_job_names_the_path_it_runs_under(self):
+        """The SF-157 root cause: an inherited PATH is not a declared one.
+
+        launchd hands a job that names no PATH the bare
+        ``/usr/bin:/bin:/usr/sbin:/sbin``.  Under it the labs' containerised
+        evaluators exit 127 and the provider CLI resolves to nothing -- so a
+        healthy mission was recorded as failing its own gates and a signed-in
+        provider was reported as needing sign-in.  Neither said "environment".
+        """
+
+        self.assertTrue(self.lifecycle.dispatch("install").ok)
+        plan = self.lifecycle._service_plan()
+
+        entries = dict(plan.environment)["PATH"].split(":")
+
+        for directory in ("/usr/local/bin", "/opt/homebrew/bin", "/usr/bin",
+                          "/bin", "/usr/sbin", "/sbin"):
+            self.assertIn(directory, entries)
+        self.assertEqual(entries[0], str(Path(plan.interpreter).parent))
+        self.assertIn(str(Path.home() / ".local" / "bin"), entries)
+        self.assertEqual(len(entries), len(set(entries)))
+
+    def test_the_installed_definition_carries_that_path_and_is_drift_checked(self):
+        self.assertTrue(self.lifecycle.dispatch("install").ok)
+        plan = self.lifecycle._service_plan()
+        body = Path(plan.definition_path).read_text()
+
+        self.assertIn("<key>PATH</key>", body)
+        self.assertIn(dict(plan.environment)["PATH"], body)
+        # The environment is inside the plan digest, so a job installed
+        # without it reads as drift rather than as a job that merely exists.
+        stripped = replace(plan, environment=tuple(
+            item for item in plan.environment if item[0] != "PATH"))
+        self.assertNotEqual(stripped.digest, plan.digest)
+
+    def test_a_stale_serving_bridge_is_reloaded_rather_than_refused(self):
+        """SF-157: the Bridge reads its registries once, at start.
+
+        An install or an admission rewrites those files under a service that
+        keeps answering from what it read.  Every diagnostic is a fresh process
+        that re-reads them, so the tooling and the server disagree in the one
+        direction nobody checks -- live, that was a mission refused
+        `UNSUPPORTED_CAPABILITY` for a capability `doctor` reported as served.
+        A stale posture is a restart, not an install, and not an Owner errand.
+        """
+
+        self.assertTrue(self.lifecycle.dispatch("install").ok)
+        self.host.serving_drift = (
+            "the running service bound capabilities before the current file(s)")
+
+        started = self.lifecycle.dispatch("start")
+
+        self.assertTrue(started.ok, started.render())
+        self.assertIn(self.config.bridge_label, self.host.loaded)
+        self.assertTrue(any(
+            command[:2] == ("launchctl", "bootout")
+            and command[2].endswith(self.config.bridge_label)
+            for command, _ in self.host.calls))
+
+    def test_a_stale_serving_bridge_is_named_in_the_status_the_owner_reads(self):
+        self.assertTrue(self.lifecycle.dispatch("install").ok)
+        self.assertTrue(self.lifecycle.dispatch("start").ok)
+        self.host.serving_drift = "the running service bound an older posture"
+
+        status = self.lifecycle.dispatch("status")
+
+        self.assertIn("Needs attention", status.render())
+        code, detail = self.lifecycle._bridge_problem(self.host.doctor())
+        self.assertEqual(code, "BRIDGE_SERVING_DRIFT")
+        self.assertIn("older configuration", detail)
 
     def test_registry_shape_adapter_accepts_list_and_keyed_projects(self):
         listed = FactoryLifecycle._registry_rows({

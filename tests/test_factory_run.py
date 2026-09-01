@@ -773,6 +773,64 @@ class FactoryAutopilotTests(unittest.TestCase):
         self.assertEqual(status.details["work_state"], "attention")
         self.assertIn("Owner attention", status.render())
 
+    def _escalate_first_slot_on_a_failed_gate(self):
+        """Reproduce the live DF-1 row: dispatched, verified, gates unmet.
+
+        Written through the ordinary transitions rather than by editing the
+        ledger, because the state that stranded DF-3 is only reachable past
+        the dispatch boundary -- an escalation is what the engine writes when
+        a mission got far enough to have a candidate.
+        """
+
+        claimed = self.lifecycle.store.claim("test-escalation")
+        mission_id, token = claimed["id"], claimed["lease_token"]
+        self.lifecycle.store.transition(
+            mission_id, token, "dispatched", detail={"candidate_sha": "b" * 40})
+        self.lifecycle.store.transition(
+            mission_id, token, "candidate_verified",
+            detail={"candidate_sha": "b" * 40})
+        self.lifecycle.store.transition(
+            mission_id, token, "escalated",
+            reason="ACCEPTANCE_GATE_FAILED: dev-check, dev-test",
+            release_lease=True)
+        return mission_id
+
+    def test_an_attention_stops_the_next_handoff_and_not_the_admitted_work(self):
+        """SF-157: an escalated slot must not strand a mission already admitted.
+
+        This is the shape the live host was left in.  DF-1 escalated on gates
+        that had exited 127, the Owner's own `./dev factory run` had already
+        admitted the next slot, and every cycle after that returned attention
+        before the supervisor ran -- so the admitted mission stayed admitted
+        for as long as the escalation stood, and no verb would ever reach it.
+        Work past the dispatch boundary would have been worse: unreconciled,
+        with reconciliation waiting on a person.
+        """
+
+        self.ready()
+        self.assertTrue(self.lifecycle.dispatch("run").ok)
+        escalated = self._escalate_first_slot_on_a_failed_gate()
+        # The Owner names the next slot deliberately; `run` is theirs and does
+        # not consult the autopilot's blocker.
+        self.assertTrue(self.lifecycle.dispatch("run").ok)
+        missions = self.missions()
+        self.assertEqual(len(missions), 2)
+        self.assertEqual(missions[1]["state"], "admitted")
+
+        advanced = self.lifecycle.dispatch("cycle")
+
+        self.assertFalse(advanced.ok)
+        self.assertEqual(advanced.state, "attention")
+        self.assertIn("DF-1", advanced.render())
+        self.assertIn("ACCEPTANCE_GATE_FAILED", advanced.render())
+        # The blocker held the handoff: still two missions, none invented.
+        after = self.missions()
+        self.assertEqual(len(after), 2)
+        # And the already-admitted one was carried, not stranded.
+        self.assertEqual(self.lifecycle.store.get(escalated)["state"], "escalated")
+        self.assertNotEqual(after[1]["state"], "admitted")
+        self.assertEqual(advanced.details["cycle"]["missions_advanced"], 1)
+
     def test_status_watch_ctrl_c_does_not_stop_factory_work(self):
         self.ready()
         output = []

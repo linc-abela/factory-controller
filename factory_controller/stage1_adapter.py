@@ -185,13 +185,28 @@ def _run_gate(gate_id: str, argv: Any, workdir: Any, timeout: float) -> dict[str
         return {"gate_id": gate_id, "passed": False, "detail": "not_run",
                 "diagnostic": f"ACCEPTANCE_GATE_UNRUNNABLE: {exc}",
                 "evidence_class": "rederived"}
+    # The exit status is recorded exactly as observed and never reinterpreted:
+    # the portfolio's own stop conditions forbid rewriting a non-zero gate as
+    # met or as an absence word, and a gate that could not find its tooling
+    # exits like any other failing command.  What was missing was the evidence
+    # to tell those apart afterwards -- a bare 127 with no output cost a whole
+    # session -- so the process's own last words travel with the status.
     return {
         "gate_id": gate_id,
         "passed": completed.returncode == 0,
         "detail": " ".join(argv),
         "exit_code": completed.returncode,
         "evidence_class": "rederived",
+        "stderr_tail": _tail(completed.stderr),
     }
+
+
+def _tail(text: Any, limit: int = 2000) -> str:
+    """The end of a gate's diagnostic stream, bounded, or a typed absence."""
+
+    if not isinstance(text, str) or not text.strip():
+        return "not_applicable"
+    return text[-limit:]
 
 
 _GIT_SHA = re.compile(r"^[0-9a-f]{40}$")

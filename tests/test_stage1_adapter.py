@@ -175,6 +175,53 @@ class Stage1AdapterTest(unittest.TestCase):
         self.assertFalse(failed["passed"])
         self.assertEqual(failed["gate_outcomes"][0]["exit_code"], 1)
 
+    def test_a_gate_that_could_not_find_its_tooling_keeps_its_own_diagnostic(self):
+        """The 127 that stopped DF-1, with the sentence that explains it.
+
+        Both labs' evaluators are `exec docker compose ...`.  Run without a
+        PATH that resolves the container runtime they exit 127, and the record
+        used to carry nothing but that number -- indistinguishable from a
+        mission whose own work failed.  The status is still recorded exactly as
+        observed, because the portfolio forbids rewriting a non-zero gate as
+        anything else; what changes is that the evaluator's last words travel
+        with it.
+        """
+
+        gate = self.root / "dev"
+        gate.write_text("#!/bin/sh\n"
+                        "exec sf157-absent-container-runtime compose run lab\n")
+        gate.chmod(gate.stat().st_mode | stat.S_IEXEC)
+        config = dict(self.config,
+                      gate_commands={"dev-check": [str(gate), "check"]},
+                      gate_workdir=str(self.root))
+        mission = {"stage1": config, "acceptance_gate_ids": ["dev-check"]}
+        dispatch = self._run("dispatch", {"mission": mission})
+
+        answer = execute({"step": "evaluate", "operation_key": "m:evaluate",
+                          "input": {"mission": mission, "dispatch": dispatch}},
+                         )
+
+        outcome = answer["gate_outcomes"][0]
+        self.assertFalse(answer["passed"])
+        self.assertEqual(outcome["exit_code"], 127)
+        self.assertIn("sf157-absent-container-runtime", outcome["stderr_tail"])
+        self.assertIn("not found", outcome["stderr_tail"])
+
+    def test_a_quiet_gate_records_a_typed_absence_rather_than_an_empty_string(self):
+        gate = self.root / "quiet.sh"
+        gate.write_text("#!/bin/sh\nexit 0\n")
+        gate.chmod(gate.stat().st_mode | stat.S_IEXEC)
+        config = dict(self.config, gate_commands={"G-PASS": [str(gate)]},
+                      gate_workdir=str(self.root))
+        mission = {"stage1": config, "acceptance_gate_ids": ["G-PASS"]}
+        dispatch = self._run("dispatch", {"mission": mission})
+
+        answer = execute({"step": "evaluate", "operation_key": "m:evaluate",
+                          "input": {"mission": mission, "dispatch": dispatch}})
+
+        self.assertEqual(answer["gate_outcomes"][0]["stderr_tail"],
+                         "not_applicable")
+
     def test_mutating_gate_runs_against_the_verified_candidate_not_the_baseline(self):
         """A green candidate gate must not be a green baseline gate in disguise."""
 
