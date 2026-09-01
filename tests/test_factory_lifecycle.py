@@ -75,6 +75,12 @@ class FakeHost:
             "factory-prototype-lab": "/labs/factory-prototype-lab",
             "factory-bug-lab": "/labs/factory-bug-lab",
         }
+        # Registered projects and provider profiles beyond the frozen dogfood
+        # pair.  Empty by default so every existing test sees the host it saw
+        # before; the product path fills them, because a product project is
+        # exactly what the internal portfolio does not have.
+        self.extra_projects = []
+        self.extra_profiles = []
         # What the prototype lab's own gates say at the frozen baseline,
         # copied from a real run of them: two tests, five of five labels
         # linked, no false matches.  The improvement slot measures its
@@ -172,13 +178,15 @@ class FakeHost:
             self.capability_admitted = True
             self.capability_admits += 1
             return HostCommandResult(0, json.dumps({"outcome": "admitted"}))
-        if arguments in (("capacity", "observe", "codex-primary"),
-                         ("capacity", "status", "codex-primary")):
+        if arguments[:1] == ("capacity",) and arguments[1:2] in (
+                ("observe",), ("status",)) and arguments[2:3] and (
+                arguments[2] == "codex-primary"
+                or arguments[2] in {row["profile_id"] for row in self.extra_profiles}):
             if not self.capacity_fresh:
                 return HostCommandResult(1, json.dumps({"state": "absent"}))
             return HostCommandResult(0, json.dumps({
                 "schema_version": "factory.bridge.capacity_observation.v1",
-                "profile_id": "codex-primary",
+                "profile_id": arguments[2],
                 "state": "fresh",
                 "classification": "available",
                 "quota_state": "available",
@@ -242,6 +250,7 @@ class FakeHost:
                     "capabilities": ["bug"],
                     "checkout": self.checkouts["factory-bug-lab"],
                 },
+                *self.extra_projects,
             ]},
             "registry_drift": "none" if self.installed else "not_applicable",
             "serving_drift": self.serving_drift,
@@ -256,7 +265,7 @@ class FakeHost:
                 "profile_id": "codex-primary",
                 "status": "available" if self.primary_ready else "unavailable",
                 "readiness": "available" if self.primary_ready else "auth_required",
-            }]},
+            }, *self.extra_profiles]},
             "containment": {"sandbox_exec_present": self.containment},
             "legacy": {"service_loaded": self.config.legacy_label in self.loaded},
         }
