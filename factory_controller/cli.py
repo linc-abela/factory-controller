@@ -20,6 +20,7 @@ from . import maintenance as mnt
 from . import portfolio
 from . import production
 from . import rehearsal
+from . import release
 from . import shift as shift_plane
 from . import shift_runtime
 from . import supervisor as sup
@@ -179,6 +180,32 @@ def parser() -> argparse.ArgumentParser:
     prod.add_argument("--work-item")
     prod.add_argument("--summary")
     prod.add_argument("--policy-version", dest="prod_policy_version", default="unset")
+
+    rel = sub.add_parser(
+        "release",
+        help="the exact-artifact path: seal, review, Owner Validation, "
+             "promotion, rollback")
+    rel.add_argument("action", choices=(
+        "seal", "deploy-review", "validate", "promote", "rollback", "show",
+        "events"))
+    rel.add_argument("--rc", dest="rc_id")
+    rel.add_argument("--bundle", type=Path, dest="rel_bundle",
+                     help="a Controller release bundle, as JSON; '-' reads stdin")
+    rel.add_argument("--verification-ref", action="append", default=[],
+                     dest="verification_refs",
+                     help="durable verification evidence; repeatable")
+    rel.add_argument("--qa-ref", action="append", default=[], dest="qa_refs",
+                     help="durable independent QA evidence; repeatable")
+    rel.add_argument("--environment", dest="rel_environment")
+    rel.add_argument("--review-url", dest="review_url")
+    rel.add_argument("--actor", dest="rel_actor")
+    rel.add_argument("--validation", dest="validation_id")
+    rel.add_argument("--deployment-ref", dest="deployment_ref")
+    rel.add_argument("--decision", choices=sorted(release.DECISIONS))
+    rel.add_argument("--notes", default="")
+    rel.add_argument("--passed", type=int, default=0, dest="rel_passed")
+    rel.add_argument("--failed", type=int, default=0, dest="rel_failed")
+    rel.add_argument("--health-ref", dest="health_ref")
 
     imp_parser = sub.add_parser("improvement")
     imp_parser.add_argument("action", choices=(
@@ -369,7 +396,11 @@ def parser() -> argparse.ArgumentParser:
         "factory", help="the bounded Owner install/start/run/stop/status surface")
     factory_parser.add_argument(
         "factory_action",
-        choices=("install", "start", "run", "cycle", "stop", "status"))
+        choices=("install", "start", "run", "product", "cycle", "stop", "status"))
+    factory_parser.add_argument(
+        "--package", type=Path,
+        help="the Product Candidate Package to submit; required by 'product' "
+             "and used by nothing else")
     factory_parser.add_argument(
         "--watch", action="store_true",
         help="keep observing status until completion, attention, or Ctrl+C")
@@ -481,6 +512,83 @@ def _production(args, store) -> int:
         return 1
     except production.PolicyError as error:
         print(json.dumps({"refused": {"code": "POLICY_INVALID",
+                                      "detail": str(error)}}, sort_keys=True))
+        return 1
+    print(json.dumps(result, sort_keys=True, default=list))
+    return 0
+
+
+def _release(args, store) -> int:
+    """The Owner's surface onto the exact-artifact release path.
+
+    ``release.py`` held this whole lifecycle and nothing reached it, which is a
+    different failure from not having it: logic no command can invoke cannot be
+    the thing an Owner Validation runs through.  This is that command, and it
+    adds no rule -- every refusal below is raised by the lifecycle itself.
+
+    The deployment port is the deterministic one, for the same reason
+    ``_production`` uses it: reaching a real target is a host mechanism and
+    lives outside this repository, so a production mutation never becomes
+    available merely because somebody typed a command here.
+    """
+
+    lifecycle = release.ReleaseLifecycle(store)
+    ledger = production.ProductionLedger(store)
+    port = production.DeterministicDeploymentAdapter()
+    health = None
+    if args.rel_passed or args.rel_failed:
+        health = production.HealthRecord(
+            checks_passed=args.rel_passed, checks_failed=args.rel_failed,
+            evidence_ref=args.health_ref or "unknown", observed_at=time.time())
+    try:
+        if args.action == "seal":
+            body = (sys.stdin.read() if str(args.rel_bundle) == "-"
+                    else args.rel_bundle.read_text())
+            bundle = production.ReleaseBundle.from_payload(json.loads(body))
+            result = lifecycle.seal(
+                args.rc_id, bundle,
+                verification_refs=args.verification_refs,
+                qa_refs=args.qa_refs).as_row()
+        elif args.action == "deploy-review":
+            result = lifecycle.deploy_review(
+                args.rc_id, ledger, port,
+                review_environment_id=args.rel_environment,
+                requested_by=args.rel_actor, review_url=args.review_url,
+                health=health)
+        elif args.action == "validate":
+            result = lifecycle.record_owner_validation(
+                args.validation_id, args.rc_id,
+                deployment_ref=args.deployment_ref, decision=args.decision,
+                decided_by=args.rel_actor, decided_at=time.time(),
+                notes=args.notes).as_row()
+        elif args.action == "promote":
+            result = lifecycle.promote_validated(
+                args.rc_id, args.validation_id, ledger, port,
+                production_environment_id=args.rel_environment,
+                requested_by=args.rel_actor, health=health)
+        elif args.action == "rollback":
+            result = lifecycle.rollback_production(
+                args.rc_id, ledger, port,
+                production_environment_id=args.rel_environment)
+        elif args.action == "events":
+            result = list(lifecycle.events(args.rc_id))
+        else:
+            result = lifecycle.candidate(args.rc_id).as_row()
+    except release.ReleaseRefusal as refusal:
+        print(json.dumps({"refused": {"code": refusal.code,
+                                      "detail": refusal.detail}}, sort_keys=True))
+        return 1
+    except production.ProductionRefusal as refusal:
+        print(json.dumps({"refused": refusal.as_row()}, sort_keys=True))
+        return 1
+    except production.PolicyError as error:
+        # A bundle the production contract itself rejects, before the release
+        # lifecycle ever sees it -- a mutable artifact tag is caught here.
+        print(json.dumps({"refused": {"code": "RELEASE_BUNDLE_INVALID",
+                                      "detail": str(error)}}, sort_keys=True))
+        return 1
+    except (AttributeError, TypeError, ValueError) as error:
+        print(json.dumps({"refused": {"code": "RELEASE_ARGUMENTS_INVALID",
                                       "detail": str(error)}}, sort_keys=True))
         return 1
     print(json.dumps(result, sort_keys=True, default=list))
@@ -1184,7 +1292,7 @@ def main(argv: list[str] | None = None) -> int:
             except factory_lifecycle.FactoryRefusal as refusal:
                 print("BLOCKED: " + refusal.detail)
                 return 1
-        result = lifecycle.dispatch(args.factory_action)
+        result = lifecycle.dispatch(args.factory_action, package=args.package)
         print(result.render())
         return 0 if result.ok else 1
     controller = _controller(args)
@@ -1272,6 +1380,8 @@ def main(argv: list[str] | None = None) -> int:
         print(json.dumps(advisory.coordinate(store, port, policy), sort_keys=True))
     elif args.command == "production":
         return _production(args, store)
+    elif args.command == "release":
+        return _release(args, store)
     elif args.command == "maintenance":
         return _maintenance(args, controller)
     elif args.command == "improvement":

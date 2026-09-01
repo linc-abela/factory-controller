@@ -1,0 +1,19 @@
+{
+  "schema_version": "factory.controller.product_run_contract.v1",
+  "run_ref": "SF-151A-lodus-casino-1",
+  "rationale": "The four facts a Product Candidate Package deliberately does not carry, because they are the Factory's configuration and not the product's intent: which repository the mission runs against, at which frozen baseline, behind which gates, and through which provider profile. The baseline is frozen here for the same reason the internal portfolio freezes one per mission -- a baseline resolved at submission time would make two submissions of the same package two different missions. c75c2ba3 is the bootstrap commit of linc-abela/lodus-casino and is on the remote, so a second host can fetch it. Its dev script is the acceptance gate source, and the three gates are the ones that script exposes: at that commit dev check and dev test exit 0 and dev evaluate exits 1, which is why dev-evaluate carries no expected-failure entry -- the mission is the gate turning green.",
+  "package_id": "lodus-casino",
+  "project_id": "lodus-casino",
+  "provider_profiles": ["codex-product"],
+  "work_class": "backlog",
+  "environment_class": "staging",
+  "mutates_repository": true,
+  "baseline_sha": "c75c2ba383a56d2289c60c88f26f09bed093c443",
+  "acceptance_gate_ids": ["dev-check", "dev-test", "dev-evaluate"],
+  "acceptance_gate_source": "https://github.com/linc-abela/lodus-casino.git@c75c2ba383a56d2289c60c88f26f09bed093c443:dev",
+  "acceptance_gate_expectations": {},
+  "publish_prefix": "public/",
+  "capability_request": "lodus-casino-capability-admission-request.json",
+  "review_environment_id": "lodus-casino-review",
+  "production_environment_id": "lodus-casino-production"
+}

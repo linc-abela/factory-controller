@@ -31,6 +31,7 @@ from . import dogfood_improvement
 from . import dogfood_intake
 from . import improvement
 from . import portfolio
+from . import product
 from . import production
 from . import shift as shift_plane
 from . import shift_runtime
@@ -124,6 +125,7 @@ class FactoryConfig:
     contract_path: Path
     portfolio_path: Path
     capability_request_path: Path
+    product_contract_path: Path
     agents_dir: Path
     state_dir: Path
     bridge_prefix: Path = Path("/Users/Shared/factory")
@@ -181,6 +183,8 @@ class FactoryConfig:
             "first-dogfood-mission-portfolio.json",
             capability_request_path=bridge_root / "contracts" /
             "first-dogfood-capability-admission-request.json",
+            product_contract_path=controller_root / "contracts" /
+            "lodus-casino-product-run-contract.json",
             agents_dir=Path.home() / "Library" / "LaunchAgents",
             state_dir=Path.home() / ".factory-controller",
         )
@@ -274,8 +278,10 @@ class FactoryLifecycle:
 
     # -- public surface ------------------------------------------------- #
 
-    def dispatch(self, action: str) -> FactoryResult:
+    def dispatch(self, action: str, **options: Any) -> FactoryResult:
         try:
+            if action == "product":
+                return self.product(options.get("package"))
             if action == "install":
                 return self.install()
             if action == "start":
@@ -486,6 +492,152 @@ class FactoryLifecycle:
         self._bootstrap_service(self._install_supervisor_definition())
 
         return self._queue_next(contract, entry, doctor, grant, owner_action=True)
+
+    def product(self, package_path: Any) -> FactoryResult:
+        """Submit one Product Candidate Package the Owner named.
+
+        This is the only verb in this module where the Owner names the work.
+        ``run`` advances a frozen portfolio and could in principle be performed
+        by a scheduler; a real product entering the Factory cannot, because the
+        package *is* the intent and nobody but its Owner may supply it.  So the
+        package path is a required argument with no default: there is no
+        "the usual one" to fall back to.
+
+        Everything after that argument is the ordinary path.  The mission is
+        materialized by the same seam the internal portfolio uses, submitted
+        through the same Controller, and executed by the same supervisor -- a
+        product mission is not a second pipeline, it is the first one with a
+        different origin.
+        """
+
+        self._require_owner()
+        if not package_path:
+            raise FactoryRefusal(
+                "PRODUCT_PACKAGE_REQUIRED",
+                "Name the Product Candidate Package to submit: "
+                "'./dev factory product --package <path>'.")
+        try:
+            contract = product.ProductContract.load(self.config.product_contract_path)
+            _, accepted = product.package_from(package_path)
+            mission = product.mission_for(contract, accepted)
+            brief = product.brief(contract, accepted)
+        except product.ProductRefusal as refusal:
+            raise FactoryRefusal(refusal.code, refusal.detail) from None
+
+        grant = self.shift.grant()
+        control = self.supervisor.control()
+        if grant is None or control.get("state") != "running" \
+                or not self._service_loaded(self.config.supervisor_label):
+            raise FactoryRefusal(
+                "FACTORY_NOT_READY",
+                "The Factory is not running. Run './dev factory start' first.")
+        doctor = self._bridge_doctor()
+        self._check_primary_and_containment(contract, doctor)
+        if not self._service_loaded(self.config.bridge_label) \
+                or not self._bridge_is_healthy(doctor):
+            code, detail = self._bridge_problem(doctor)
+            raise FactoryRefusal(code, detail)
+
+        approval_ref = self._approval_reference(
+            "%s-%s" % (contract.run_ref, accepted.package_digest[:12]))
+        act = product.owner_act(
+            contract, accepted, owner=self.owner.username,  # type: ignore[union-attr]
+            approval_ref=approval_ref,
+            at=dogfood_intake.iso_utc(self.clock()))
+        self._record_owner_act("product", approval_ref, {
+            "package_id": act["package_id"],
+            "package_digest": act["package_digest"],
+            "work_item_id": act["work_item_id"],
+            "act_hash": act["act_hash"],
+        })
+        self._write_mission_file(mission.mission_ref, "owner-intake", act)
+
+        self._refresh_capacity(contract)
+        doctor, _ = self._admit_capability(
+            self.config.bridge_root / "contracts" / contract.capability_request,
+            contract, doctor, approval_ref)
+        self._provision_product_store(contract, doctor)
+        self._bootstrap_service(self._install_supervisor_definition())
+
+        intake = self._materialize(
+            contract, None, mission, doctor, grant, brief=brief,
+            portfolio_ref=contract.run_ref,
+            corpus_identity="package://%s@%s" % (accepted.mission["source_pcp"],
+                                                 accepted.package_digest))
+        try:
+            submitted, created = self.controller.submit(
+                intake.payload, intake.idempotency_key)
+        except Exception as exc:  # noqa: BLE001
+            raise FactoryRefusal(
+                "PRODUCT_NOT_SUBMITTED",
+                "The product mission could not be submitted. Retry the command."
+            ) from exc
+
+        open_decisions = product.unresolved(accepted)
+        lines = [
+            "Submitted %s to the Factory." % accepted.mission["source_pcp"],
+            "Work item: %s against %s at %s."
+            % (mission.mission_ref, contract.project_id, contract.baseline_sha[:12]),
+            "Package digest: %s." % accepted.package_digest,
+            "This mission was %s."
+            % ("admitted now" if created else "already admitted; nothing was duplicated"),
+            "The Factory owns execution from here. Watch it with "
+            "'./dev factory status --watch'.",
+        ]
+        if open_decisions:
+            lines.insert(3, "The package leaves %d decision(s) open: %s."
+                         % (len(open_decisions), ", ".join(open_decisions)))
+        return FactoryResult(
+            action="product", ok=True,
+            state="submitted" if created else "already-submitted",
+            lines=tuple(lines),
+            details={
+                "mission_id": submitted.get("id"),
+                "work_item_id": mission.mission_ref,
+                "package_id": accepted.package_id,
+                "package_digest": accepted.package_digest,
+                "idempotency_key": intake.idempotency_key,
+                "context_manifest_hash": intake.context_manifest_hash,
+                "baseline_sha": contract.baseline_sha,
+                "approval_ref": approval_ref,
+                "owner_act_hash": act["act_hash"],
+                "created": created,
+            },
+        )
+
+    def _provision_product_store(self, contract, doctor) -> None:
+        """Give the product project the same durable policy a lab project has.
+
+        Deliberately narrower than ``_provision_store``: one project, the
+        contract's single work class, and no improvement policy at all.  An
+        improvement plane opened over a product on its first build would let a
+        second admitter promote a candidate for a mission that has not
+        produced one yet.
+        """
+
+        row = dogfood_intake.registry_row(
+            self._registry_rows(doctor), contract.project_id)
+        policy = portfolio.ProjectPolicy(
+            project_id=contract.project_id,
+            repository=row.get("repository_remote_url"),
+            state="enabled", priority=1, concurrency_cap=1,
+            acceptance_gate_ids=tuple(contract.acceptance_gate_ids),
+            acceptance_gate_source=contract.acceptance_gate_source,
+            policy_version=contract.run_ref,
+        )
+        current = self.store.project(contract.project_id)
+        if current is None or current.as_row() != policy.as_row():
+            self.store.register_project(policy)
+        supervisor_policy = supervisor.SupervisorPolicy(
+            project_id=contract.project_id, enabled=True,
+            work_classes=(contract.work_class,),
+            missions_per_cycle=1, maintenance_admissions=1,
+            improvement_admissions=0,
+            policy_version=contract.run_ref,
+        )
+        existing = self.supervisor.policy(contract.project_id)
+        if existing is None or existing.as_row() != supervisor_policy.as_row():
+            self.supervisor.set_policy(supervisor_policy)
 
     def cycle(self) -> FactoryResult:
         """Advance one bounded Factory cycle and hand off the next slot.
@@ -862,8 +1014,15 @@ class FactoryLifecycle:
         return row["experiment_ref"]
 
     def _materialize(self, contract, entry, mission, doctor, grant, attempt=1,
-                     brief=None):
-        """Derive the whole mission, and refuse rather than guess any part."""
+                     brief=None, *, portfolio_ref=None, corpus_identity=None):
+        """Derive the whole mission, and refuse rather than guess any part.
+
+        ``portfolio_ref`` and ``corpus_identity`` default to the frozen
+        internal portfolio's own two identities.  The product path supplies
+        them instead -- its corpus is the submitted package's digest, not a
+        portfolio file -- so both paths keep one identity scheme, one manifest
+        rule and one admission document between them.
+        """
 
         registry = self._registry_rows(doctor)
         registry_digest = (doctor.get("registry") or {}).get("digest") \
@@ -883,10 +1042,11 @@ class FactoryLifecycle:
         try:
             intake = dogfood_intake.build(
                 mission,
-                portfolio_ref=entry.portfolio_ref, run_ref=contract.run_ref,
+                portfolio_ref=portfolio_ref or entry.portfolio_ref,
+                run_ref=contract.run_ref,
                 registry=registry, registry_digest=registry_digest,
                 provider_profiles=contract.provider_profiles,
-                corpus_identity="contract://%s@%s"
+                corpus_identity=corpus_identity or "contract://%s@%s"
                                 % (entry.portfolio_ref,
                                    self._portfolio_identity()),
                 owner=self.owner.username,  # type: ignore[union-attr]
@@ -939,8 +1099,13 @@ class FactoryLifecycle:
         """
 
         suffix = "" if attempt <= 1 else "-attempt-%d" % attempt
+        # A product work item is `<package_id>:build`, and a colon in a POSIX
+        # filename is legal but displays as a path separator.  Every internal
+        # portfolio reference is already colon-free, so this renames nothing
+        # that exists.
+        stem = mission_ref.lower().replace(":", "-")
         return self.config.mission_dir / (
-            "%s%s-%s.json" % (mission_ref.lower(), suffix, kind))
+            "%s%s-%s.json" % (stem, suffix, kind))
 
     def _write_mission_file(self, mission_ref: str, kind: str,
                             body: Mapping[str, Any], attempt: int = 1) -> None:
@@ -1718,23 +1883,36 @@ class FactoryLifecycle:
             None, None, "factory", "FACTORY_OWNER_ACTION", row)
 
     def _admit_required_capability(self, contract, doctor, approval_ref):
+        return self._admit_capability(
+            self.config.capability_request_path, contract, doctor, approval_ref)
+
+    def _admit_capability(self, request_path, contract, doctor, approval_ref):
+        """One Owner admission, scoped to the contract that asked for it.
+
+        The scope check is the whole point of reading the request through a
+        contract rather than trusting the file: an admission may only name
+        profiles and projects the contract already declares, so a widened
+        request file cannot widen the running bridge past what the Owner
+        approved when they approved the contract.
+        """
+
         try:
-            payload = json.loads(self.config.capability_request_path.read_text())
+            payload = json.loads(Path(request_path).read_text())
         except (OSError, ValueError):
             raise FactoryRefusal(
                 "CAPABILITY_REQUEST_UNAVAILABLE",
-                "The first-dogfood capability request is unavailable.") from None
+                "The capability request this run needs is unavailable.") from None
         if not isinstance(payload, dict):
             raise FactoryRefusal(
                 "CAPABILITY_REQUEST_INVALID",
-                "The first-dogfood capability request is invalid.")
+                "The capability request this run needs is invalid.")
         requested_profiles = tuple(payload.get("profiles") or ())
         requested_projects = tuple(payload.get("projects") or ())
         if set(requested_profiles) - set(contract.provider_profiles) \
                 or set(requested_projects) != set(contract.projects):
             raise FactoryRefusal(
                 "CAPABILITY_SCOPE_INVALID",
-                "The first-dogfood capability request exceeds the frozen portfolio.")
+                "The capability request exceeds what this run contract declares.")
         payload["authorized_by"] = self.owner.username  # type: ignore[union-attr]
         approval_key = "author" + "ization_ref"
         payload[approval_key] = approval_ref
