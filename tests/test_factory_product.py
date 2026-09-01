@@ -8,13 +8,14 @@ that the widening it performs is exactly one profile and one project.
 
 from __future__ import annotations
 
+import itertools
 import json
 from dataclasses import replace
 from pathlib import Path
 import tempfile
 import unittest
 
-from factory_controller import pcp, product, release
+from factory_controller import pcp, product, production, release
 from factory_controller.factory import FactoryConfig, FactoryLifecycle, OwnerIdentity
 from factory_controller.engine import Controller
 from factory_controller.store import MissionStore
@@ -688,9 +689,21 @@ class ProductReviewTests(unittest.TestCase):
                 CONTRACT.production_environment_id)
 
     def test_reviewing_twice_seals_one_candidate_and_deploys_once(self):
+        """With a clock that moves between them, which is what caught this.
+
+        `bundle_digest` is taken over every bundle field, the RC id is derived
+        from the candidate rather than the clock, and `seal` refuses one id
+        offered different bytes.  So a provenance timestamp read from "now"
+        made the second review of one candidate a hard refusal -- invisible to
+        a test whose two calls landed in the same second, and immediate on a
+        host.
+        """
+
         self.ready()
         self.assertTrue(self.submit().ok)
         self.finish_the_product_mission()
+        ticks = itertools.count(1_800_000_000.0, 9_999.0)
+        self.lifecycle.clock = lambda: next(ticks)
 
         first = self.review()
         second = self.review()
@@ -706,6 +719,55 @@ class ProductReviewTests(unittest.TestCase):
             deployments = db.execute("SELECT COUNT(*) n FROM deployments"
                                      " WHERE project_id='lodus-casino'").fetchone()["n"]
         self.assertEqual(deployments, 1)
+
+    def test_a_candidate_already_sealed_under_other_bytes_is_reused(self):
+        """The live host's own state, reproduced.
+
+        A Release Candidate is immutable, so an RC sealed from a bundle whose
+        fields have since changed shape can never be re-sealed. Recognising it
+        by commit and artifact is what keeps a second review from being a
+        permanent refusal; a different artifact still reaches `seal`.
+        """
+
+        self.ready()
+        self.assertTrue(self.submit().ok)
+        mission_id = self.finish_the_product_mission()
+        # Seal first, from a bundle that differs only in when it says it was
+        # built -- exactly the drift that produced the refusal.
+        first = self.review()
+        rc_id = first.details["rc_id"]
+        lifecycle = release.ReleaseLifecycle(self.lifecycle.store)
+        stale = production.ReleaseBundle.from_payload(product.release_bundle(
+            CONTRACT, work_item_id="lodus-casino:build", mission_id=mission_id,
+            repository="https://github.com/linc-abela/lodus-casino.git",
+            candidate_sha=self.CANDIDATE,
+            artifact={"kind": "static-bundle",
+                      "identity": first.details["artifact_digest"]},
+            evidence_pointer="e" * 64, provenance_at="1999-01-01T00:00:00Z"))
+        self.assertNotEqual(stale.bundle_digest,
+                            first.details["bundle_digest"])
+        with self.assertRaises(release.ReleaseRefusal) as refused:
+            lifecycle.seal(rc_id, stale, verification_refs=["v"], qa_refs=["q"])
+        self.assertEqual(refused.exception.code, "RC_IDENTITY_MISMATCH")
+
+        again = self.review()
+
+        self.assertTrue(again.ok, again.render())
+        self.assertEqual(again.details["rc_id"], rc_id)
+        self.assertEqual(len(self.candidates()), 1)
+
+    def test_a_different_artifact_for_one_candidate_is_still_refused(self):
+        """The narrowing must not become a way past the immutability rule."""
+
+        self.ready()
+        self.assertTrue(self.submit().ok)
+        self.finish_the_product_mission()
+        first = self.review()
+        lifecycle = release.ReleaseLifecycle(self.lifecycle.store)
+
+        self.assertIsNone(self.lifecycle._already_sealed(
+            lifecycle, first.details["rc_id"], self.CANDIDATE,
+            sealed_digest="sha256:" + "b" * 64))
 
     def test_the_review_is_recorded_as_an_owner_act(self):
         self.ready()

@@ -724,16 +724,27 @@ class FactoryLifecycle:
             repository=registry.get("repository_remote_url"),
             candidate_sha=candidate, artifact=artifact["artifact"],
             evidence_pointer=evidence_pointer,
-            provenance_at=dogfood_intake.iso_utc(self.clock()))
+            # When the candidate was built, not when a review was asked for.
+            # A wall clock here moves `bundle_digest`, and the Release
+            # Candidate id is derived from the candidate rather than the
+            # clock -- so a second review offered the same id different bytes
+            # and was refused RC_IDENTITY_MISMATCH by its own idempotency
+            # rule.  The mission's settle time is the durable fact the field
+            # is actually about, and it does not move.
+            provenance_at=dogfood_intake.iso_utc(
+                float(mission["updated_at"])))
         bundle = production.ReleaseBundle.from_payload(payload)
         rc_id = product.rc_id_for(contract, candidate)
         lifecycle = release.ReleaseLifecycle(self.store, clock=self.clock)
         try:
-            sealed = lifecycle.seal(
-                rc_id, bundle,
-                verification_refs=["candidate://%s" % candidate,
-                                   "mission://%s" % mission["id"]],
-                qa_refs=["qa://%s/decision-boundary" % mission["id"]])
+            sealed = self._already_sealed(
+                lifecycle, rc_id, candidate, sealed_digest=bundle.artifact["identity"])
+            if sealed is None:
+                sealed = lifecycle.seal(
+                    rc_id, bundle,
+                    verification_refs=["candidate://%s" % candidate,
+                                       "mission://%s" % mission["id"]],
+                    qa_refs=["qa://%s/decision-boundary" % mission["id"]])
             deployed = lifecycle.deploy_review(
                 rc_id, self.production,
                 production.DeterministicDeploymentAdapter(),
@@ -772,6 +783,33 @@ class FactoryLifecycle:
                      "decision_boundary": boundary["outcome"],
                      "files": artifact["file_count"]},
         )
+
+    @staticmethod
+    def _already_sealed(lifecycle, rc_id: str, candidate: str, *,
+                        sealed_digest: str):
+        """The Release Candidate this candidate already has, if it has one.
+
+        Sealing is a one-time act and a Release Candidate is immutable, so a
+        second review has to recognise its own earlier work rather than offer
+        one id a second set of bytes.  Recognised on the two facts a Release
+        Candidate is *about* -- the commit and the bytes -- so a genuine change
+        still reaches ``seal`` and is still refused there; this narrows what
+        counts as the same release, it does not widen what may be sealed.
+
+        Without it, any field of the bundle that is not a fact about the
+        candidate makes the second review a hard refusal, and the RC already in
+        the ledger cannot be re-sealed to fix it.  That is not hypothetical:
+        it is how this was found.
+        """
+
+        try:
+            existing = lifecycle.candidate(rc_id)
+        except release.ReleaseRefusal:
+            return None
+        if existing.candidate_sha == candidate \
+                and existing.artifact_digest == sealed_digest:
+            return existing
+        return None
 
     def _product_contract(self):
         try:
