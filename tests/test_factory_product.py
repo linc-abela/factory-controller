@@ -727,6 +727,36 @@ class ProductReviewTests(unittest.TestCase):
         self.assertEqual(release_mod._surface(self.config.review_url),
                          self.config.review_url)
 
+    def test_status_names_the_review_verb_before_it_has_been_run(self):
+        self.ready()
+        self.assertTrue(self.submit().ok)
+        self.finish_the_product_mission()
+
+        rendered = self.lifecycle.dispatch("status").render()
+        self.assertIn("is settled; it succeeded", rendered)
+        self.assertIn("Next: run './dev factory review'", rendered)
+
+    def test_status_names_the_sealed_review_and_its_surface(self):
+        self.ready()
+        self.assertTrue(self.submit().ok)
+        self.finish_the_product_mission()
+        result = self.review()
+
+        rendered = self.lifecycle.dispatch("status").render()
+        self.assertIn("Review: %s is ready at %s"
+                      % (result.details["rc_id"], self.config.review_url),
+                      rendered)
+        self.assertIn(result.details["artifact_digest"], rendered)
+        self.assertNotIn("Next: run './dev factory review'", rendered)
+
+    def test_an_unfinished_mission_is_not_offered_for_review(self):
+        self.ready()
+        self.assertTrue(self.submit().ok)
+
+        rendered = self.lifecycle.dispatch("status").render()
+        self.assertNotIn("factory review", rendered)
+        self.assertNotIn("Review:", rendered)
+
     def test_a_review_never_touches_the_mission_it_releases(self):
         self.ready()
         self.assertTrue(self.submit().ok)

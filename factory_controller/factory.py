@@ -1517,10 +1517,55 @@ class FactoryLifecycle:
             summary_state = "complete"
         else:
             summary_state = "pending"
+        lines.extend(self._review_lines(mission, state))
         history = self._dogfood_history_note()
         if history is not None:
             lines.append(history)
         return tuple(lines), summary_state
+
+    def _review_lines(self, mission, state: str) -> tuple[str, ...]:
+        """Where a finished product stands on the way to the Owner's judgement.
+
+        A mission that succeeded and a product the Owner can look at are two
+        different facts, and the surface reported only the first: the Owner
+        was told the work finished and left to know, from somewhere else, that
+        a verb existed to turn it into something reviewable.  This is the rest
+        of that sentence, and like everything else here it is read rather than
+        assumed -- an unsealed candidate says so, and a sealed one names the
+        surface its own bytes are served on.
+        """
+
+        if state != "completed":
+            return ()
+        try:
+            contract = product.ProductContract.load(
+                self.config.product_contract_path)
+            result = mission.get("result") or {}
+            candidate = ((result.get("verification") or {}).get("verification")
+                         or {}).get("candidate_sha")
+            if not isinstance(candidate, str):
+                return ()
+            rc_id = product.rc_id_for(contract, candidate)
+        except Exception:  # noqa: BLE001
+            return ()
+        try:
+            with self.store.transaction() as db:
+                row = db.execute(
+                    "SELECT validation_surface, artifact_digest FROM"
+                    " release_deployments WHERE rc_id=?", (rc_id,)).fetchone()
+        except Exception:  # noqa: BLE001
+            # The release plane owns that table and creates it on first use, so
+            # before any product was ever reviewed there is nothing to read.
+            # Reading is all this does: a status that created a schema would be
+            # a status that writes.
+            row = None
+        if row is None:
+            return ("Next: run './dev factory review' to prepare it for your "
+                    "review.",)
+        return ("Review: %s is ready at %s" % (rc_id, row["validation_surface"]),
+                "Serving artifact %s" % row["artifact_digest"],
+                "Start the surface with './dev review up' if it is not already "
+                "running.")
 
     def _work_summary(self) -> tuple[tuple[str, ...], str]:
         """What the Owner needs to know about work, with no internal ids.
