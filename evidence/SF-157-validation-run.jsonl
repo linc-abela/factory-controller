@@ -1,0 +1,44 @@
+{"lines": ["FACTORY INSTALLED", "Run './dev factory start' to begin work."], "ok": true, "slots": [], "state": "off", "step": "install"}
+{"lines": ["FACTORY READY", "Shift active. Supervisor running."], "ok": true, "slots": [], "state": "ready", "step": "start"}
+{"lines": ["DOGFOOD MISSION QUEUED", "Mission: Run the same path against a declared gate that is known to fail, and prove the failure is recorded as a failure.", "Project: factory-bug-lab", "The supervisor will pick it up automatically. Run './dev factory status' to follow it."], "ok": true, "slots": [{"attempts": 1, "key": "DF-1:b09a0ea397b87e87f2fad42cfa5b8dd5cd6b5f54e050f82e37f6839849736107", "state": "completed", "terminal_reason": "not_applicable", "work_item": "DF-1"}, {"attempts": 0, "key": "DF-2:9146478420dbeefc847e609cda37dad16b39e3d8e3ef92b7525d35cb7d164155", "state": "admitted", "terminal_reason": "not_applicable", "work_item": "DF-2"}], "state": "queued", "step": "cycle-1"}
+{"lines": ["DOGFOOD MISSION QUEUED", "Mission: Diagnose and fix the seat-overbooking defect the lab's frozen report describes, from baseline 4072bfd7, adding a regression that fails at the baseline and passes at the fix.", "Project: factory-bug-lab", "The supervisor will pick it up automatically. Run './dev factory status' to follow it."], "ok": true, "slots": [{"attempts": 1, "key": "DF-1:b09a0ea397b87e87f2fad42cfa5b8dd5cd6b5f54e050f82e37f6839849736107", "state": "completed", "terminal_reason": "not_applicable", "work_item": "DF-1"}, {"attempts": 1, "key": "DF-2:9146478420dbeefc847e609cda37dad16b39e3d8e3ef92b7525d35cb7d164155", "state": "completed", "terminal_reason": "not_applicable", "work_item": "DF-2"}, {"attempts": 0, "key": "DF-3:ed366e390c67073d32661ecfdab83fd5e500c9d6917ece296935096d2b63116f", "state": "admitted", "terminal_reason": "not_applicable", "work_item": "DF-3"}], "state": "queued", "step": "cycle-2"}
+{"lines": ["DOGFOOD MISSION QUEUED", "Mission: Carry one improvement candidate through baseline measurement and promotion without regressing the lab's own decision boundary.", "Project: factory-prototype-lab", "The supervisor will pick it up automatically. Run './dev factory status' to follow it."], "ok": true, "slots": [{"attempts": 1, "key": "DF-1:b09a0ea397b87e87f2fad42cfa5b8dd5cd6b5f54e050f82e37f6839849736107", "state": "completed", "terminal_reason": "not_applicable", "work_item": "DF-1"}, {"attempts": 1, "key": "DF-2:9146478420dbeefc847e609cda37dad16b39e3d8e3ef92b7525d35cb7d164155", "state": "completed", "terminal_reason": "not_applicable", "work_item": "DF-2"}, {"attempts": 1, "key": "DF-3:ed366e390c67073d32661ecfdab83fd5e500c9d6917ece296935096d2b63116f", "state": "completed", "terminal_reason": "not_applicable", "work_item": "DF-3"}, {"attempts": 0, "key": "DF-4:2ee0a509f4f79ee7d4cdb2c7552efeabb15034631485d1140014ff34f6357d7b", "state": "admitted", "terminal_reason": "not_applicable", "work_item": "DF-4"}], "state": "queued", "step": "cycle-3"}
+{"lines": ["DOGFOOD PORTFOLIO COMPLETE", "Every mission in the first portfolio has settled.", "Run './dev factory status' to review the results."], "ok": true, "slots": [{"attempts": 1, "key": "DF-1:b09a0ea397b87e87f2fad42cfa5b8dd5cd6b5f54e050f82e37f6839849736107", "state": "completed", "terminal_reason": "not_applicable", "work_item": "DF-1"}, {"attempts": 1, "key": "DF-2:9146478420dbeefc847e609cda37dad16b39e3d8e3ef92b7525d35cb7d164155", "state": "completed", "terminal_reason": "not_applicable", "work_item": "DF-2"}, {"attempts": 1, "key": "DF-3:ed366e390c67073d32661ecfdab83fd5e500c9d6917ece296935096d2b63116f", "state": "completed", "terminal_reason": "not_applicable", "work_item": "DF-3"}, {"attempts": 1, "key": "DF-4:2ee0a509f4f79ee7d4cdb2c7552efeabb15034631485d1140014ff34f6357d7b", "state": "completed", "terminal_reason": "not_applicable", "work_item": "DF-4"}], "state": "complete", "step": "cycle-4"}
+{
+  "action": "run",
+  "result": {
+    "cycles": 4,
+    "outcome": "complete",
+    "slots": [
+      {
+        "attempts": 1,
+        "key": "DF-1:b09a0ea397b87e87f2fad42cfa5b8dd5cd6b5f54e050f82e37f6839849736107",
+        "state": "completed",
+        "terminal_reason": "not_applicable",
+        "work_item": "DF-1"
+      },
+      {
+        "attempts": 1,
+        "key": "DF-2:9146478420dbeefc847e609cda37dad16b39e3d8e3ef92b7525d35cb7d164155",
+        "state": "completed",
+        "terminal_reason": "not_applicable",
+        "work_item": "DF-2"
+      },
+      {
+        "attempts": 1,
+        "key": "DF-3:ed366e390c67073d32661ecfdab83fd5e500c9d6917ece296935096d2b63116f",
+        "state": "completed",
+        "terminal_reason": "not_applicable",
+        "work_item": "DF-3"
+      },
+      {
+        "attempts": 1,
+        "key": "DF-4:2ee0a509f4f79ee7d4cdb2c7552efeabb15034631485d1140014ff34f6357d7b",
+        "state": "completed",
+        "terminal_reason": "not_applicable",
+        "work_item": "DF-4"
+      }
+    ]
+  }
+}
+exit=0
