@@ -10,8 +10,27 @@ from typing import Any, Sequence
 from .engine import RetryableFailure
 
 
+#: How long one step may take before the Controller stops waiting for it.
+#:
+#: This has to be *longer* than anything the execution layer is allowed to do,
+#: because the Controller giving up is not the same fact as the work failing.
+#: At 300 seconds it was shorter than both: a provider profile declares
+#: ``timeout_seconds: 3600``, and a mission may declare three acceptance gates
+#: at ``gate_timeout_seconds`` 1800 each.  SF-157 measured what that costs.  A
+#: dogfood mission ran for five minutes, the adapter raised
+#: ``ADAPTER_UNAVAILABLE`` on its own timeout while the provider was still
+#: working, the retry was refused ``LANE_ALREADY_ACTIVE`` by the lane its own
+#: first attempt still held, and the slot's remaining attempts were spent on
+#: ``PROJECT_CAPACITY_EXHAUSTED`` within five seconds -- three attempts gone,
+#: none of them a statement about the work, and a lane left `uncertain`.  The
+#: only reason DF-1 ever passed is that it happened to finish inside the five
+#: minutes.
+STEP_TIMEOUT_SECONDS = 7200.0
+
+
 class JsonProcessAdapter:
-    def __init__(self, command: Sequence[str], *, timeout_seconds: float = 300) -> None:
+    def __init__(self, command: Sequence[str], *,
+                 timeout_seconds: float = STEP_TIMEOUT_SECONDS) -> None:
         if not command:
             raise ValueError("adapter command is required")
         self.command = tuple(command)

@@ -17,6 +17,7 @@ from dataclasses import replace
 from pathlib import Path
 from unittest import mock
 
+from factory_controller import adapter as adapter_mod
 from factory_controller import context_adapter, dogfood_intake, routing, shift as shift_plane
 from factory_controller.context import sha256_hex
 
@@ -830,6 +831,32 @@ class FactoryAutopilotTests(unittest.TestCase):
         self.assertEqual(self.lifecycle.store.get(escalated)["state"], "escalated")
         self.assertNotEqual(after[1]["state"], "admitted")
         self.assertEqual(advanced.details["cycle"]["missions_advanced"], 1)
+
+    def test_a_step_may_take_longer_than_everything_it_waits_on(self):
+        """SF-157: the Controller giving up is not the work failing.
+
+        The step timeout was 300 seconds while the mission it waits on declares
+        three gates at 1800 each and the execution layer allows its provider an
+        hour.  A mission that ran for five minutes therefore raised
+        `ADAPTER_UNAVAILABLE` on the Controller's own clock while the provider
+        was still working; the retry was refused by the lane its first attempt
+        still held, and the slot's remaining attempts went to
+        `PROJECT_CAPACITY_EXHAUSTED` five seconds later.  Three attempts spent,
+        and not one of them a statement about the work.
+        """
+
+        self.ready()
+        self.assertTrue(self.lifecycle.dispatch("run").ok)
+        payload = self.missions()[0]["payload"]
+        gates = payload["acceptance_gate_ids"]
+        longest = max(len(mission.acceptance_gate_ids) for mission
+                      in self.lifecycle._load_contract_and_portfolio()[1].missions)
+
+        self.assertGreaterEqual(
+            adapter_mod.STEP_TIMEOUT_SECONDS,
+            payload["stage1"]["gate_timeout_seconds"] * longest)
+        self.assertGreaterEqual(adapter_mod.STEP_TIMEOUT_SECONDS, 3600)
+        self.assertTrue(gates)
 
     def test_status_watch_ctrl_c_does_not_stop_factory_work(self):
         self.ready()
