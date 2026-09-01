@@ -41,6 +41,11 @@ CONTEXT_SCHEMA_VERSION = "1.0"
 #: manifest; the other two carry a refusal code and nothing else.
 BROKER_STATUSES = ("built", "refused", "unavailable")
 
+#: The additive, bounded repository-grounding view the Context Broker may
+#: provide.  The Controller carries these names but never implements their
+#: classification.
+CONTEXT_OVERVIEW_SECTIONS = ("authoritative", "runtime", "execution", "tests")
+
 #: What a cache said about itself.  ``unknown`` is a canonical absence word and
 #: is what an unreporting broker gets -- never a guessed miss.
 CACHE_STATES = ("hit", "miss", "unknown")
@@ -93,6 +98,7 @@ class ContextRequest:
     required_anchors: tuple[str, ...] = ()
     allowed_paths: tuple[str, ...] = ()
     denied_paths: tuple[str, ...] = ()
+    overview: tuple[str, ...] = ()
     repository_remote_url: str | None = None
     baseline_sha: str | None = None
     purpose: str | None = None
@@ -117,6 +123,13 @@ class ContextRequest:
         age = _optional_number(raw, "max_age_seconds")
         if age is not None and age <= 0:
             raise ContextError("max_age_seconds must be positive")
+        overview = tuple(sorted(set(_string_tuple(raw, "overview"))))
+        unknown_overview = sorted(
+            set(overview) - set(CONTEXT_OVERVIEW_SECTIONS))
+        if unknown_overview:
+            raise ContextError(
+                "overview contains unsupported sections: %s"
+                % ", ".join(unknown_overview))
         return cls(
             corpus_identity=corpus,
             policy_identity=policy,
@@ -124,6 +137,7 @@ class ContextRequest:
             required_anchors=_string_tuple(raw, "required_anchors"),
             allowed_paths=_string_tuple(raw, "allowed_paths"),
             denied_paths=_string_tuple(raw, "denied_paths"),
+            overview=overview,
             repository_remote_url=_optional_str(raw, "repository_remote_url")
             or _optional_str(payload or {}, "repository_remote_url"),
             baseline_sha=_optional_str(raw, "baseline_sha")
@@ -145,6 +159,7 @@ class ContextRequest:
             "required_anchors": list(self.required_anchors),
             "allowed_paths": list(self.allowed_paths),
             "denied_paths": list(self.denied_paths),
+            "overview": list(self.overview),
             "repository_remote_url": self.repository_remote_url,
             "baseline_sha": self.baseline_sha,
             "purpose": self.purpose,
@@ -273,6 +288,9 @@ class ContextMeasurement:
     #: A broker's statement about token counting.  Always a canonical absence
     #: word unless a real count was supplied; bytes are never converted.
     context_token_count: Any = "unknown"
+    #: The broker's bounded repository map/classification, carried opaquely so
+    #: the Controller can explain what was grounded without becoming a reader.
+    repository_overview: dict[str, Any] | None = None
 
     @property
     def reduction(self) -> dict[str, Any]:
@@ -361,6 +379,7 @@ class ContextPackage:
                 "broker_manifest_digest": self.measurement.broker_manifest_digest,
                 "policy_digest": self.measurement.policy_digest,
                 "context_token_count": self.measurement.context_token_count,
+                "repository_overview": self.measurement.repository_overview,
             },
         }
 
@@ -510,6 +529,7 @@ def explain(request: ContextRequest | None, package: ContextPackage | None,
         "selected_refs": [] if manifest is None else list(manifest.selected_refs),
         "excluded_refs": list(package.receipt.excluded_refs),
         "unresolved_questions": [] if manifest is None else list(manifest.unresolved_questions),
+        "repository_overview": package.measurement.repository_overview,
         "required_anchors_covered": manifest is not None and all(
             anchor in set(manifest.selected_refs) for anchor in request.required_anchors),
         "measurement": package.as_row()["measurement"],
@@ -563,6 +583,7 @@ def _measurement_from(raw: Any) -> ContextMeasurement:
     head = raw.get("head_sha")
     broker_digest = raw.get("broker_manifest_digest")
     policy = raw.get("policy_digest")
+    overview = raw.get("repository_overview")
     return ContextMeasurement(
         baseline_context_bytes=_count(raw.get("baseline_context_bytes")),
         baseline_context_files=_count(raw.get("baseline_context_files")),
@@ -579,6 +600,7 @@ def _measurement_from(raw: Any) -> ContextMeasurement:
         and broker_digest else None,
         policy_digest=policy if isinstance(policy, str) and policy else None,
         context_token_count=canonical_absence(raw.get("context_token_count")),
+        repository_overview=dict(overview) if isinstance(overview, dict) else None,
     )
 
 

@@ -47,6 +47,19 @@ class LayerAdapter:
         if step == self.crash_on and not self.crashed:
             self.crashed = True
             raise ProcessDeath(step)
+        if step == "context":
+            # Keep generic engine/autopilot tests on the deterministic fixture;
+            # the real Factory lifecycle injects the checked-in Broker builder.
+            from factory_controller.safe_provider import build_context
+            result = build_context(value["context_request"])
+            if result.get("status") == "built":
+                result["measurement"] = {
+                    **result.get("measurement", {}),
+                    "baseline_context_bytes": 1,
+                    "baseline_context_files": 1,
+                    "selected_context_bytes": 1,
+                }
+            return result
         if step == "dispatch":
             return self._dispatch(operation_key, value)
         if step == "verify":

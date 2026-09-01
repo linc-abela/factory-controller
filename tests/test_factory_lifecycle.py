@@ -9,6 +9,7 @@ import unittest
 from dataclasses import replace
 from pathlib import Path
 
+from factory_controller import context_adapter
 from factory_controller.adapter import HostCommandResult
 from factory_controller.engine import Controller
 from factory_controller.factory import FactoryConfig, FactoryLifecycle, OwnerIdentity
@@ -17,6 +18,35 @@ from factory_controller.store import MissionStore
 
 PROTOTYPE_SHA = "229b923b050fe8a4450d5597d472157bd42c8647"
 BUG_SHA = "4072bfd7c008d3b227e2e164ecbe6f58013c2733"
+
+
+def fake_context(wire):
+    """Keep lifecycle tests deterministic without bypassing the context seam."""
+
+    selected = list(dict.fromkeys(wire.get("required_anchors") or []))
+    manifest = context_adapter.evidence_core_manifest(wire, selected)
+    return {
+        "status": "built",
+        "manifest": manifest,
+        "receipt": {
+            "schema_version": "1.0",
+            "context_manifest_hash": manifest["manifest_hash"],
+            "selected_refs": selected,
+            "excluded_refs": [],
+            "mandatory_fact_coverage": selected,
+            "refusal_code": None,
+        },
+        "measurement": {
+            "baseline_context_bytes": 1,
+            "baseline_context_files": 1,
+            "selected_context_bytes": 1,
+            "selected_context_files": len(selected),
+            "cache_state": "miss",
+            "cache_identity": "f" * 64,
+            "head_sha": wire.get("baseline_sha"),
+            "repository_remote_url": wire.get("repository_remote_url"),
+        },
+    }
 
 
 class NoopAdapter:
@@ -229,6 +259,7 @@ class FactoryLifecycleTests(unittest.TestCase):
                 "evidence_core": {"status": "ACCEPTED", "identity": "evidence"},
                 "context_broker": {"status": "ok", "identity": "context"},
             },
+            context_builder=fake_context,
         )
 
     def test_commands_are_idempotent_and_record_one_shift(self):
@@ -350,6 +381,7 @@ class FactoryLifecycleTests(unittest.TestCase):
                 "factory-prototype-lab": (PROTOTYPE_SHA,),
                 "factory-bug-lab": (BUG_SHA,),
             },
+            context_builder=fake_context,
         )
 
     def test_a_stopped_container_runtime_is_named_instead_of_a_dead_end(self):

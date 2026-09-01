@@ -91,6 +91,20 @@ class RequestTests(unittest.TestCase):
         self.assertEqual(request.repository_remote_url, REMOTE)
         self.assertEqual(request.baseline_sha, HEAD)
 
+    def test_the_request_can_name_the_bounded_repository_overview(self):
+        request = ContextRequest.from_payload(payload(context_request={
+            "corpus_identity": CORPUS, "policy_identity": POLICY,
+            "overview": ["tests", "authoritative", "runtime", "execution"]}))
+        self.assertEqual(request.overview,
+                         ("authoritative", "execution", "runtime", "tests"))
+        self.assertEqual(request.as_wire()["overview"], list(request.overview))
+
+    def test_an_unknown_repository_overview_section_is_refused(self):
+        with self.assertRaises(ContextError):
+            ContextRequest.from_payload(payload(context_request={
+                "corpus_identity": CORPUS, "policy_identity": POLICY,
+                "overview": ["models"]}))
+
     def test_mission_input_hash_is_derived_from_mission_identity_alone(self):
         """Retry, budget and provider policy must not orphan a valid manifest."""
 
@@ -363,6 +377,13 @@ class MeasurementTests(unittest.TestCase):
         }).as_row()["measurement"]
         self.assertEqual(row["broker_manifest_digest"], "7839a263")
         self.assertEqual(row["policy_digest"], "3f353f")
+
+    def test_the_bounded_repository_overview_is_carried_as_measured_metadata(self):
+        overview = {"sections": {"tests": {"refs": []}}, "top_level": {}}
+        row = context.ContextPackage.from_response({
+            "status": "refused", "measurement": {
+                "repository_overview": overview}}).as_row()["measurement"]
+        self.assertEqual(row["repository_overview"], overview)
 
     def test_a_negative_or_boolean_measurement_is_absent_rather_than_wrong(self):
         pkg = ContextPackage.from_response({"status": "refused", "measurement": {

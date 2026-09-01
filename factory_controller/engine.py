@@ -233,7 +233,12 @@ class Controller:
                 "%s: ceiling %s reported input tokens"
                 % (token_refusal, budget.max_reported_input_tokens))
 
-        response = self._step(mission, "context", {"context_request": request.as_wire()})
+        response = self._step(
+            mission, "context",
+            {"context_request": request.as_wire(),
+             # The adapter may bind the declared request to the registered
+             # checkout, but it remains the only process allowed to inspect it.
+             "mission": mission["payload"]})
         package = context.ContextPackage.from_response(response)
         if package.status == "unavailable":
             # Nothing was memoized, so a later attempt may ask again.  Only a

@@ -65,6 +65,7 @@ class ServicePlan:
     agents_dir: str
     state_dir: str
     working_dir: str
+    environment: tuple[tuple[str, str], ...] = ()
 
     def __post_init__(self) -> None:
         if not self.label or self.label != self.label.strip() or "/" in self.label:
@@ -81,6 +82,17 @@ class ServicePlan:
             value = getattr(self, name)
             if not value or not Path(value).is_absolute():
                 raise ActivationError("%s must be an absolute path" % name)
+        if (not isinstance(self.environment, tuple)
+                or any(not isinstance(item, tuple) or len(item) != 2
+                       or not all(isinstance(value, str) and value
+                                  for value in item)
+                       for item in self.environment)
+                or len({item[0] for item in self.environment})
+                != len(self.environment)):
+            raise ActivationError("environment must be distinct key/value pairs")
+        if any("=" in key or "\x00" in key or "\x00" in value
+               for key, value in self.environment):
+            raise ActivationError("environment keys and values are malformed")
 
     # -- derived locations -------------------------------------------------- #
 
@@ -113,11 +125,13 @@ class ServicePlan:
                 "interpreter": self.interpreter,
                 "interval_seconds": self.interval_seconds,
                 "agents_dir": self.agents_dir, "state_dir": self.state_dir,
-                "working_dir": self.working_dir}
+                "working_dir": self.working_dir,
+                "environment": dict(self.environment)}
 
 
 def from_contract(contract: dict[str, Any], *, agents_dir: str, state_dir: str,
-                  working_dir: str, label: str = DEFAULT_LABEL) -> ServicePlan:
+                  working_dir: str, label: str = DEFAULT_LABEL,
+                  environment: tuple[tuple[str, str], ...] = ()) -> ServicePlan:
     """Build the plan from ``OperationsSupervisor.service_contract``.
 
     Reading the contract rather than restating it is the point: the invocation
@@ -133,7 +147,8 @@ def from_contract(contract: dict[str, Any], *, agents_dir: str, state_dir: str,
         label=label, invocation=tuple(invocation),
         interval_seconds=int(schedule.get("interval_seconds",
                                           DEFAULT_INTERVAL_SECONDS)),
-        agents_dir=agents_dir, state_dir=state_dir, working_dir=working_dir)
+        agents_dir=agents_dir, state_dir=state_dir, working_dir=working_dir,
+        environment=environment)
 
 
 # --------------------------------------------------------------------------- #
@@ -156,6 +171,13 @@ def definition(plan: ServicePlan) -> str:
 
     arguments = "".join("\n    <string>%s</string>" % _escape(value)
                         for value in plan.invocation)
+    environment = ""
+    if plan.environment:
+        values = "".join(
+            "\n    <key>%s</key><string>%s</string>"
+            % (_escape(key), _escape(value))
+            for key, value in plan.environment)
+        environment = "\n  <key>EnvironmentVariables</key><dict>%s\n  </dict>" % values
     return f"""<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0"><dict>
@@ -163,6 +185,7 @@ def definition(plan: ServicePlan) -> str:
   <key>ProgramArguments</key><array>{arguments}
   </array>
   <key>WorkingDirectory</key><string>{_escape(plan.working_dir)}</string>
+{environment}
   <key>StartInterval</key><integer>{plan.interval_seconds}</integer>
   <key>RunAtLoad</key><false/>
   <key>ProcessType</key><string>Background</string>
@@ -290,6 +313,7 @@ def doctor(plan: ServicePlan) -> dict[str, Any]:
             "whether the host scheduler holds this job is a host query this "
             "package does not make; the Owner's verify steps answer it",
         "invocation": list(plan.invocation),
+        "environment": dict(plan.environment),
         "interpreter": plan.interpreter,
         "interval_seconds": plan.interval_seconds,
         "activation": activation_command(plan),

@@ -68,7 +68,7 @@ class RequestTranslationTests(unittest.TestCase):
     BROKER_FIELDS = {"repo_identity", "baseline", "head", "required_anchors",
                      "requested_paths", "allowed_paths", "denied_paths",
                      "max_bytes", "max_files", "max_file_bytes", "always_include",
-                     "admit_binary_paths", "admit_oversized_paths"}
+                     "admit_binary_paths", "admit_oversized_paths", "overview"}
 
     def test_only_fields_the_broker_accepts_are_ever_sent(self):
         for extra in ({}, {"allowed_paths": ["src"], "denied_paths": ["deploy"]},
@@ -97,6 +97,11 @@ class RequestTranslationTests(unittest.TestCase):
         sent = context_adapter.broker_request(wire())
         self.assertEqual(sent["baseline"], HEAD)
         self.assertEqual(sent["head"], HEAD)
+
+    def test_the_bounded_overview_entitlement_reaches_the_broker(self):
+        sent = context_adapter.broker_request(
+            wire(overview=["tests", "authoritative"]))
+        self.assertEqual(sent["overview"], ["authoritative", "tests"])
 
 
 class AnswerTranslationTests(unittest.TestCase):
@@ -148,6 +153,16 @@ class AnswerTranslationTests(unittest.TestCase):
         warm = context.ContextPackage.from_response(context_adapter.translate(
             self.wire, {**ANSWER, "cache_hit": True}, now=1000.0))
         self.assertEqual(warm.measurement.cache_state, "hit")
+
+    def test_the_bounded_overview_is_carried_from_the_broker(self):
+        answer = {**ANSWER, "manifest": {
+            **ANSWER["manifest"],
+            "overview": {"sections": {"tests": {"refs": []}},
+                          "top_level": {}}}}
+        package = context.ContextPackage.from_response(
+            context_adapter.translate(self.wire, answer, now=1000.0))
+        self.assertEqual(package.measurement.repository_overview,
+                         answer["manifest"]["overview"])
 
     def test_selection_order_is_the_brokers(self):
         scrambled = {**ANSWER, "manifest": {**ANSWER["manifest"], "selected": [

@@ -32,9 +32,12 @@ from __future__ import annotations
 
 import time
 from dataclasses import dataclass
-from typing import Any, Mapping, Sequence
+from typing import Any, Callable, Mapping, Sequence
 
-from .context import CONTEXT_SCHEMA_VERSION, mission_input_hash, sha256_hex
+from .context import (
+    CONTEXT_SCHEMA_VERSION, ContextBudget, ContextError, ContextPackage,
+    ContextRequest, mission_input_hash, sha256_hex, verify,
+)
 
 
 #: The capabilities the evidence layer's admission guard accepts.  Mirrored
@@ -52,6 +55,12 @@ NATIVE_RECEIPT = "foundation_native_receipt"
 OWNER_RATIFICATION = "owner_ratification"
 NATIVE_REGISTRY = "foundation_project_registry"
 LIVE_ACTION = "live_provider_dispatch"
+
+# The first dogfood path asks for a useful but finite repository picture.  The
+# Broker owns classification and selection; these names are only the request
+# contract carried into that seam.
+DOGFOOD_CONTEXT_OVERVIEW = ("authoritative", "runtime", "execution", "tests")
+DOGFOOD_CONTEXT_BUDGET = {"max_bytes": 200_000, "max_files": 40}
 
 
 class IntakeError(Exception):
@@ -136,6 +145,20 @@ def context_manifest(payload_identity: Mapping[str, Any], *,
     return {**unhashed, "manifest_hash": sha256_hex(unhashed)}
 
 
+def context_request(payload_identity: Mapping[str, Any], *,
+                    corpus_identity: str, policy_identity: str) -> dict[str, Any]:
+    """Declare the bounded Broker view for one frozen dogfood mission."""
+
+    return {
+        "corpus_identity": corpus_identity,
+        "policy_identity": policy_identity,
+        "repository_remote_url": payload_identity["repository_remote_url"],
+        "baseline_sha": payload_identity["baseline_sha"],
+        "required_anchors": ["MISSION.md"],
+        "overview": list(DOGFOOD_CONTEXT_OVERVIEW),
+    }
+
+
 def _self_hashed(value: Mapping[str, Any], field: str) -> dict[str, Any]:
     body = {name: item for name, item in value.items() if name != field}
     return {**body, field: sha256_hex(body)}
@@ -170,7 +193,9 @@ def build(mission, *, portfolio_ref: str, run_ref: str,
           registry: Sequence[Mapping[str, Any]], registry_digest: str,
           provider_profiles: Sequence[str], corpus_identity: str,
           owner: str, approval_ref: str, granted_at: float, expires_at: float,
-          now: float, stage1: Mapping[str, Any], attempt: int = 1) -> Intake:
+          now: float, stage1: Mapping[str, Any], attempt: int = 1,
+          context_builder: Callable[[dict[str, Any]], Mapping[str, Any]] | None = None
+          ) -> Intake:
     """Turn one frozen portfolio mission into one submittable real mission.
 
     ``attempt`` is the slot's attempt number, counting the first.  It reaches
@@ -248,13 +273,54 @@ def build(mission, *, portfolio_ref: str, run_ref: str,
     policy_identity = "%s:%s" % (portfolio_ref, mission.mission_ref)
     if attempt > 1:
         policy_identity += "#%d" % attempt
+    declared_context = context_request(
+        identity, corpus_identity=corpus_identity,
+        policy_identity=policy_identity)
+    context_payload = {
+        **identity,
+        "context_request": declared_context,
+        "context_budget": dict(DOGFOOD_CONTEXT_BUDGET),
+    }
+    try:
+        request = ContextRequest.from_payload(context_payload)
+        budget = ContextBudget.from_payload(context_payload)
+    except ContextError as exc:
+        raise IntakeError(
+            "CONTEXT_REQUEST_INVALID",
+            "The dogfood repository-grounding request is invalid: %s" % exc) from None
+    selected_refs = [gate_script(mission.acceptance_gate_source)]
+    package = None
+    if context_builder is not None:
+        try:
+            package = ContextPackage.from_response(context_builder(request.as_wire()))
+        except Exception as exc:  # noqa: BLE001
+            raise IntakeError(
+                "CONTEXT_PREFLIGHT_FAILED",
+                "The Context Broker preflight could not be completed (%s)."
+                % type(exc).__name__) from None
+        refusal = verify(request, package, budget=budget, now=now)
+        if refusal:
+            raise IntakeError(
+                refusal,
+                "The Context Broker did not produce an admissible repository "
+                "grounding package (%s)." % refusal)
+        if package.manifest is None:
+            raise IntakeError(
+                "CONTEXT_MANIFEST_MISSING",
+                "The Context Broker preflight returned no repository manifest.")
+        selected_refs = list(package.manifest.selected_refs)
     manifest = context_manifest(
         identity,
         corpus_identity=corpus_identity,
         policy_identity=policy_identity,
-        selected_refs=[gate_script(mission.acceptance_gate_source)],
+        selected_refs=selected_refs,
     )
     manifest_hash = manifest["manifest_hash"]
+    if package is not None and package.manifest is not None \
+            and package.manifest.manifest_hash != manifest_hash:
+        raise IntakeError(
+            "CONTEXT_PREFLIGHT_MISMATCH",
+            "The Context Broker package did not match the mission manifest identity.")
     key = "%s:%s" % (mission.mission_ref, manifest_hash)
 
     dispatch_readiness = _self_hashed({
@@ -329,6 +395,8 @@ def build(mission, *, portfolio_ref: str, run_ref: str,
         "project_id": mission.project_id,
         "repository": remote_url,
         "context_manifest_hash": manifest_hash,
+        "context_request": declared_context,
+        "context_budget": dict(DOGFOOD_CONTEXT_BUDGET),
         "acceptance_gate_expectations": expectations,
         "work_class": mission.work_class,
         "environment_class": mission.environment_class,
@@ -362,6 +430,7 @@ def build(mission, *, portfolio_ref: str, run_ref: str,
     )
 
 
-__all__ = ["Intake", "IntakeError", "build", "context_manifest",
+__all__ = ["DOGFOOD_CONTEXT_BUDGET", "DOGFOOD_CONTEXT_OVERVIEW", "Intake",
+           "IntakeError", "build", "context_manifest", "context_request",
            "gate_commands", "gate_expectations", "gate_script", "iso_utc",
            "registry_row"]

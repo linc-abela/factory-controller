@@ -81,6 +81,9 @@ def broker_request(wire: dict[str, Any]) -> dict[str, Any]:
     for name in ("max_bytes", "max_files"):
         if isinstance(wire.get(name), int):
             request[name] = wire[name]
+    overview = list(wire.get("overview") or [])
+    if overview:
+        request["overview"] = overview
     return request
 
 
@@ -161,16 +164,21 @@ def translate(wire: dict[str, Any], answer: dict[str, Any], *,
             or manifest.get("manifest_digest"),
             "policy_digest": manifest.get("policy_digest"),
             "context_token_count": canonical_absence(economics.get("token_count")),
+            "repository_overview": manifest.get("overview")
+            if isinstance(manifest.get("overview"), dict) else None,
         },
     }
 
 
-def build(wire: dict[str, Any]) -> dict[str, Any]:
+def build(wire: dict[str, Any], *, repo: str | Path | None = None,
+          command: str | None = None, cache: str | Path | None = None,
+          request_dir: str | Path | None = None, cwd: str | Path | None = None,
+          now: float | None = None) -> dict[str, Any]:
     """Run the broker the operator admitted, and restate what it said."""
 
-    command = os.environ.get(COMMAND_ENV)
-    repo = os.environ.get(REPO_ENV)
-    cache = os.environ.get(CACHE_ENV)
+    command = command or os.environ.get(COMMAND_ENV)
+    repo = repo or os.environ.get(REPO_ENV)
+    cache = cache or os.environ.get(CACHE_ENV)
     if not command or not repo or not cache:
         # Not configured is not the same as refused: a later attempt may run
         # with the broker in place, so this must not become durable context.
@@ -180,7 +188,7 @@ def build(wire: dict[str, Any]) -> dict[str, Any]:
     # to be one both processes can name. The cache directory is the only
     # location the operator has already admitted to both, so the request is
     # staged there and removed again.
-    staging = Path(os.environ.get(REQUEST_DIR_ENV) or cache)
+    staging = Path(request_dir or os.environ.get(REQUEST_DIR_ENV) or cache)
     try:
         staging.mkdir(parents=True, exist_ok=True)
         handle, path = tempfile.mkstemp(dir=staging, prefix="request-", suffix=".json")
@@ -189,12 +197,18 @@ def build(wire: dict[str, Any]) -> dict[str, Any]:
     try:
         with os.fdopen(handle, "w", encoding="utf-8") as stream:
             json.dump(request, stream, sort_keys=True)
-        argv = shlex.split(command) + [
-            "build", "--repo", repo, "--cache-dir", cache, "--request", path]
+        try:
+            argv = shlex.split(command) + [
+                "build", "--repo", str(repo), "--cache-dir", str(cache),
+                "--request", path]
+        except ValueError:
+            return {"status": "unavailable",
+                    "refusal_code": "CONTEXT_BROKER_UNCONFIGURED"}
         try:
             completed = subprocess.run(
                 argv, text=True, capture_output=True,
-                timeout=TIMEOUT_SECONDS, check=False)
+                timeout=TIMEOUT_SECONDS, check=False,
+                cwd=None if cwd is None else str(cwd))
         except (OSError, subprocess.TimeoutExpired):
             return {"status": "unavailable", "refusal_code": "CONTEXT_BROKER_UNAVAILABLE"}
     finally:
@@ -208,7 +222,7 @@ def build(wire: dict[str, Any]) -> dict[str, Any]:
         return {"status": "unavailable", "refusal_code": "CONTEXT_BROKER_UNREADABLE"}
     if not isinstance(answer, dict):
         return {"status": "unavailable", "refusal_code": "CONTEXT_BROKER_UNREADABLE"}
-    return translate(wire, answer)
+    return translate(wire, answer, now=now)
 
 
 def main() -> int:

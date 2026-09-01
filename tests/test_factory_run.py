@@ -17,7 +17,7 @@ from dataclasses import replace
 from pathlib import Path
 from unittest import mock
 
-from factory_controller import dogfood_intake, routing, shift as shift_plane
+from factory_controller import context_adapter, dogfood_intake, routing, shift as shift_plane
 from factory_controller.context import sha256_hex
 
 from tests.support import LayerAdapter, RouteTestCase, mission_payload
@@ -85,6 +85,9 @@ class FactoryRunTests(unittest.TestCase):
         self.assertEqual(payload["baseline_sha"], PROTOTYPE_SHA)
         self.assertEqual(payload["execution_mode"], "real")
         self.assertEqual(payload["capability"], "prototype")
+        self.assertEqual(payload["context_request"]["required_anchors"], ["MISSION.md"])
+        self.assertEqual(payload["context_request"]["overview"],
+                         ["authoritative", "runtime", "execution", "tests"])
         self.assertEqual([row["profile"] for row in payload["provider_candidates"]],
                          ["codex-primary"])
         self.assertEqual(
@@ -117,6 +120,24 @@ class FactoryRunTests(unittest.TestCase):
 
         self.assertIn("factory_controller.stage1_adapter", invocation)
         self.assertNotIn("safe_provider", invocation)
+
+        environment = dict(self.lifecycle._service_plan().environment)
+        self.assertIn(context_adapter.COMMAND_ENV, environment)
+        self.assertIn("factory_context_broker.cli",
+                      environment[context_adapter.COMMAND_ENV])
+        self.assertTrue(environment[context_adapter.CACHE_ENV].endswith(
+            "state/context-broker-cache"))
+
+    def test_broker_preflight_failure_blocks_submission(self):
+        self.ready()
+        self.lifecycle.context_builder = lambda wire: {
+            "status": "refused", "refusal_code": "MISSING_REQUIRED_ANCHOR"}
+
+        result = self.lifecycle.dispatch("run")
+
+        self.assertFalse(result.ok)
+        self.assertEqual(result.details["code"], "MISSING_REQUIRED_ANCHOR")
+        self.assertEqual(self.missions(), [])
 
     def test_run_reloads_a_supervisor_started_before_this_command(self):
         """A stale definition on disk is not the one launchd is holding."""

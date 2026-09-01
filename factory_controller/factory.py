@@ -24,6 +24,7 @@ from typing import Any, Callable, Mapping, Sequence
 from . import activation
 from . import capacity
 from . import context
+from . import context_adapter
 from . import dogfood
 from . import dogfood_intake
 from . import improvement
@@ -172,7 +173,9 @@ class FactoryLifecycle:
                  owner: OwnerIdentity | None = None,
                  clock: Callable[[], float] = time.time,
                  reports: Mapping[str, Mapping[str, Any]] | None = None,
-                 remote_reachability: Mapping[str, Sequence[str]] | None = None) -> None:
+                 remote_reachability: Mapping[str, Sequence[str]] | None = None,
+                 context_builder: Callable[[dict[str, Any]], Mapping[str, Any]] | None = None
+                 ) -> None:
         self.controller = controller
         self.store = controller.store
         self.config = config or FactoryConfig.default(self.store.path)
@@ -185,6 +188,7 @@ class FactoryLifecycle:
         self.remote_reachability = None if remote_reachability is None else {
             name: tuple(values) for name, values in remote_reachability.items()
         }
+        self.context_builder = context_builder
         self.report_failures: dict[str, str] = {}
         self.supervisor = supervisor.OperationsSupervisor(
             controller, clock=self.store.clock)
@@ -613,6 +617,12 @@ class FactoryLifecycle:
                 "The execution layer's project registry has no identity the "
                 "mission could be bound to. Run './dev factory install'.")
         interpreter = self._resolve_supported_python()
+        registered = dogfood_intake.registry_row(registry, mission.project_id)
+        checkout = registered.get("checkout")
+        builder = self.context_builder
+        if builder is None:
+            builder = lambda wire: self._build_context(
+                wire, checkout=checkout, interpreter=interpreter)
         try:
             intake = dogfood_intake.build(
                 mission,
@@ -637,6 +647,7 @@ class FactoryLifecycle:
                     "gate_timeout_seconds": 1800,
                 },
                 attempt=attempt,
+                context_builder=builder,
             )
         except dogfood_intake.IntakeError as refusal:
             raise FactoryRefusal(refusal.code, refusal.detail) from None
@@ -1212,6 +1223,11 @@ class FactoryLifecycle:
             % shlex.quote(interpreter),
             "factory", "cycle",
         )
+        environment = (
+            (context_adapter.COMMAND_ENV,
+             self._context_broker_command(interpreter)),
+            (context_adapter.CACHE_ENV, str(self._context_broker_cache())),
+        )
         contract = self.supervisor.service_contract(
             invocation=invocation,
             interval_seconds=self.config.interval_seconds,
@@ -1223,11 +1239,40 @@ class FactoryLifecycle:
                 state_dir=str(self.config.state_dir),
                 working_dir=str(self.config.controller_root),
                 label=self.config.supervisor_label,
+                environment=environment,
             )
         except activation.ActivationError:
             raise FactoryRefusal(
                 "SUPERVISOR_PLAN_INVALID",
                 "The Factory supervisor service definition is invalid.") from None
+
+    def _context_broker_cache(self) -> Path:
+        return self.config.state_dir / "context-broker-cache"
+
+    def _context_broker_command(self, interpreter: str) -> str:
+        """Name the checked-in Broker CLI used by both preflight and service."""
+
+        broker_root = self.config.controller_root.parent / "factory-context-broker"
+        code = (
+            "import sys; sys.path.insert(0, %s); "
+            "from factory_context_broker.cli import main; "
+            "raise SystemExit(main())"
+        ) % json.dumps(str(broker_root))
+        return "%s -c %s" % (shlex.quote(interpreter), shlex.quote(code))
+
+    def _build_context(self, wire: dict[str, Any], *, checkout: Any,
+                       interpreter: str) -> Mapping[str, Any]:
+        """Preflight the same real Broker command the installed service uses."""
+
+        if not isinstance(checkout, str) or not checkout:
+            return {"status": "unavailable",
+                    "refusal_code": "CONTEXT_REPOSITORY_UNCONFIGURED"}
+        broker_root = self.config.controller_root.parent / "factory-context-broker"
+        return context_adapter.build(
+            wire, repo=checkout,
+            command=self._context_broker_command(interpreter),
+            cache=self._context_broker_cache(), cwd=broker_root,
+            now=self.clock())
 
     def _install_supervisor_definition(self) -> activation.ServicePlan:
         plan = self._service_plan()

@@ -213,6 +213,7 @@ hands it to a Context Broker, and checks the answer against it.
     "policy_identity": "SF-136:STAGE-4-CONTEXT",
     "required_anchors": ["MISSION.md"],
     "allowed_paths": [], "denied_paths": [],
+    "overview": ["authoritative", "runtime", "execution", "tests"],
     "max_age_seconds": 900
   },
   "context_budget": {"max_bytes": 200000, "max_files": 40,
@@ -247,6 +248,14 @@ FACTORY_CONTEXT_BROKER_CACHE=/path/to/cache \
 The broker resolves context at the mission's own `baseline_sha` and refuses a
 manifest whose head is not the checkout's `HEAD`, so the target checkout must be
 at that commit.
+
+The installed first-dogfood service carries the checked-in Broker command and a
+Factory-owned cache directory in its service environment. The intake preflights
+that same command against the registered project checkout, and the Stage-1
+adapter binds the context step to the mission's registered checkout again. A
+missing Broker, wrong checkout, stale head, or refused overview blocks the
+mission before provider dispatch; there is no synthetic repository fallback on
+the real path.
 
 ## The portfolio
 

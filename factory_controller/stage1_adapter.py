@@ -31,7 +31,7 @@ import time
 from pathlib import Path
 from typing import Any
 
-from . import safe_provider
+from . import context_adapter, safe_provider
 
 
 def _stage1_config(request: dict[str, Any]) -> dict[str, Any]:
@@ -46,6 +46,19 @@ def _mission(request: dict[str, Any]) -> dict[str, Any]:
     if "mission" in mission:
         mission = mission["mission"]
     return mission
+
+
+def _context(request: dict[str, Any]) -> dict[str, Any]:
+    """Bind a real mission's context to the checkout it declares."""
+
+    mission = _mission(request)
+    stage1 = mission.get("stage1")
+    repository = stage1.get("repository") if isinstance(stage1, dict) else None
+    if not isinstance(repository, str) or not repository:
+        return {"status": "unavailable",
+                "refusal_code": "CONTEXT_REPOSITORY_UNCONFIGURED"}
+    return context_adapter.build(
+        request["input"]["context_request"], repo=repository)
 
 
 def _bound_idempotency_key(result: dict[str, Any]) -> str | None:
@@ -451,6 +464,8 @@ def _evaluate(request: dict[str, Any], config: dict[str, Any],
 
 def execute(request: dict[str, Any]) -> dict[str, Any]:
     step = request["step"]
+    if step == "context":
+        return _context(request)
     config = _stage1_config(request)
     if step == "dispatch":
         return _dispatch(request, config)
