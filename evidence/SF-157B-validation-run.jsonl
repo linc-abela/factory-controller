@@ -1,0 +1,102 @@
+{"improvement": {"state": "not_run"}, "lines": ["FACTORY INSTALLED", "Run './dev factory start' to begin work."], "ok": true, "slots": [], "state": "off", "step": "install"}
+{"improvement": {"state": "not_run"}, "lines": ["FACTORY READY", "Shift active. Supervisor running."], "ok": true, "slots": [], "state": "ready", "step": "start"}
+{"improvement": {"state": "not_run"}, "lines": ["DOGFOOD MISSION QUEUED", "Mission: Run the same path against a declared gate that is known to fail, and prove the failure is recorded as a failure.", "Project: factory-bug-lab", "The supervisor will pick it up automatically. Run './dev factory status' to follow it."], "ok": true, "slots": [{"attempts": 1, "key": "DF-1:d5cec6419ab1dea2b44550982f6235a359364afb6ec700a46c6483178c0859ce", "state": "completed", "terminal_reason": "not_applicable", "work_item": "DF-1"}, {"attempts": 0, "key": "DF-2:77d558a2daadcc05c122f533d5c9d2458d6449c65471c6d7600229ea3d1871fb", "state": "admitted", "terminal_reason": "not_applicable", "work_item": "DF-2"}], "state": "queued", "step": "cycle-1"}
+{"improvement": {"state": "not_run"}, "lines": ["DOGFOOD MISSION QUEUED", "Mission: Diagnose and fix the seat-overbooking defect the lab's frozen report describes, from baseline 4072bfd7, adding a regression that fails at the baseline and passes at the fix.", "Project: factory-bug-lab", "The supervisor will pick it up automatically. Run './dev factory status' to follow it."], "ok": true, "slots": [{"attempts": 1, "key": "DF-1:d5cec6419ab1dea2b44550982f6235a359364afb6ec700a46c6483178c0859ce", "state": "completed", "terminal_reason": "not_applicable", "work_item": "DF-1"}, {"attempts": 1, "key": "DF-2:77d558a2daadcc05c122f533d5c9d2458d6449c65471c6d7600229ea3d1871fb", "state": "completed", "terminal_reason": "not_applicable", "work_item": "DF-2"}, {"attempts": 0, "key": "DF-3:28b9125e8217af72e6d51ecbd52543580a261a12328f309ee4ccdceb59f64dae", "state": "admitted", "terminal_reason": "not_applicable", "work_item": "DF-3"}], "state": "queued", "step": "cycle-2"}
+{"improvement": {"approval_refs": [], "baseline": {"evaluate_correct": 5, "evaluate_false_matches": 0, "passing_tests": 2}, "candidate_measurements": "not_run", "candidate_sha": "not_run", "change_set": "not_run", "disposition": "unknown", "evaluator_identity": "not_run", "experiment_ref": "imp_95d35bcdd3c769015dc05cae", "objective_digest": "dc49284064c72b3d8e423119cbbc7350ff0ec526fec857542791225bc31da212", "objective_ref": "SF-144-DF-4-prototype-lab-quality-1", "producer_identity": "not_run", "promotion_deployment_id": "not_applicable", "promotion_environment_id": "not_applicable", "reverted_to": "not_applicable", "state": "mission_created", "verdict": "not_run"}, "lines": ["DOGFOOD MISSION QUEUED", "Mission: Carry one improvement candidate through baseline measurement and promotion without regressing the lab's own decision boundary.", "Project: factory-prototype-lab", "The supervisor will pick it up automatically. Run './dev factory status' to follow it."], "ok": true, "slots": [{"attempts": 1, "key": "DF-1:d5cec6419ab1dea2b44550982f6235a359364afb6ec700a46c6483178c0859ce", "state": "completed", "terminal_reason": "not_applicable", "work_item": "DF-1"}, {"attempts": 1, "key": "DF-2:77d558a2daadcc05c122f533d5c9d2458d6449c65471c6d7600229ea3d1871fb", "state": "completed", "terminal_reason": "not_applicable", "work_item": "DF-2"}, {"attempts": 1, "key": "DF-3:28b9125e8217af72e6d51ecbd52543580a261a12328f309ee4ccdceb59f64dae", "state": "completed", "terminal_reason": "not_applicable", "work_item": "DF-3"}, {"attempts": 0, "key": "DF-4:51ae89a801a65ce440739dab0d00e2dad14874ce228e3f6e90dc68e76af41478", "state": "admitted", "terminal_reason": "not_applicable", "work_item": "DF-4"}], "state": "queued", "step": "cycle-3"}
+{"improvement": {"approval_refs": ["factory-owner-501-factory-shift-1"], "baseline": {"evaluate_correct": 5, "evaluate_false_matches": 0, "passing_tests": 2}, "candidate_measurements": {"evaluate_correct": 5, "evaluate_false_matches": 0, "passing_tests": 5}, "candidate_sha": "dd9fcd92e41c533e0b2b60c169345e5db4e55040", "change_set": ["lab/prototype.py", "tests/test_prototype.py"], "deployment": {"adapter": "not_run", "approval_ref": "not_applicable", "approved_by": "not_applicable", "bundle_digest": "94d146e755fa99e98aafcff2ec68b3c26a353865dbdad4864a9af04ec9c8a985", "contract_version": "factory-controller/production/1.0", "deployment_id": "dep_3c97464e24c24e56", "ended_at": "not_run", "environment_class": "staging", "environment_id": "factory-prototype-lab-staging", "health_outcome": "not_run", "operation_key": "not_run", "operation_ref": "not_run", "project_id": "factory-prototype-lab", "release_sha": "dd9fcd92e41c533e0b2b60c169345e5db4e55040", "rollback_attempts": 0, "rollback_of": "not_applicable", "started_at": "not_run", "state": "approved", "transitions": [{"created_at": 1788252095.628756, "from_state": null, "kind": "release_admitted", "to_state": "approved"}]}, "disposition": "accepted", "evaluator_identity": "factory-controller/dogfood-improvement", "experiment_ref": "imp_95d35bcdd3c769015dc05cae", "objective_digest": "dc49284064c72b3d8e423119cbbc7350ff0ec526fec857542791225bc31da212", "objective_ref": "SF-144-DF-4-prototype-lab-quality-1", "producer_identity": "provider:codex-primary", "promotion_deployment_id": "dep_3c97464e24c24e56", "promotion_environment_id": "factory-prototype-lab-staging", "reverted_to": "not_applicable", "state": "closed", "verdict": "improved"}, "lines": ["DOGFOOD PORTFOLIO COMPLETE", "Every mission in the first portfolio has settled.", "Run './dev factory status' to review the results."], "ok": true, "slots": [{"attempts": 1, "key": "DF-1:d5cec6419ab1dea2b44550982f6235a359364afb6ec700a46c6483178c0859ce", "state": "completed", "terminal_reason": "not_applicable", "work_item": "DF-1"}, {"attempts": 1, "key": "DF-2:77d558a2daadcc05c122f533d5c9d2458d6449c65471c6d7600229ea3d1871fb", "state": "completed", "terminal_reason": "not_applicable", "work_item": "DF-2"}, {"attempts": 1, "key": "DF-3:28b9125e8217af72e6d51ecbd52543580a261a12328f309ee4ccdceb59f64dae", "state": "completed", "terminal_reason": "not_applicable", "work_item": "DF-3"}, {"attempts": 1, "key": "DF-4:51ae89a801a65ce440739dab0d00e2dad14874ce228e3f6e90dc68e76af41478", "state": "completed", "terminal_reason": "not_applicable", "work_item": "DF-4"}], "state": "complete", "step": "cycle-4"}
+{
+  "action": "run",
+  "result": {
+    "cycles": 4,
+    "improvement": {
+      "approval_refs": [
+        "factory-owner-501-factory-shift-1"
+      ],
+      "baseline": {
+        "evaluate_correct": 5,
+        "evaluate_false_matches": 0,
+        "passing_tests": 2
+      },
+      "candidate_measurements": {
+        "evaluate_correct": 5,
+        "evaluate_false_matches": 0,
+        "passing_tests": 5
+      },
+      "candidate_sha": "dd9fcd92e41c533e0b2b60c169345e5db4e55040",
+      "change_set": [
+        "lab/prototype.py",
+        "tests/test_prototype.py"
+      ],
+      "deployment": {
+        "adapter": "not_run",
+        "approval_ref": "not_applicable",
+        "approved_by": "not_applicable",
+        "bundle_digest": "94d146e755fa99e98aafcff2ec68b3c26a353865dbdad4864a9af04ec9c8a985",
+        "contract_version": "factory-controller/production/1.0",
+        "deployment_id": "dep_3c97464e24c24e56",
+        "ended_at": "not_run",
+        "environment_class": "staging",
+        "environment_id": "factory-prototype-lab-staging",
+        "health_outcome": "not_run",
+        "operation_key": "not_run",
+        "operation_ref": "not_run",
+        "project_id": "factory-prototype-lab",
+        "release_sha": "dd9fcd92e41c533e0b2b60c169345e5db4e55040",
+        "rollback_attempts": 0,
+        "rollback_of": "not_applicable",
+        "started_at": "not_run",
+        "state": "approved",
+        "transitions": [
+          {
+            "created_at": 1788252095.628756,
+            "from_state": null,
+            "kind": "release_admitted",
+            "to_state": "approved"
+          }
+        ]
+      },
+      "disposition": "accepted",
+      "evaluator_identity": "factory-controller/dogfood-improvement",
+      "experiment_ref": "imp_95d35bcdd3c769015dc05cae",
+      "objective_digest": "dc49284064c72b3d8e423119cbbc7350ff0ec526fec857542791225bc31da212",
+      "objective_ref": "SF-144-DF-4-prototype-lab-quality-1",
+      "producer_identity": "provider:codex-primary",
+      "promotion_deployment_id": "dep_3c97464e24c24e56",
+      "promotion_environment_id": "factory-prototype-lab-staging",
+      "reverted_to": "not_applicable",
+      "state": "closed",
+      "verdict": "improved"
+    },
+    "outcome": "complete",
+    "slots": [
+      {
+        "attempts": 1,
+        "key": "DF-1:d5cec6419ab1dea2b44550982f6235a359364afb6ec700a46c6483178c0859ce",
+        "state": "completed",
+        "terminal_reason": "not_applicable",
+        "work_item": "DF-1"
+      },
+      {
+        "attempts": 1,
+        "key": "DF-2:77d558a2daadcc05c122f533d5c9d2458d6449c65471c6d7600229ea3d1871fb",
+        "state": "completed",
+        "terminal_reason": "not_applicable",
+        "work_item": "DF-2"
+      },
+      {
+        "attempts": 1,
+        "key": "DF-3:28b9125e8217af72e6d51ecbd52543580a261a12328f309ee4ccdceb59f64dae",
+        "state": "completed",
+        "terminal_reason": "not_applicable",
+        "work_item": "DF-3"
+      },
+      {
+        "attempts": 1,
+        "key": "DF-4:51ae89a801a65ce440739dab0d00e2dad14874ce228e3f6e90dc68e76af41478",
+        "state": "completed",
+        "terminal_reason": "not_applicable",
+        "work_item": "DF-4"
+      }
+    ]
+  }
+}
