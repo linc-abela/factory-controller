@@ -1,7 +1,11 @@
 #!/bin/sh
 set -eu
 case "${1:-}" in
-  factory) exec python3 -m factory_controller.cli "$@" ;;
+  # The Owner surfaces run on the host, against the installed Factory's
+  # own state directory. `release` is here for the same reason `factory`
+  # is: the ledger it has to reach is a host path, and the containerised
+  # fall-through below would silently open a different one.
+  factory|release) exec python3 -m factory_controller.cli "$@" ;;
   review)
     # The Owner review surface. `./dev factory review` seals the
     # Release Candidate and unpacks its bytes; this only serves them.

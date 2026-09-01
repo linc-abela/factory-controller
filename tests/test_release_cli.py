@@ -18,6 +18,7 @@ from pathlib import Path
 import unittest
 
 from factory_controller import cli, production
+from factory_controller import factory as factory_lifecycle
 from factory_controller.store import MissionStore
 
 from tests.test_release_lifecycle import REPOSITORY, bundle
@@ -202,6 +203,37 @@ class ReleaseCommandTests(unittest.TestCase):
         code, result = self.run_cli("release", "seal", "--rc", "CASINO-MVP-RC-011")
         self.assertEqual(code, 1)
         self.assertEqual(result["refused"]["code"], "RELEASE_ARGUMENTS_INVALID")
+
+
+class LedgerResolutionTests(unittest.TestCase):
+    """SF-158: which Factory a command with no `--db` is talking about.
+
+    The Owner was shown a Release Candidate by `./dev factory status` and told
+    RC_NOT_FOUND by `./dev release show`, because the default ledger path was
+    resolved inside the `factory` branch alone and every other command opened a
+    file in whatever directory it ran from. One host, one Factory, one ledger.
+    """
+
+    def resolved(self, argv):
+        return Path(cli._resolved_db(cli.parser().parse_args(argv)))
+
+    def test_the_default_is_the_installed_factorys_own_ledger(self):
+        expected = (factory_lifecycle.FactoryConfig.default().state_dir
+                    / "factory-controller.db")
+
+        self.assertEqual(self.resolved(["release", "show", "--rc", "r"]),
+                         expected)
+        self.assertEqual(self.resolved(["factory", "status"]), expected)
+        self.assertEqual(self.resolved(["status"]), expected)
+
+    def test_an_explicit_path_still_points_where_it_says(self):
+        self.assertEqual(
+            self.resolved(["--db", "/tmp/other.db", "release", "show",
+                           "--rc", "r"]),
+            Path("/tmp/other.db"))
+        self.assertEqual(
+            self.resolved(["--db", "local.db", "release", "show", "--rc", "r"]),
+            Path.cwd() / "local.db")
 
 
 if __name__ == "__main__":

@@ -1270,15 +1270,31 @@ def _improvement_policy(declared: dict) -> "imp.ImprovementPolicy":
     return imp.ImprovementPolicy(**values)
 
 
+def _resolved_db(args) -> Path:
+    """Which Factory a command with no ``--db`` is talking about.
+
+    The installed one.  This resolution used to happen inside the ``factory``
+    branch alone, so `./dev factory status` read the host's ledger while
+    `./dev release show` read a file in whatever directory it was run from --
+    and an Owner recording the validation of a Release Candidate they had just
+    been shown was told RC_NOT_FOUND.  One host, one Factory, one ledger; an
+    explicit ``--db`` still points wherever it says.
+    """
+
+    db_path = Path(args.db)
+    if args.db == "factory-controller.db":
+        return factory_lifecycle.FactoryConfig.default().state_dir / args.db
+    if not db_path.is_absolute():
+        return Path.cwd() / db_path
+    return db_path
+
+
 def main(argv: list[str] | None = None) -> int:
     args = parser().parse_args(argv)
+    args.db = str(_resolved_db(args))
     if args.command == "factory":
         config = factory_lifecycle.FactoryConfig.default()
         db_path = Path(args.db)
-        if args.db == "factory-controller.db":
-            db_path = config.state_dir / "factory-controller.db"
-        elif not db_path.is_absolute():
-            db_path = Path.cwd() / db_path
         lifecycle = factory_lifecycle.FactoryLifecycle(
             Controller(MissionStore(db_path),
                        JsonProcessAdapter(shlex.split(args.adapter)),
