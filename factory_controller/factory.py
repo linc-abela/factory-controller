@@ -62,6 +62,26 @@ GATE_MEASUREMENT_TIMEOUT_SECONDS = 1800
 #: `evaluate_candidate` refuses when the two are the same string.
 IMPROVEMENT_EVALUATOR_IDENTITY = "factory-controller/dogfood-improvement"
 
+#: How one durable mission state reads on the Owner's status surface.
+#:
+#: The keys are ``store.ALLOWED_TRANSITIONS``' own vocabulary and nothing else,
+#: so a state the engine can write always has a reading here; the phrase is
+#: deliberately coarse, because which *step* the mission is on is a separate,
+#: more precise fact and is reported beside this one.
+PRODUCT_LIFECYCLE = {
+    "admitted": "queued; the supervisor will pick it up automatically",
+    "dispatching": "executing",
+    "dispatched": "verifying its candidate",
+    "candidate_verified": "running its acceptance gates",
+    "evaluated": "evaluating its gate results",
+    "evidence_sealed": "sealing its evidence",
+    "completed": "settled; it succeeded",
+    "refused": "stopped before the provider started",
+    "failed": "stopped",
+    "cancelled": "cancelled",
+    "escalated": "stopped after the provider started",
+}
+
 DEFAULT_WATCH_INTERVAL_SECONDS = 30.0
 AUTOPILOT_WORKER_ID = "factory-autopilot"
 
@@ -1144,6 +1164,110 @@ class FactoryLifecycle:
                               if reading.retryable)
         return entry, slots, outcomes, retryable, entry.next_mission(outcomes, retryable)
 
+    def _product_reading(self):
+        """The latest mission admitted under the Owner's product contract.
+
+        Read-only and refusal-free for the same reason ``_work_reading`` is: a
+        status that could not be printed because one contract was unreadable
+        would hide every other fact with it.
+        """
+
+        try:
+            contract = product.ProductContract.load(
+                self.config.product_contract_path)
+            rows = [row for row in self.store.all_missions()
+                    if row.get("project_id") == contract.project_id]
+            return None if not rows else self.store.get(rows[-1]["id"])
+        except Exception:  # noqa: BLE001
+            return None
+
+    def _product_stage(self, mission_id: str) -> str | None:
+        """Which durable step the mission is on, when one has been recorded."""
+
+        try:
+            records = self.store.step_records(mission_id)
+        except Exception:  # noqa: BLE001
+            return None
+        if not records:
+            return None
+        latest = records[-1]
+        return "%s (%s)" % (
+            latest["name"],
+            "complete" if latest["status"] == "COMPLETED" else "in progress")
+
+    def _dogfood_history_note(self) -> str | None:
+        """The internal portfolio's own blocker, demoted to what it is.
+
+        It stays in durable history and stays readable -- nothing here writes,
+        and the rows the autopilot reads are untouched -- but it is not a
+        product's blocker and must not be rendered as one.
+        """
+
+        reading = self._work_reading()
+        if reading is None:
+            return None
+        entry, slots, _, _, _ = reading
+        blocker = self._first_autopilot_attention(entry, slots)
+        if blocker is None:
+            return None
+        portfolio_mission, _, _ = blocker
+        return ("History: the %s internal validation mission is still marked "
+                "for Owner review. It is kept in durable history and does not "
+                "block this product." % portfolio_mission.mission_ref)
+
+    def _product_summary(self) -> tuple[tuple[str, ...], str] | None:
+        """What the Owner needs to know about their product, when one exists.
+
+        ``_work_summary`` reads the frozen first-dogfood portfolio and nothing
+        else.  That was the whole truth until a real product was admitted, and
+        then it was not: a product mission is named by the Owner one package at
+        a time, so it is in no portfolio and never will be, and the status
+        surface went on answering with an internal validation slot.  Worse, it
+        answered with DF-1's escalation -- which ``cycle`` deliberately steps
+        past, precisely so already-admitted work keeps advancing -- rendered as
+        the current blocker of work that was in fact executing.
+
+        So a product mission takes the headline whenever one exists, and the
+        internal portfolio keeps it whenever one does not.  Every field below
+        is read from the rows the engine itself writes; nothing is derived from
+        the fact that a status command was run.
+        """
+
+        mission = self._product_reading()
+        if mission is None:
+            return None
+        state = mission["state"]
+        payload = mission.get("payload")
+        work_item = (payload or {}).get("work_item_id") or "The product mission"
+        lines = ["Product: %s in %s is %s"
+                 % (work_item, mission["project_id"],
+                    PRODUCT_LIFECYCLE.get(state, state))]
+        stage = self._product_stage(mission["id"])
+        if stage is not None:
+            lines.append("Stage: " + stage)
+        try:
+            profile = self.store.route_history(
+                mission["id"]).get("selected_provider_profile")
+        except Exception:  # noqa: BLE001
+            profile = None
+        if profile:
+            lines.append("Provider: %s (%s)"
+                         % (self._display_profile(profile), profile))
+        if state in shift_plane.UNSUCCESSFUL_MISSION_STATES:
+            summary_state = "attention"
+            lines.append(
+                "Attention: %s needs Owner review (%s)."
+                % (work_item, mission["terminal_reason"]
+                   or "it did not settle successfully"))
+        elif state == "completed":
+            summary_state = "complete"
+        else:
+            summary_state = "pending"
+        history = self._dogfood_history_note()
+        if history is not None:
+            lines.append(history)
+        return tuple(lines), summary_state
+
     def _work_summary(self) -> tuple[tuple[str, ...], str]:
         """What the Owner needs to know about work, with no internal ids.
 
@@ -1265,7 +1389,7 @@ class FactoryLifecycle:
         label = "FACTORY READY" if ready else "FACTORY OFF"
         shift_summary = "Active" if live is not None else "Off"
         supervisor_summary = "Running" if supervisor_loaded else "Stopped"
-        work, work_state = self._work_summary()
+        work, work_state = self._product_summary() or self._work_summary()
         status_attention = self._status_attention(
             doctor, live=live, bridge_healthy=bridge_healthy, primary=primary)
         if status_attention:

@@ -297,5 +297,189 @@ class FactoryProductTests(unittest.TestCase):
         self.assertEqual(supervisor_policy.work_classes, (CONTRACT.work_class,))
 
 
+class ProductStatusTests(unittest.TestCase):
+    """SF-158: whose blocker the Owner status surface is actually reporting.
+
+    The live host reached exactly the shape reproduced here.  DF-1 escalated on
+    acceptance gates that had exited 127 for want of a PATH; the Owner then
+    submitted the real package and `./dev factory status --watch` answered
+    *"The DF-1 validation mission needs Owner attention"* and stopped watching,
+    while `lodus-casino:build` was admitted and eligible to advance.  Nothing
+    in the ledger was wrong -- the status reading was looking at the wrong
+    portfolio, because a product mission is in none.
+    """
+
+    setUp = FactoryProductTests.setUp
+    ready = FactoryProductTests.ready
+    submit = FactoryProductTests.submit
+    missions = FactoryProductTests.missions
+
+    def escalate_the_first_internal_slot(self):
+        """Settle DF-1 the way the live host settled it: gates run, gates failed.
+
+        Through the ordinary transitions rather than by editing rows, because
+        an escalation is only reachable past the dispatch boundary and that is
+        the half of the state that makes it Owner attention.
+        """
+
+        self.assertTrue(self.lifecycle.dispatch("run").ok)
+        claimed = self.lifecycle.store.claim("test-escalation")
+        mission_id, token = claimed["id"], claimed["lease_token"]
+        for state in ("dispatched", "candidate_verified"):
+            self.lifecycle.store.transition(
+                mission_id, token, state, detail={"candidate_sha": "b" * 40})
+        self.lifecycle.store.transition(
+            mission_id, token, "escalated",
+            reason="ACCEPTANCE_GATE_FAILED: dev-check, dev-test",
+            release_lease=True)
+        return mission_id
+
+    def status(self):
+        result = self.lifecycle.dispatch("status")
+        self.assertTrue(result.ok, result.render())
+        return result
+
+    # -- precedence -------------------------------------------------------- #
+
+    def test_without_a_product_the_internal_portfolio_still_owns_the_status(self):
+        """The internal path is unchanged where there is no product to report."""
+
+        self.ready()
+        self.escalate_the_first_internal_slot()
+
+        result = self.status()
+        self.assertEqual(result.details["work_state"], "attention")
+        self.assertIn("DF-1 validation mission needs Owner attention",
+                      result.render())
+        self.assertNotIn("lodus-casino:build", result.render())
+
+    def test_an_admitted_product_mission_takes_the_status_headline(self):
+        self.ready()
+        self.escalate_the_first_internal_slot()
+        self.assertTrue(self.submit().ok)
+
+        result = self.status()
+        self.assertIn("Product: lodus-casino:build in lodus-casino is queued",
+                      result.render())
+        self.assertNotIn("The DF-1 validation mission needs Owner attention",
+                         result.render())
+
+    def test_the_historical_internal_attention_survives_as_history(self):
+        """Demoted, not erased: the escalation is still there to be read."""
+
+        self.ready()
+        escalated = self.escalate_the_first_internal_slot()
+        self.assertTrue(self.submit().ok)
+
+        row = self.lifecycle.store.get(escalated)
+        self.assertEqual(row["state"], "escalated")
+        self.assertEqual(row["terminal_reason"],
+                         "ACCEPTANCE_GATE_FAILED: dev-check, dev-test")
+        rendered = self.status().render()
+        self.assertIn("History: the DF-1 internal validation mission is still "
+                      "marked for Owner review", rendered)
+        self.assertIn("does not block this product", rendered)
+
+    def test_admitted_product_work_is_not_reported_as_paused(self):
+        """The false claim itself: eligible work described as waiting on a person."""
+
+        self.ready()
+        self.escalate_the_first_internal_slot()
+        self.assertTrue(self.submit().ok)
+
+        result = self.status()
+        self.assertEqual(result.details["work_state"], "pending")
+        self.assertNotIn("paused", result.render())
+        # Eligible is a durable property, not a phrasing: the scheduler can
+        # still claim the mission the status surface just described.
+        claimed = self.lifecycle.store.claim(
+            "test-eligibility", project_ids=("lodus-casino",))
+        self.assertIsNotNone(claimed)
+        self.assertEqual(claimed["payload"]["work_item_id"], "lodus-casino:build")
+
+    def test_watch_keeps_watching_while_the_product_mission_advances(self):
+        """`--watch` stops on attention; a live product mission is not one."""
+
+        self.ready()
+        self.escalate_the_first_internal_slot()
+        self.assertTrue(self.submit().ok)
+        emitted, slept = [], []
+
+        def sleep(seconds):
+            slept.append(seconds)
+            if len(slept) == 2:
+                raise KeyboardInterrupt
+
+        self.assertEqual(
+            self.lifecycle.watch(1, emit=emitted.append, sleep=sleep), 0)
+        self.assertEqual(len(emitted), 2)
+        self.assertIn("Product: lodus-casino:build", emitted[0])
+
+    # -- what the state actually is ---------------------------------------- #
+
+    def test_the_stage_and_provider_are_reported_once_they_are_durable(self):
+        self.ready()
+        self.assertTrue(self.submit().ok)
+        claimed = self.lifecycle.store.claim(
+            "test-stage", project_ids=("lodus-casino",))
+        self.lifecycle.store.begin_step(
+            claimed["id"], claimed["lease_token"], "dispatch", {"a": 1})
+        self.lifecycle.store.record_run(
+            claimed["id"], 1, {"reason": "PRIMARY", "considered": []},
+            {"provider_profile": "codex-product", "classification": "completed",
+             "process_started": True},
+            claimed["idempotency_key"])
+
+        rendered = self.status().render()
+        self.assertIn("lodus-casino:build in lodus-casino is executing", rendered)
+        self.assertIn("Stage: dispatch (in progress)", rendered)
+        self.assertIn("Provider: Codex (codex-product)", rendered)
+
+    def test_a_stopped_product_mission_is_the_blocker_it_actually_is(self):
+        self.ready()
+        self.escalate_the_first_internal_slot()
+        self.assertTrue(self.submit().ok)
+        claimed = self.lifecycle.store.claim(
+            "test-stop", project_ids=("lodus-casino",))
+        self.lifecycle.store.transition(
+            claimed["id"], claimed["lease_token"], "refused",
+            reason="PROVIDER_POLICY_VIOLATION: the profile is denied",
+            release_lease=True)
+
+        result = self.status()
+        self.assertEqual(result.details["work_state"], "attention")
+        self.assertIn("Attention: lodus-casino:build needs Owner review "
+                      "(PROVIDER_POLICY_VIOLATION: the profile is denied).",
+                      result.render())
+
+    def test_a_settled_product_mission_reports_that_it_succeeded(self):
+        self.ready()
+        self.assertTrue(self.submit().ok)
+        claimed = self.lifecycle.store.claim(
+            "test-settle", project_ids=("lodus-casino",))
+        mission_id, token = claimed["id"], claimed["lease_token"]
+        for state in ("dispatched", "candidate_verified", "evaluated",
+                      "evidence_sealed", "completed"):
+            self.lifecycle.store.transition(mission_id, token, state)
+
+        result = self.status()
+        self.assertEqual(result.details["work_state"], "complete")
+        self.assertIn("lodus-casino:build in lodus-casino is settled; "
+                      "it succeeded", result.render())
+
+    def test_the_status_surface_never_mutates_the_mission_it_reports(self):
+        """Status is a reading.  The live run's own safety depends on it."""
+
+        self.ready()
+        self.escalate_the_first_internal_slot()
+        self.assertTrue(self.submit().ok)
+        before = [dict(row) for row in self.missions()]
+
+        for _ in range(3):
+            self.status()
+
+        self.assertEqual([dict(row) for row in self.missions()], before)
+
+
 if __name__ == "__main__":
     unittest.main()
