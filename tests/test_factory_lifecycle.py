@@ -195,7 +195,50 @@ class FakeHost:
                 "stale_after_seconds": 3600,
                 "source_ref": "fake-capacity-reading",
             }))
+        if arguments[:2] == ("artifact", "build"):
+            return self._artifact(arguments)
         return HostCommandResult(127, "", "unknown Bridge command")
+
+    def _artifact(self, arguments):
+        """A real archive, because the review path really unpacks one.
+
+        Returning only a digest would leave `_materialize_review` untested
+        against anything, and the bytes an Owner reviews are the whole point of
+        the identity.
+        """
+
+        import hashlib
+        import io
+        import tarfile
+
+        project_id, candidate = arguments[2], arguments[3]
+        prefix = arguments[arguments.index("--prefix") + 1].rstrip("/") + "/"
+        if project_id not in self.checkouts:
+            return HostCommandResult(1, "", "unknown project")
+        root = self.config.state_dir / "fake-artifacts"
+        root.mkdir(parents=True, exist_ok=True)
+        body = b"<!doctype html><title>%s</title>\n" % candidate.encode()
+        buffer = io.BytesIO()
+        with tarfile.open(fileobj=buffer, mode="w") as archive:
+            info = tarfile.TarInfo(prefix + "index.html")
+            info.size = len(body)
+            archive.addfile(info, io.BytesIO(body))
+        raw = buffer.getvalue()
+        identity = hashlib.sha256(raw).hexdigest()
+        path = root / (identity + ".tar")
+        path.write_bytes(raw)
+        return HostCommandResult(0, json.dumps({
+            "schema_version": "factory.bridge.candidate_artifact.v1",
+            "project_id": project_id, "candidate_sha": candidate,
+            "publish_prefix": prefix,
+            "artifact": {"kind": "static-bundle",
+                         "identity": "sha256:" + identity},
+            "archive_path": str(path), "archive_bytes": len(raw),
+            "content_bytes": len(body), "file_count": 1,
+            "files": [prefix + "index.html"],
+            "repository_remote_url":
+                "https://github.com/linc-abela/%s.git" % project_id,
+        }))
 
     def doctor(self):
         source_sha = "a" * 40

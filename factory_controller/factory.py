@@ -16,6 +16,7 @@ import re
 import shlex
 import shutil
 import sys
+import tarfile
 import tempfile
 import time
 from dataclasses import dataclass, field
@@ -33,6 +34,7 @@ from . import improvement
 from . import portfolio
 from . import product
 from . import production
+from . import release
 from . import shift as shift_plane
 from . import shift_runtime
 from . import stage1_adapter
@@ -155,6 +157,16 @@ class FactoryConfig:
     interval_seconds: int = 300
     shift_duration_seconds: float = 4 * 3600.0
     request_prefix: str = "factory-shift"
+    #: Where a sealed Release Candidate is offered for Owner Validation.
+    #:
+    #: Local by default and local on purpose.  ``release._surface`` accepts an
+    #: HTTPS target or an explicit loopback one and nothing else, and this
+    #: Factory has no authorized HTTPS target: reaching one is an Owner act
+    #: with an account and a visibility decision behind it.  A loopback surface
+    #: is a review the Owner can actually open today, and it serves the sealed
+    #: artifact's own bytes, so the digest they validate is the digest that
+    #: would be promoted.
+    review_url: str = "http://127.0.0.1:8787"
     python_path: Path | None = None
 
     @property
@@ -314,6 +326,8 @@ class FactoryLifecycle:
                 return self.cycle()
             if action == "status":
                 return self.status()
+            if action == "review":
+                return self.review()
             raise FactoryRefusal("ACTION_UNKNOWN", "That Factory action is not supported.")
         except FactoryRefusal as refusal:
             return FactoryResult(
@@ -625,6 +639,220 @@ class FactoryLifecycle:
             },
         )
 
+    def review(self) -> FactoryResult:
+        """Take the completed product mission to a reviewable Release Candidate.
+
+        Everything between a mission the Factory finished and a judgement the
+        Owner can make existed already and was joined by nobody: the execution
+        layer could mint an artifact identity from a candidate commit, the
+        release plane could seal a Release Candidate and record a review
+        deployment, and no code carried the one to the other.  So the terminal
+        state of a successful product run was a commit on a lane reference and
+        an operator expected to hand-author a release bundle -- which is the
+        Owner loop this verb exists to end.
+
+        It adds no rule.  The artifact is built by the execution layer from the
+        candidate the mission verified, every bundle field is a durable row,
+        and every refusal below is raised by the release plane or the
+        production ledger.  It is also idempotent by construction: the Release
+        Candidate id is derived from the candidate commit, so a second
+        invocation seals the same RC and re-uses the same deployment rather
+        than minting a second release for one set of bytes.
+        """
+
+        self._require_owner()
+        contract = self._product_contract()
+        mission = self._product_reading()
+        if mission is None:
+            raise FactoryRefusal(
+                "PRODUCT_MISSION_ABSENT",
+                "No product mission has been submitted yet. Run "
+                "'./dev factory product --package <path>' first.")
+        if mission["state"] != "completed":
+            raise FactoryRefusal(
+                "PRODUCT_MISSION_UNFINISHED",
+                "The product mission is %s, not finished. Run "
+                "'./dev factory status' to follow it."
+                % PRODUCT_LIFECYCLE.get(mission["state"], mission["state"]))
+        work_item = (mission.get("payload") or {}).get("work_item_id")
+        result = mission.get("result") or {}
+        evaluation = result.get("evaluation") or {}
+        candidate = ((result.get("verification") or {}).get("verification")
+                     or {}).get("candidate_sha")
+        evidence_pointer = (result.get("evidence") or {}).get("evidence_pointer")
+        if not isinstance(candidate, str) or not isinstance(evidence_pointer, str):
+            raise FactoryRefusal(
+                "PRODUCT_EVIDENCE_INCOMPLETE",
+                "The finished product mission recorded no verified candidate "
+                "to release.")
+
+        # Independent QA before anything is sealed, because a Release
+        # Candidate is immutable once it exists and a boundary this check
+        # rejects must never acquire one.
+        boundary = product.decision_boundary(
+            contract, evaluation.get("changed_paths"))
+        if not boundary["held"]:
+            self.store.coordinate(
+                mission["id"], contract.project_id, "factory",
+                "FACTORY_PRODUCT_QA_REFUSED", boundary)
+            raise FactoryRefusal(
+                "DECISION_BOUNDARY_VIOLATED",
+                "The candidate changed %s, which is the source of the gates "
+                "it was judged by. This is a failed mission, not a passed one."
+                % boundary["gate_source"] if boundary["violations"] else
+                "The Factory cannot tell what this candidate changed, so it "
+                "cannot certify that the gates still judge what they declared.")
+
+        doctor = self._bridge_doctor()
+        registry = dogfood_intake.registry_row(
+            self._registry_rows(doctor), contract.project_id)
+        artifact = self._build_artifact(contract, candidate)
+        self._provision_product_store(contract, doctor)
+
+        self.store.coordinate(
+            mission["id"], contract.project_id, "factory",
+            "FACTORY_PRODUCT_QA_HELD",
+            {**boundary, "candidate_sha": candidate,
+             "artifact": artifact["artifact"],
+             "gate_outcomes": [
+                 {"gate_id": row.get("gate_id"), "passed": row.get("passed"),
+                  "exit_code": row.get("exit_code")}
+                 for row in evaluation.get("gate_outcomes") or ()]})
+
+        payload = product.release_bundle(
+            contract, work_item_id=work_item, mission_id=mission["id"],
+            repository=registry.get("repository_remote_url"),
+            candidate_sha=candidate, artifact=artifact["artifact"],
+            evidence_pointer=evidence_pointer,
+            provenance_at=dogfood_intake.iso_utc(self.clock()))
+        bundle = production.ReleaseBundle.from_payload(payload)
+        rc_id = product.rc_id_for(contract, candidate)
+        lifecycle = release.ReleaseLifecycle(self.store, clock=self.clock)
+        try:
+            sealed = lifecycle.seal(
+                rc_id, bundle,
+                verification_refs=["candidate://%s" % candidate,
+                                   "mission://%s" % mission["id"]],
+                qa_refs=["qa://%s/decision-boundary" % mission["id"]])
+            deployed = lifecycle.deploy_review(
+                rc_id, self.production,
+                production.DeterministicDeploymentAdapter(),
+                review_environment_id=contract.review_environment_id,
+                requested_by=self.owner.username,  # type: ignore[union-attr]
+                review_url=self.config.review_url)
+        except (release.ReleaseRefusal, production.ProductionRefusal) as refusal:
+            raise FactoryRefusal(
+                getattr(refusal, "code", "REVIEW_NOT_PREPARED"),
+                getattr(refusal, "detail", "The review could not be prepared."),
+            ) from None
+
+        root = self._materialize_review(artifact, sealed.artifact_digest)
+        self._record_owner_act("review", sealed.rc_id, {
+            "rc_id": sealed.rc_id, "candidate_sha": candidate,
+            "artifact_digest": sealed.artifact_digest,
+            "deployment_ref": deployed["deployment_ref"]})
+        return FactoryResult(
+            action="review", ok=True, state="review-ready",
+            lines=("PRODUCT READY FOR REVIEW",
+                   "Release Candidate: %s" % sealed.rc_id,
+                   "Artifact: %s (%d files)"
+                   % (sealed.artifact_digest, artifact["file_count"]),
+                   "Review it at %s" % self.config.review_url,
+                   "Start the review surface with './dev review up', and stop "
+                   "it with './dev review down'.",
+                   "Nothing is promoted until you record a decision."),
+            details={"rc_id": sealed.rc_id, "work_item_id": work_item,
+                     "candidate_sha": candidate,
+                     "artifact_digest": sealed.artifact_digest,
+                     "bundle_digest": sealed.bundle_digest,
+                     "deployment_ref": deployed["deployment_ref"],
+                     "deployment_state": deployed["state"],
+                     "review_url": self.config.review_url,
+                     "review_root": str(root),
+                     "decision_boundary": boundary["outcome"],
+                     "files": artifact["file_count"]},
+        )
+
+    def _product_contract(self):
+        try:
+            return product.ProductContract.load(self.config.product_contract_path)
+        except product.ProductRefusal as refusal:
+            raise FactoryRefusal(refusal.code, refusal.detail) from None
+
+    def _build_artifact(self, contract, candidate_sha: str) -> dict[str, Any]:
+        """Ask the execution layer for the candidate's immutable identity.
+
+        The Controller does not walk a repository to produce bytes: resolving a
+        commit and packing its publish prefix is host mechanics, and the layer
+        that owns the project registry is the one that can prove the commit is
+        present in the checkout it registered.
+        """
+
+        _, report = self._bridge_json(
+            "artifact", "build", contract.project_id, candidate_sha,
+            "--prefix", contract.publish_prefix)
+        artifact = report.get("artifact")
+        if not isinstance(artifact, Mapping) or not report.get("archive_path"):
+            raise FactoryRefusal(
+                "ARTIFACT_NOT_BUILT",
+                "The execution layer could not build a publishable artifact "
+                "from the verified candidate.")
+        return report
+
+    def _materialize_review(self, report: Mapping[str, Any], identity: str) -> Path:
+        """Unpack the sealed artifact where the review surface can serve it.
+
+        The bytes served are the archive the identity was taken over, not the
+        working copy and not a fresh checkout -- otherwise the digest the Owner
+        validates is not the digest that would be promoted, which is the one
+        invariant the package states about its own release.
+        """
+
+        root = self.config.state_dir / "review" / identity.split(":", 1)[-1]
+        prefix = str(report.get("publish_prefix") or "").rstrip("/")
+        try:
+            if root.exists():
+                shutil.rmtree(root)
+            root.mkdir(parents=True)
+            with tarfile.open(str(report["archive_path"]), "r:") as archive:
+                # The extraction filter this needs landed in 3.12 and the
+                # Owner's own `./dev factory` runs whichever python3 the host
+                # has, so the two rules the filter enforces are applied here
+                # instead of assumed.  A directory entry is not extracted at
+                # all: the archive is a canonical repack of files only, and a
+                # member that is not one is not something to unpack quietly.
+                members = []
+                for member in archive.getmembers():
+                    if not member.isfile():
+                        continue
+                    parts = member.name.split("/")
+                    if member.name.startswith("/") or ".." in parts:
+                        raise FactoryRefusal(
+                            "REVIEW_ARTIFACT_UNSAFE",
+                            "The artifact archive names a path outside itself.")
+                    members.append(member)
+                # Pass the filter as well wherever the interpreter has it:
+                # the checks above are the floor, not a replacement for it.
+                filtered = ({"filter": "data"}
+                            if hasattr(tarfile, "data_filter") else {})
+                archive.extractall(str(root), members=members, **filtered)
+        except (OSError, tarfile.TarError) as error:
+            raise FactoryRefusal(
+                "REVIEW_NOT_MATERIALIZED",
+                "The reviewable bytes could not be written: %s"
+                % type(error).__name__) from None
+        served = root / prefix if prefix else root
+        marker = self.config.state_dir / "review" / "current"
+        try:
+            if marker.is_symlink() or marker.exists():
+                marker.unlink()
+            marker.symlink_to(served)
+        except OSError:
+            # A host that will not hold the pointer still holds the bytes; the
+            # surface is told the resolved path either way.
+            pass
+        return served
+
     def _provision_product_store(self, contract, doctor) -> None:
         """Give the product project the same durable policy a lab project has.
 
@@ -648,6 +876,32 @@ class FactoryLifecycle:
         current = self.store.project(contract.project_id)
         if current is None or current.as_row() != policy.as_row():
             self.store.register_project(policy)
+        # The contract names a review environment and nothing created it, so
+        # the first release deployment of the first real product refused on an
+        # environment only this contract could have declared.  Provisioning is
+        # what makes a contract's names exist; the lab path already registers
+        # its own, and this one was simply missed.
+        #
+        # The production environment is deliberately not registered here.  It
+        # is gated, it is reached only through an Owner Validation this path
+        # stops short of, and an environment nothing can yet deploy to is a
+        # claim rather than a provision.
+        review = production.EnvironmentPolicy(
+            environment_id=contract.review_environment_id,
+            project_id=contract.project_id,
+            repository=row.get("repository_remote_url"),
+            environment_class="staging",
+            service_ref="%s-review" % contract.project_id,
+            approver_refs=(self.owner.username,),  # type: ignore[union-attr]
+            autonomous=True,
+            policy_version=contract.run_ref,
+        )
+        try:
+            self.production.register_environment(review)
+        except production.ProductionRefusal:
+            # Registered already, under the Owner's own act.  Re-registering
+            # here would rewrite an envelope this seam does not own.
+            pass
         supervisor_policy = supervisor.SupervisorPolicy(
             project_id=contract.project_id, enabled=True,
             work_classes=(contract.work_class,),

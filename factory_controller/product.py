@@ -277,8 +277,108 @@ def unresolved(intake: pcp.PCPIntake) -> Sequence[str]:
     return tuple(intake.mission.get("open_decisions") or ())
 
 
+# --------------------------------------------------------------------------- #
+# what a completed product mission becomes
+# --------------------------------------------------------------------------- #
+
+
+def rc_id_for(contract: ProductContract, candidate_sha: str) -> str:
+    """One Release Candidate identity per candidate commit, derived not minted.
+
+    ``release.seal`` is idempotent on exactly this id and refuses
+    ``RC_IDENTITY_MISMATCH`` when the same id is offered different bytes.  So
+    deriving the id from the bytes is what makes a repeated review the same
+    review: a minted id would seal a second candidate for one commit, and a
+    constant id would collide the moment a second candidate existed.
+    """
+
+    if not isinstance(candidate_sha, str) or len(candidate_sha) < 12:
+        _refuse("PRODUCT_CANDIDATE_INVALID",
+                "a candidate is a full commit id")
+    return "rc-%s-%s" % (contract.package_id, candidate_sha[:12])
+
+
+def gate_source_path(contract: ProductContract) -> str:
+    """The repository path the acceptance gates are read from.
+
+    ``acceptance_gate_source`` is ``<remote>@<baseline>:<path>``; a remote URL
+    carries its own colons, so the path is the last segment and never the
+    second.
+    """
+
+    return contract.acceptance_gate_source.rsplit(":", 1)[-1]
+
+
+def decision_boundary(contract: ProductContract, changed_paths: Any) -> dict[str, Any]:
+    """Did the candidate rewrite the thing that judges it?
+
+    This is the one independent-QA question a product mission can be asked
+    from durable state alone, and it is not redundant with the gates: the
+    gates run from the *candidate's* own checkout, so a provider that relaxed
+    its gate source would pass gates that no longer mean what the contract
+    declared -- and every other record in the run would still be green.  The
+    package's own prohibitions say the same thing in the product's words.
+
+    Read from the stage-1 evaluator's recorded ``changed_paths``.  Nothing is
+    re-derived from git here: candidate truth belongs to Evidence Core's
+    verifier, and this is a question about a list the Factory already holds.
+    An absent list is ``unknown`` rather than an empty pass -- the check
+    cannot be performed, which is not the same fact as the boundary holding.
+    """
+
+    source = gate_source_path(contract)
+    if not isinstance(changed_paths, (list, tuple)):
+        return {"held": False, "outcome": "unknown", "gate_source": source,
+                "changed_paths": "unknown", "violations": []}
+    paths = [str(item) for item in changed_paths]
+    violations = [item for item in paths if item == source]
+    return {"held": not violations,
+            "outcome": "held" if not violations else "violated",
+            "gate_source": source, "changed_paths": paths,
+            "violations": violations}
+
+
+def release_bundle(contract: ProductContract, *, work_item_id: str,
+                   mission_id: str, repository: str, candidate_sha: str,
+                   artifact: Any, evidence_pointer: str,
+                   provenance_at: str) -> dict[str, Any]:
+    """The completed mission as a release bundle payload, nothing invented.
+
+    Every field is a durable row or the artifact identity the execution layer
+    minted from the candidate commit.  ``artifact`` is a real digest here,
+    unlike the internal improvement path's ``not_applicable``: a product
+    publishes bytes, and which bytes is the whole question a review answers.
+
+    ``env_schema`` and ``migration`` are empty and ``not_applicable`` because
+    a browser-only static bundle has neither, which the package states as a
+    prohibition rather than an omission.
+    """
+
+    return {
+        "bundle_ref": "rc-%s" % work_item_id,
+        "project_id": contract.project_id,
+        "repository": repository,
+        "release_sha": candidate_sha,
+        "mission_ref": work_item_id,
+        "evidence_refs": ["mission://%s" % mission_id,
+                          "evidence://%s" % evidence_pointer,
+                          "package://%s" % contract.package_id],
+        "evaluator_receipts": ["gate://%s/%s" % (mission_id, gate)
+                               for gate in contract.acceptance_gate_ids],
+        "artifact": artifact,
+        "env_schema": {},
+        "migration": {"forward_ref": "not_applicable",
+                      "reverse_ref": "not_applicable"},
+        "release_policy_version": contract.run_ref,
+        "provenance": {"built_by": "factory-controller/product",
+                       "built_at": provenance_at,
+                       "contract_version": "factory-controller/production/1.0"},
+    }
+
+
 __all__ = [
     "BRIEF_LIMIT", "CONTRACT_SCHEMA", "OWNER_ACT_SCHEMA", "ProductContract",
-    "ProductMission", "ProductRefusal", "brief", "mission_for", "owner_act",
-    "package_from", "unresolved",
+    "ProductMission", "ProductRefusal", "brief", "decision_boundary",
+    "gate_source_path", "mission_for", "owner_act", "package_from",
+    "rc_id_for", "release_bundle", "unresolved",
 ]

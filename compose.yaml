@@ -5,3 +5,16 @@ services:
     volumes:
       - .:/workspace
 
+  # The Owner's review surface: the sealed artifact's own bytes, served
+  # read-only on loopback. It builds nothing and reads nothing from this
+  # repository -- `./dev factory review` unpacks the archive the artifact
+  # identity was taken over, and this serves exactly that directory, so the
+  # digest an Owner validates is the digest that would be promoted.
+  review:
+    build: .
+    command: ["python", "-m", "http.server", "8787", "--bind", "0.0.0.0",
+              "--directory", "/review"]
+    ports:
+      - "127.0.0.1:8787:8787"
+    volumes:
+      - ${FACTORY_REVIEW_ROOT:-./.review}:/review:ro

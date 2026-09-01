@@ -14,7 +14,7 @@ from pathlib import Path
 import tempfile
 import unittest
 
-from factory_controller import pcp, product
+from factory_controller import pcp, product, release
 from factory_controller.factory import FactoryConfig, FactoryLifecycle, OwnerIdentity
 from factory_controller.engine import Controller
 from factory_controller.store import MissionStore
@@ -479,6 +479,263 @@ class ProductStatusTests(unittest.TestCase):
             self.status()
 
         self.assertEqual([dict(row) for row in self.missions()], before)
+
+
+class ProductReviewTests(unittest.TestCase):
+    """SF-158: what a finished product mission becomes.
+
+    The execution layer could already mint an immutable artifact identity from
+    a candidate commit, and `release.py` could already seal a Release Candidate
+    and record a review deployment.  Nothing carried one to the other, so the
+    terminal state of a successful product run was a commit on a lane reference
+    plus an operator expected to hand-author a release bundle.
+    """
+
+    setUp = FactoryProductTests.setUp
+    ready = FactoryProductTests.ready
+    submit = FactoryProductTests.submit
+    missions = FactoryProductTests.missions
+
+    CANDIDATE = "7" * 40
+
+    def finish_the_product_mission(self, changed_paths=("public/index.html",)):
+        """Settle the product mission the way the engine settles one.
+
+        Through the ordinary transitions with the ordinary result shape, so the
+        review path reads the fields the engine actually writes rather than a
+        shape invented for a test.
+        """
+
+        claimed = self.lifecycle.store.claim(
+            "test-product", project_ids=("lodus-casino",))
+        mission_id, token = claimed["id"], claimed["lease_token"]
+        for state in ("dispatched", "candidate_verified", "evaluated",
+                      "evidence_sealed"):
+            self.lifecycle.store.transition(mission_id, token, state)
+        self.lifecycle.store.transition(
+            mission_id, token, "completed", release_lease=True, result={
+                "dispatch": {"candidate_sha": self.CANDIDATE},
+                "verification": {"verification": {
+                    "candidate_sha": self.CANDIDATE,
+                    "baseline_sha": CONTRACT.baseline_sha,
+                    "verification_digest": "d" * 64}},
+                "evaluation": {
+                    "passed": True,
+                    "changed_paths": (None if changed_paths is None
+                                      else list(changed_paths)),
+                    "gate_outcomes": [
+                        {"gate_id": gate, "passed": True, "exit_code": 0}
+                        for gate in CONTRACT.acceptance_gate_ids]},
+                "evidence": {"accepted": True, "evidence_pointer": "e" * 64}})
+        return mission_id
+
+    def review(self):
+        return self.lifecycle.dispatch("review")
+
+    def candidates(self):
+        # The lifecycle owns the schema, so asking it is what makes "no
+        # release candidates" different from "no table yet".
+        release.ReleaseLifecycle(self.lifecycle.store)
+        with self.lifecycle.store.transaction() as db:
+            return [dict(row) for row in
+                    db.execute("SELECT * FROM release_candidates")]
+
+    # -- refusals, and what they leave behind ----------------------------- #
+
+    def test_a_review_before_any_product_mission_refuses(self):
+        self.ready()
+        result = self.review()
+
+        self.assertFalse(result.ok)
+        self.assertEqual(result.details["code"], "PRODUCT_MISSION_ABSENT")
+
+    def test_an_unfinished_product_mission_seals_nothing(self):
+        self.ready()
+        self.assertTrue(self.submit().ok)
+
+        result = self.review()
+
+        self.assertFalse(result.ok)
+        self.assertEqual(result.details["code"], "PRODUCT_MISSION_UNFINISHED")
+        self.assertEqual(self.candidates(), [])
+
+    def test_a_candidate_that_rewrote_its_own_gate_source_is_refused(self):
+        """The one QA question durable state can answer, and it must bite.
+
+        The gates run from the candidate's own checkout, so a provider that
+        relaxed the script it is judged by would pass gates that no longer mean
+        what the contract declared -- with every other record still green.
+        """
+
+        self.ready()
+        self.assertTrue(self.submit().ok)
+        self.finish_the_product_mission(
+            changed_paths=("public/index.html", "dev"))
+
+        result = self.review()
+
+        self.assertFalse(result.ok)
+        self.assertEqual(result.details["code"], "DECISION_BOUNDARY_VIOLATED")
+        self.assertEqual(self.candidates(), [])
+        refused = [row for row in self.lifecycle.store.coordination(None, limit=50)
+                   if row.get("reason") == "FACTORY_PRODUCT_QA_REFUSED"]
+        self.assertEqual(len(refused), 1)
+        self.assertEqual(refused[0]["detail"]["violations"], ["dev"])
+
+    def test_an_unrecorded_change_set_cannot_certify_the_boundary(self):
+        """Absent is not clean: an unanswerable question is not a pass."""
+
+        self.ready()
+        self.assertTrue(self.submit().ok)
+        self.finish_the_product_mission(changed_paths=None)
+
+        result = self.review()
+
+        self.assertFalse(result.ok)
+        self.assertEqual(result.details["code"], "DECISION_BOUNDARY_VIOLATED")
+        self.assertEqual(self.candidates(), [])
+
+    # -- the review itself ------------------------------------------------ #
+
+    def test_a_finished_mission_becomes_a_sealed_reviewable_candidate(self):
+        self.ready()
+        self.assertTrue(self.submit().ok)
+        mission_id = self.finish_the_product_mission()
+
+        result = self.review()
+
+        self.assertTrue(result.ok, result.render())
+        self.assertEqual(result.state, "review-ready")
+        self.assertEqual(result.details["rc_id"],
+                         "rc-lodus-casino-" + self.CANDIDATE[:12])
+        self.assertEqual(result.details["candidate_sha"], self.CANDIDATE)
+        self.assertEqual(result.details["decision_boundary"], "held")
+        self.assertTrue(result.details["artifact_digest"].startswith("sha256:"))
+        self.assertEqual(result.details["review_url"], self.config.review_url)
+
+        rows = self.candidates()
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["candidate_sha"], self.CANDIDATE)
+        self.assertEqual(rows[0]["artifact_digest"],
+                         result.details["artifact_digest"])
+        self.assertEqual(json.loads(rows[0]["qa_refs_json"]),
+                         ["qa://%s/decision-boundary" % mission_id])
+
+    def test_the_reviewed_bytes_are_the_sealed_artifacts_own(self):
+        """Not the working copy and not a fresh checkout: the sealed archive.
+
+        The package's own invariant is that the promoted digest equals the
+        validated one, which is only true if the Owner reviews the bytes the
+        identity was taken over.
+        """
+
+        self.ready()
+        self.assertTrue(self.submit().ok)
+        self.finish_the_product_mission()
+
+        result = self.review()
+
+        served = Path(result.details["review_root"])
+        self.assertTrue((served / "index.html").is_file())
+        self.assertIn(self.CANDIDATE, (served / "index.html").read_text())
+
+    def test_an_archive_that_escapes_itself_is_refused(self):
+        """Planted, because a guard nobody has seen fire is not a guard.
+
+        The archive is the Factory's own canonical repack, which is exactly why
+        this is checked rather than trusted: the check is what makes that a
+        property instead of an assumption.
+        """
+
+        import io
+        import tarfile
+
+        self.ready()
+        self.assertTrue(self.submit().ok)
+        self.finish_the_product_mission()
+        hostile = Path(self.temp.name) / "hostile.tar"
+        with tarfile.open(hostile, "w") as archive:
+            body = b"x"
+            info = tarfile.TarInfo("public/../../escaped")
+            info.size = len(body)
+            archive.addfile(info, io.BytesIO(body))
+        report = {"archive_path": str(hostile), "publish_prefix": "public/"}
+
+        with self.assertRaises(Exception) as caught:
+            self.lifecycle._materialize_review(report, "sha256:" + "a" * 64)
+        self.assertEqual(caught.exception.code, "REVIEW_ARTIFACT_UNSAFE")
+
+    def test_the_review_environment_is_registered_by_provisioning(self):
+        """The environment the contract names, which nothing used to create."""
+
+        self.ready()
+        self.assertTrue(self.submit().ok)
+        policy = self.lifecycle.production.environment(
+            CONTRACT.review_environment_id)
+
+        self.assertEqual(policy.environment_class, "staging")
+        self.assertEqual(policy.project_id, "lodus-casino")
+        self.assertEqual(policy.state, "enabled")
+        self.assertTrue(policy.autonomous)
+
+    def test_the_production_environment_is_deliberately_not_registered(self):
+        """It is gated and unreachable until an Owner Validation exists."""
+
+        self.ready()
+        self.assertTrue(self.submit().ok)
+        with self.assertRaises(Exception):
+            self.lifecycle.production.environment(
+                CONTRACT.production_environment_id)
+
+    def test_reviewing_twice_seals_one_candidate_and_deploys_once(self):
+        self.ready()
+        self.assertTrue(self.submit().ok)
+        self.finish_the_product_mission()
+
+        first = self.review()
+        second = self.review()
+
+        self.assertTrue(second.ok, second.render())
+        self.assertEqual(first.details["rc_id"], second.details["rc_id"])
+        self.assertEqual(first.details["artifact_digest"],
+                         second.details["artifact_digest"])
+        self.assertEqual(first.details["deployment_ref"],
+                         second.details["deployment_ref"])
+        self.assertEqual(len(self.candidates()), 1)
+        with self.lifecycle.store.transaction() as db:
+            deployments = db.execute("SELECT COUNT(*) n FROM deployments"
+                                     " WHERE project_id='lodus-casino'").fetchone()["n"]
+        self.assertEqual(deployments, 1)
+
+    def test_the_review_is_recorded_as_an_owner_act(self):
+        self.ready()
+        self.assertTrue(self.submit().ok)
+        self.finish_the_product_mission()
+        result = self.review()
+
+        acts = [row for row in self.lifecycle.store.coordination(None, limit=100)
+                if row.get("reason") == "FACTORY_OWNER_ACTION"
+                and row["detail"].get("action") == "review"]
+        self.assertEqual(len(acts), 1)
+        self.assertEqual(acts[0]["detail"]["rc_id"], result.details["rc_id"])
+
+    def test_the_review_surface_is_a_local_target_the_contract_accepts(self):
+        """`release._surface` takes HTTPS or explicit loopback and nothing else."""
+
+        from factory_controller import release as release_mod
+
+        self.assertEqual(release_mod._surface(self.config.review_url),
+                         self.config.review_url)
+
+    def test_a_review_never_touches_the_mission_it_releases(self):
+        self.ready()
+        self.assertTrue(self.submit().ok)
+        mission_id = self.finish_the_product_mission()
+        before = dict(self.lifecycle.store.get(mission_id))
+
+        self.review()
+
+        self.assertEqual(dict(self.lifecycle.store.get(mission_id)), before)
 
 
 if __name__ == "__main__":
