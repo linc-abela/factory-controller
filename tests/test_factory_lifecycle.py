@@ -81,6 +81,9 @@ class FakeHost:
         # exactly what the internal portfolio does not have.
         self.extra_projects = []
         self.extra_profiles = []
+        # What the revision seam was asked for, and what it may refuse with.
+        self.revision_requests = []
+        self.revision_error = None
         # What the prototype lab's own gates say at the frozen baseline,
         # copied from a real run of them: two tests, five of five labels
         # linked, no false matches.  The improvement slot measures its
@@ -197,7 +200,46 @@ class FakeHost:
             }))
         if arguments[:2] == ("artifact", "build"):
             return self._artifact(arguments)
+        if arguments[:2] == ("revision", "base"):
+            return self._revision(arguments)
         return HostCommandResult(127, "", "unknown Bridge command")
+
+    def _revision(self, arguments):
+        """A derived commit id, because the Controller must not mint one.
+
+        The real module commits the predecessor's mission statement with the
+        caller's text appended.  What matters on this side of the seam is that
+        the id is a function of the predecessor and the text, so a repeated
+        Owner command lands on one base -- the same property the real one has.
+        """
+
+        import hashlib
+
+        project_id, predecessor = arguments[2], arguments[3]
+        ref = arguments[arguments.index("--ref") + 1]
+        path = arguments[arguments.index("--mission-file") + 1]
+        if project_id not in self.checkouts:
+            return HostCommandResult(1, "", "unknown project")
+        if self.revision_error is not None:
+            return HostCommandResult(2, json.dumps(self.revision_error), "")
+        addendum = Path(path).read_text()
+        self.revision_requests.append(
+            {"predecessor_sha": predecessor, "ref": ref, "addendum": addendum})
+        seed = ("%s|%s" % (predecessor, addendum)).encode()
+        return HostCommandResult(0, json.dumps({
+            "schema_version": "factory.bridge.revision_base.v1",
+            "project_id": project_id,
+            "repository_remote_url":
+                "https://github.com/linc-abela/%s.git" % project_id,
+            "predecessor_sha": predecessor,
+            "revision_sha": hashlib.sha1(seed).hexdigest(),
+            "ref": ref, "mission_path": arguments[
+                arguments.index("--mission-path") + 1],
+            "mission_digest": "sha256:" + hashlib.sha256(
+                addendum.encode()).hexdigest(),
+            "mission_bytes": len(addendum.encode()),
+            "created": True,
+        }))
 
     def _artifact(self, arguments):
         """A real archive, because the review path really unpacks one.

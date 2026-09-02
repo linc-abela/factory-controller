@@ -396,12 +396,12 @@ def parser() -> argparse.ArgumentParser:
         "factory", help="the bounded Owner install/start/run/stop/status surface")
     factory_parser.add_argument(
         "factory_action",
-        choices=("install", "start", "run", "product", "review", "cycle",
-                 "stop", "status"))
+        choices=("install", "start", "run", "product", "revise", "review",
+                 "cycle", "stop", "status"))
     factory_parser.add_argument(
         "--package", type=Path,
         help="the Product Candidate Package to submit; required by 'product' "
-             "and used by nothing else")
+             "and by 'revise', and used by nothing else")
     factory_parser.add_argument(
         "--watch", action="store_true",
         help="keep observing status until completion, attention, or Ctrl+C")

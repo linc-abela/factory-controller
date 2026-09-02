@@ -26,6 +26,11 @@ DECISIONS = frozenset({"resolved", "open"})
 INVESTMENT_DECISIONS = frozenset({"build", "hold", "reject"})
 RISK_LEVELS = frozenset({"low", "medium", "high", "critical"})
 SHA256 = re.compile(r"^[0-9a-f]{64}$")
+SHA1 = re.compile(r"^[0-9a-f]{40}$")
+#: The one Owner Validation decision a revision can descend from.  A package
+#: claiming to supersede a release the Owner accepted is a different act with a
+#: different authority, and it is not this one.
+RETURN_FOR_CHANGES = "RETURN_FOR_CHANGES"
 PACKAGE_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$")
 
 _TOP_LEVEL = frozenset({
@@ -34,7 +39,7 @@ _TOP_LEVEL = frozenset({
     "decision_ledger", "outcome_criteria", "scope", "required_capabilities",
     "authority", "investment_decision", "evidence", "recommendation",
     "production_readiness_hints", "non_functional_preferences",
-    "sequencing_preference", "known_risks",
+    "sequencing_preference", "known_risks", "revision",
 })
 _REQUIRED = (
     "package_id", "schema_version", "package_version", "supersedes", "origin",
@@ -121,6 +126,51 @@ def _authority_value(value: Any, field: str) -> None:
     _refuse("PCP_AUTHORITY_INVALID", "%s must carry a value or absence" % field)
 
 
+def _revision(value: dict[str, Any], version: int) -> None:
+    """What a superseding package must say about the release it supersedes.
+
+    ``supersedes`` names the predecessor *package*, which is a product fact and
+    was always enough for version 1.1.0.  It is not enough for a revision that
+    a Factory will build: the work descends from a specific rejected candidate
+    the Owner looked at, and a revision that cannot name it would silently
+    rebuild from whatever baseline the run contract still pins -- an unrelated
+    commit, and the rejected bytes lost.
+
+    So a revision names four things: the Release Candidate reviewed, the
+    candidate commit inside it, the Owner Validation that returned it, and the
+    changes the Owner asked for.  Each is checked against durable state by the
+    caller; what is checked here is only that the package says them.
+    """
+
+    body = value.get("revision")
+    if version == 1:
+        if body is not None:
+            _refuse("PCP_REVISION_INVALID",
+                    "version 1 is not a revision of anything")
+        value.pop("revision", None)
+        return
+    if not isinstance(body, Mapping) or set(body) != {
+            "predecessor_rc", "predecessor_candidate_sha",
+            "owner_validation_id", "owner_decision", "requested_changes"}:
+        _refuse("PCP_REVISION_INVALID",
+                "a superseding package must carry a complete revision block")
+    _text(body["predecessor_rc"], "revision.predecessor_rc", limit=128)
+    _text(body["owner_validation_id"], "revision.owner_validation_id", limit=128)
+    if not isinstance(body["predecessor_candidate_sha"], str) \
+            or not SHA1.fullmatch(body["predecessor_candidate_sha"]):
+        _refuse("PCP_REVISION_INVALID",
+                "revision.predecessor_candidate_sha is a full commit id")
+    if body["owner_decision"] != RETURN_FOR_CHANGES:
+        _refuse("PCP_REVISION_INVALID",
+                "a revision descends from %s and from nothing else"
+                % RETURN_FOR_CHANGES)
+    changes = _list(body["requested_changes"], "revision.requested_changes")
+    if len(changes) > 64:
+        _refuse("PCP_REVISION_INVALID", "too many requested changes")
+    for item in changes:
+        _text(item, "revision.requested_changes", limit=2048)
+
+
 def validate(package: Mapping[str, Any]) -> dict[str, Any]:
     """Validate one PCP against the v1.1.0 contract and return a frozen copy."""
 
@@ -145,6 +195,7 @@ def validate(package: Mapping[str, Any]) -> dict[str, Any]:
         _refuse("PCP_SUPERSESSION_INVALID", "version 1 must not supersede another package")
     if version > 1 and not isinstance(value["supersedes"], str):
         _refuse("PCP_SUPERSESSION_INVALID", "a superseding package must name its predecessor")
+    _revision(value, version)
     _text(value["origin"], "origin", limit=128)
     _text(value["authored_by"], "authored_by", limit=256)
     _text(value["created_at"], "created_at", limit=128)
@@ -298,8 +349,16 @@ def intake(package: Mapping[str, Any]) -> PCPIntake:
         for check_id in ("C-1", "C-2", "C-3", "C-4", "C-5", "C-6", "C-7",
                          "C-8", "C-9", "C-11", "C-12")
     )
+    revision = value.get("revision")
+    # A revision is a new mission, not a second run of the first one.  The
+    # work item id is the mission identity everything downstream derives from
+    # -- the idempotency key, the manifest, the admission document -- so a
+    # revision that reused `<package_id>:build` would either be refused as a
+    # duplicate or, worse, mutate the record of the build the Owner rejected.
+    work_item_id = ("%s:revision:%d" % (value["package_id"], value["package_version"])
+                    if revision else "%s:build" % value["package_id"])
     mission = {
-        "work_item_id": "%s:build" % value["package_id"],
+        "work_item_id": work_item_id,
         "product_id": value["package_id"],
         "capability": "development",
         "environment_class": "staging",
@@ -308,6 +367,7 @@ def intake(package: Mapping[str, Any]) -> PCPIntake:
         "objective": value["outcome_criteria"][0]["statement"],
         "required_capabilities": value["required_capabilities"],
         "open_decisions": [item["decision_id"] for item in open_decisions],
+        **({} if not revision else {"revision": dict(revision)}),
     }
     return PCPIntake(
         package_id=value["package_id"],

@@ -19,6 +19,8 @@ import sys
 import tarfile
 import tempfile
 import time
+import urllib.error
+import urllib.request
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable, Mapping, Sequence
@@ -31,6 +33,7 @@ from . import dogfood
 from . import dogfood_improvement
 from . import dogfood_intake
 from . import improvement
+from . import pcp
 from . import portfolio
 from . import product
 from . import production
@@ -83,6 +86,11 @@ PRODUCT_LIFECYCLE = {
     "cancelled": "cancelled",
     "escalated": "stopped after the provider started",
 }
+
+#: How long the Owner's own review surface gets to answer a probe of itself.
+#: It is a loopback web root served by a container on this host, so a slow
+#: answer is a stopped surface rather than a busy one.
+REVIEW_PROBE_TIMEOUT_SECONDS = 10.0
 
 DEFAULT_WATCH_INTERVAL_SECONDS = 30.0
 AUTOPILOT_WORKER_ID = "factory-autopilot"
@@ -314,6 +322,8 @@ class FactoryLifecycle:
         try:
             if action == "product":
                 return self.product(options.get("package"))
+            if action == "revise":
+                return self.revise(options.get("package"))
             if action == "install":
                 return self.install()
             if action == "start":
@@ -639,6 +649,218 @@ class FactoryLifecycle:
             },
         )
 
+    def revise(self, package_path: Any) -> FactoryResult:
+        """Return the reviewed release for changes, and open the revision.
+
+        One command, because it is one Owner act.  Splitting it would leave a
+        state in which the release the Owner rejected is recorded as rejected
+        and nothing is being done about it -- and it would put the Owner in
+        the position of having to know that a second command exists, which is
+        the loop ``review`` was written to end.
+
+        What it does, in order, and none of it invented here: it confirms the
+        superseding package really names the release that was reviewed, it
+        observes the review surface rather than accepting a claim about it, it
+        records the Owner's decision against that exact deployment, it asks
+        the execution layer for a revision base descending from the rejected
+        candidate, and it submits one new mission through the same seam every
+        other mission uses.
+
+        It is safe to repeat.  Every step is idempotent on an identity derived
+        from the package and the release it supersedes: the same command run
+        twice records one decision, opens one base, and admits one mission.
+        """
+
+        self._require_owner()
+        if not package_path:
+            raise FactoryRefusal(
+                "PRODUCT_PACKAGE_REQUIRED",
+                "Name the superseding Product Candidate Package: "
+                "'./dev factory revise --package <path>'.")
+        contract = self._product_contract()
+        try:
+            _, accepted = product.package_from(package_path)
+            superseded = product.revision_of(accepted)
+            if superseded is None:
+                raise FactoryRefusal(
+                    "PRODUCT_NOT_A_REVISION",
+                    "That package supersedes nothing, so it is a first build. "
+                    "Submit it with './dev factory product --package <path>'.")
+        except product.ProductRefusal as refusal:
+            raise FactoryRefusal(refusal.code, refusal.detail) from None
+
+        lifecycle = release.ReleaseLifecycle(self.store, clock=self.clock)
+        try:
+            rejected = lifecycle.candidate(superseded["predecessor_rc"])
+        except release.ReleaseRefusal as refusal:
+            raise FactoryRefusal(
+                refusal.code,
+                "The release this package supersedes is not one this Factory "
+                "sealed (%s)." % refusal.detail) from None
+        if rejected.candidate_sha != superseded["predecessor_candidate_sha"]:
+            raise FactoryRefusal(
+                "REVISION_PREDECESSOR_MISMATCH",
+                "The package names a different candidate than the release it "
+                "supersedes actually holds.")
+        if rejected.project_id != contract.project_id:
+            raise FactoryRefusal(
+                "REVISION_PROJECT_MISMATCH",
+                "The release this package supersedes belongs to another "
+                "product.")
+        deployment = self._review_deployment(rejected.rc_id)
+
+        grant = self.shift.grant()
+        control = self.supervisor.control()
+        if grant is None or control.get("state") != "running" \
+                or not self._service_loaded(self.config.supervisor_label):
+            raise FactoryRefusal(
+                "FACTORY_NOT_READY",
+                "The Factory is not running. Run './dev factory start' first.")
+        doctor = self._bridge_doctor()
+        self._check_primary_and_containment(contract, doctor)
+        if not self._service_loaded(self.config.bridge_label) \
+                or not self._bridge_is_healthy(doctor):
+            code, detail = self._bridge_problem(doctor)
+            raise FactoryRefusal(code, detail)
+
+        # The Owner's decision, against the exact deployment they looked at.
+        # The health it requires is measured here rather than asserted, and a
+        # deployment that has already settled is left alone: a second run of
+        # this command must not re-observe a fact the ledger already holds.
+        if self.production.deployment(
+                deployment["deployment_id"])["state"] == "verifying":
+            self.production.record_health(
+                deployment["deployment_id"],
+                self._probe_review_surface(
+                    contract, rejected, deployment["validation_surface"]))
+        try:
+            validation = lifecycle.record_owner_validation(
+                superseded["owner_validation_id"], rejected.rc_id,
+                deployment_ref=deployment["deployment_ref"],
+                decision=pcp.RETURN_FOR_CHANGES,
+                decided_by=self.owner.username,  # type: ignore[union-attr]
+                decided_at=self.clock(),
+                notes="superseded by %s (%s)"
+                      % (accepted.mission["source_pcp"], accepted.package_digest))
+        except release.ReleaseRefusal as refusal:
+            raise FactoryRefusal(refusal.code, refusal.detail) from None
+
+        base = self._open_revision_base(contract, accepted, rejected)
+        try:
+            mission = product.mission_for(contract, accepted,
+                                          baseline_sha=base["revision_sha"])
+            brief = product.brief(contract, accepted)
+        except product.ProductRefusal as refusal:
+            raise FactoryRefusal(refusal.code, refusal.detail) from None
+
+        approval_ref = self._approval_reference(
+            "%s-%s" % (contract.run_ref, accepted.package_digest[:12]))
+        act = product.owner_act(
+            contract, accepted, owner=self.owner.username,  # type: ignore[union-attr]
+            approval_ref=approval_ref,
+            at=dogfood_intake.iso_utc(self.clock()))
+        self._record_owner_act("revise", approval_ref, {
+            "package_id": act["package_id"],
+            "package_digest": act["package_digest"],
+            "work_item_id": act["work_item_id"],
+            "act_hash": act["act_hash"],
+            "predecessor_rc": rejected.rc_id,
+            "predecessor_candidate_sha": rejected.candidate_sha,
+            "owner_validation_id": validation.validation_id,
+            "revision_sha": base["revision_sha"]})
+        self._write_mission_file(mission.mission_ref, "owner-intake", act)
+
+        self._refresh_capacity(contract)
+        doctor, _ = self._admit_capability(
+            self.config.bridge_root / "contracts" / contract.capability_request,
+            contract, doctor, approval_ref)
+        self._provision_product_store(contract, doctor)
+        self._bootstrap_service(self._install_supervisor_definition())
+
+        intake = self._materialize(
+            contract, None, mission, doctor, grant, brief=brief,
+            portfolio_ref=contract.run_ref,
+            corpus_identity="package://%s@%s" % (accepted.mission["source_pcp"],
+                                                 accepted.package_digest))
+        try:
+            submitted, created = self.controller.submit(
+                intake.payload, intake.idempotency_key)
+        except Exception as exc:  # noqa: BLE001
+            raise FactoryRefusal(
+                "REVISION_NOT_SUBMITTED",
+                "The revision mission could not be submitted. Retry the "
+                "command.") from exc
+
+        return FactoryResult(
+            action="revise", ok=True,
+            state="submitted" if created else "already-submitted",
+            lines=("RELEASE RETURNED FOR CHANGES",
+                   "Returned: %s, which stays sealed and is not promoted."
+                   % rejected.rc_id,
+                   "Revision: %s, built from the candidate you reviewed."
+                   % mission.mission_ref,
+                   "Submitted %s. This mission was %s."
+                   % (accepted.mission["source_pcp"],
+                      "admitted now" if created
+                      else "already admitted; nothing was duplicated"),
+                   "The Factory owns execution from here. Watch it with "
+                   "'./dev factory status --watch'."),
+            details={
+                "mission_id": submitted.get("id"),
+                "work_item_id": mission.mission_ref,
+                "package_id": accepted.package_id,
+                "package_version": accepted.package_version,
+                "package_digest": accepted.package_digest,
+                "idempotency_key": intake.idempotency_key,
+                "context_manifest_hash": intake.context_manifest_hash,
+                "predecessor_rc": rejected.rc_id,
+                "predecessor_candidate_sha": rejected.candidate_sha,
+                "predecessor_artifact_digest": rejected.artifact_digest,
+                "owner_validation_id": validation.validation_id,
+                "owner_decision": validation.decision,
+                "revision_sha": base["revision_sha"],
+                "revision_ref": base["ref"],
+                "baseline_sha": mission.baseline_sha,
+                "approval_ref": approval_ref,
+                "owner_act_hash": act["act_hash"],
+                "created": created,
+            },
+        )
+
+    def _open_revision_base(self, contract, accepted, rejected) -> dict[str, Any]:
+        """Ask the execution layer for the commit the revision starts from.
+
+        The Controller does not touch Git, so the predecessor link is made
+        where it can be proven: a real commit whose parent is the rejected
+        candidate, carrying that candidate's own mission statement with the
+        Owner's requested changes appended to it.  What travels from here is
+        the package's text and nothing else.
+        """
+
+        addendum = self._mission_path(
+            accepted.mission["work_item_id"], "revision-request")
+        try:
+            self.config.mission_dir.mkdir(parents=True, exist_ok=True)
+            addendum.write_text(product.revision_addendum(accepted))
+            os.chmod(addendum, 0o600)
+        except (OSError, product.ProductRefusal):
+            raise FactoryRefusal(
+                "REVISION_NOT_RECORDED",
+                "The revision request could not be recorded safely. Retry the "
+                "command.") from None
+        _, report = self._bridge_json(
+            "revision", "base", contract.project_id, rejected.candidate_sha,
+            "--mission-path", contract.mission_statement_path,
+            "--mission-file", str(addendum),
+            "--ref", product.revision_ref(accepted))
+        if report.get("refused") or not isinstance(report.get("revision_sha"), str):
+            raise FactoryRefusal(
+                str(report.get("code") or "REVISION_BASE_NOT_OPENED"),
+                str(report.get("detail")
+                    or "The execution layer could not open a revision base "
+                       "from the candidate you reviewed."))
+        return report
+
     def review(self) -> FactoryResult:
         """Take the completed product mission to a reviewable Release Candidate.
 
@@ -890,6 +1112,88 @@ class FactoryLifecycle:
             # surface is told the resolved path either way.
             pass
         return served
+
+    def _review_deployment(self, rc_id: str) -> dict[str, Any]:
+        """The exact review deployment the Owner looked at, or a refusal."""
+
+        try:
+            with self.store.transaction() as db:
+                row = db.execute(
+                    "SELECT * FROM release_deployments WHERE rc_id=?"
+                    " AND environment_class='staging'", (rc_id,)).fetchone()
+                promoted = db.execute(
+                    "SELECT deployment_ref FROM release_deployments WHERE rc_id=?"
+                    " AND environment_class='production'", (rc_id,)).fetchone()
+        except Exception:  # noqa: BLE001
+            row = promoted = None
+        if row is None:
+            raise FactoryRefusal(
+                "REVIEW_DEPLOYMENT_NOT_FOUND",
+                "That release was never prepared for review, so there is no "
+                "review of it to decide. Run './dev factory review' first.")
+        if promoted is not None:
+            # A revision supersedes something the Owner turned away.  A
+            # release that reached Production is a different object with a
+            # different lifecycle, and returning it "for changes" here would
+            # leave live bytes with no record of what happened to them.
+            raise FactoryRefusal(
+                "RELEASE_ALREADY_PROMOTED",
+                "That release is already in Production. A change to it is a "
+                "new release decision, not a revision of a review.")
+        return dict(row)
+
+    def _probe_review_surface(self, contract, rc, surface: str):
+        """Observe the Owner's own review surface, and never assert it.
+
+        Owner Validation requires the exact review deployment to be durably
+        healthy, and until now the only way to make it so was an operator
+        passing check counts on the command line -- a number a person types,
+        standing in for a fact about a running surface.  The surface is a
+        loopback web root on this host serving bytes this Factory unpacked
+        from the digest it sealed, so the fact is directly observable and
+        there is no reason to accept a claim instead.
+
+        Two checks, and both are about *this* release: the surface answers,
+        and what it answers with is byte-identical to the sealed artifact's
+        own entry document.  A surface that is not running, or is serving some
+        other release, produces no health record at all -- the deployment
+        stays where it is and the Owner is told which command starts it.
+        Recording a failed observation instead would settle the deployment
+        permanently on a fact about the host, and the review could never be
+        completed afterwards.
+        """
+
+        root = self.config.state_dir / "review" / rc.artifact_digest.split(":", 1)[-1]
+        prefix = contract.publish_prefix.strip("/")
+        entry = (root / prefix if prefix else root) / "index.html"
+        try:
+            expected = entry.read_bytes()
+        except OSError:
+            raise FactoryRefusal(
+                "REVIEW_BYTES_UNAVAILABLE",
+                "The reviewed release is no longer unpacked on this host. Run "
+                "'./dev factory review' again, then repeat this command."
+            ) from None
+        try:
+            with urllib.request.urlopen(
+                    surface, timeout=REVIEW_PROBE_TIMEOUT_SECONDS) as answer:
+                status = getattr(answer, "status", None) or answer.getcode()
+                observed = answer.read(len(expected) + 1)
+        except (urllib.error.URLError, OSError, ValueError):
+            raise FactoryRefusal(
+                "REVIEW_SURFACE_UNREACHABLE",
+                "The review surface is not running, so the Factory cannot "
+                "confirm what you looked at. Start it with './dev review up' "
+                "and run this command again.") from None
+        if status != 200 or observed != expected:
+            raise FactoryRefusal(
+                "REVIEW_SURFACE_MISMATCH",
+                "The review surface is not serving the release being decided. "
+                "Run './dev factory review' and './dev review up' again.")
+        return production.HealthRecord(
+            checks_passed=2, checks_failed=0,
+            evidence_ref="review-probe://%s@%s" % (rc.rc_id, rc.artifact_digest),
+            observed_at=self.clock())
 
     def _provision_product_store(self, contract, doctor) -> None:
         """Give the product project the same durable policy a lab project has.
@@ -1556,10 +1860,49 @@ class FactoryLifecycle:
         else:
             summary_state = "pending"
         lines.extend(self._review_lines(mission, state))
+        lines.extend(self._lineage_lines(mission))
         history = self._dogfood_history_note()
         if history is not None:
             lines.append(history)
         return tuple(lines), summary_state
+
+    def _lineage_lines(self, mission) -> tuple[str, ...]:
+        """What the Owner already decided about this product, and about what.
+
+        A second product mission looks exactly like the first one on a surface
+        that reads only the latest row, and the difference is the whole point:
+        one is a build and the other is a revision of a release the Owner
+        turned away.  So the releases that were returned are named here beside
+        the mission that supersedes them, and every line is read from the
+        release plane's own immutable rows.
+        """
+
+        try:
+            with self.store.transaction() as db:
+                returned = db.execute(
+                    "SELECT v.rc_id, v.candidate_sha, v.decided_at, c.project_id"
+                    " FROM owner_validations v"
+                    " JOIN release_candidates c ON c.rc_id = v.rc_id"
+                    " WHERE v.decision=? AND c.project_id=?"
+                    " ORDER BY v.decided_at",
+                    ("RETURN_FOR_CHANGES", mission["project_id"])).fetchall()
+        except Exception:  # noqa: BLE001
+            # Nothing has ever been released for this product, so the release
+            # plane has not created its tables yet.  Reading is all this does.
+            return ()
+        if not returned:
+            return ()
+        lines = ["Returned for changes: %s at candidate %s; it stays sealed "
+                 "and is not promoted." % (row["rc_id"], row["candidate_sha"][:12])
+                 for row in returned]
+        payload = mission.get("payload") or {}
+        work_item = payload.get("work_item_id") or ""
+        baseline = payload.get("baseline_sha")
+        if ":revision:" in str(work_item) and isinstance(baseline, str):
+            lines.append(
+                "Revision lineage: %s builds from %s, which descends from the "
+                "candidate you reviewed." % (work_item, baseline[:12]))
+        return tuple(lines)
 
     def _review_lines(self, mission, state: str) -> tuple[str, ...]:
         """Where a finished product stands on the way to the Owner's judgement.
