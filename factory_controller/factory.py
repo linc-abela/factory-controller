@@ -2647,16 +2647,36 @@ class FactoryLifecycle:
             raise FactoryRefusal(
                 "SANDBOX_CONTAINMENT_UNAVAILABLE",
                 "macOS sandbox containment is unavailable. Check system security settings.")
+        if not self._ready_profiles(contract, doctor):
+            display = " or ".join(sorted(
+                {self._display_profile(profile)
+                 for profile in contract.provider_profiles}))
+            raise FactoryRefusal(
+                "PRIMARY_PROVIDER_UNAVAILABLE",
+                "%s is unavailable. Complete its sign-in, then retry start."
+                % display)
+
+    def _ready_profiles(self, contract, doctor) -> tuple[str, ...]:
+        """The declared runtimes that would accept work right now.
+
+        One usable runtime is what a mission needs, and a contract that
+        declares alternatives is declaring exactly that -- so requiring every
+        declared profile to be ready turns a failover into a second hard
+        dependency, and the Factory refuses work it could do because the
+        runtime it was not going to use is signed out.
+
+        Which of the ready ones runs is not decided here.  The execution
+        layer walks its own profiles in priority order and falls over only on
+        its pre-spawn unavailability fact; this reports what it observed and
+        nothing more.  No number about how much of a subscription is left
+        exists anywhere on this path, because no runtime here reports one.
+        """
+
         profiles = (doctor.get("provider") or {}).get("profiles")
         by_id = {row.get("profile_id"): row for row in (profiles or ())
                  if isinstance(row, Mapping)}
-        unavailable = [profile for profile in contract.provider_profiles
-                       if by_id.get(profile, {}).get("readiness") != "available"]
-        if unavailable:
-            display = self._display_profile(unavailable[0])
-            raise FactoryRefusal(
-                "PRIMARY_PROVIDER_UNAVAILABLE",
-                "%s is unavailable. Complete its sign-in, then retry start." % display)
+        return tuple(profile for profile in contract.provider_profiles
+                     if by_id.get(profile, {}).get("readiness") == "available")
 
     @staticmethod
     def _display_profile(profile: str) -> str:
@@ -2730,7 +2750,20 @@ class FactoryLifecycle:
         serving = set((doctor.get("capability_admissions") or {}).get("serving")
                       or doctor.get("capabilities") or ())
         requested_capability = payload.get("capability")
-        if requested_capability not in serving:
+        # Serving the capability is not the same fact as serving it through
+        # the runtimes this request names.  An admission is recorded per
+        # profile, so a second declared runtime added to an already-served
+        # capability would never be admitted and would silently serve nothing
+        # -- the failover would exist in the registry and nowhere else.
+        #
+        # Widening happens on evidence of a gap, never on the absence of an
+        # answer: a base capability the execution layer serves without any
+        # admission at all reports no admitted profiles, and re-admitting it
+        # on every command would make this verb non-idempotent for a posture
+        # that was never narrow.
+        admitted = self._admitted_profiles(doctor, requested_capability)
+        if requested_capability not in serving \
+                or (admitted and not set(requested_profiles) <= admitted):
             result, applied = self._bridge_json(
                 "capability", "admit", "-", input_text=request_body)
             if result.returncode != 0 or applied.get("outcome") not in {
@@ -2745,6 +2778,17 @@ class FactoryLifecycle:
             self._reload_bridge()
         return self._bridge_doctor(), preview
 
+    @staticmethod
+    def _admitted_profiles(doctor: Mapping[str, Any], capability: Any) -> set:
+        """Which runtimes the execution layer admits for one capability."""
+
+        admissions = (doctor.get("capability_admissions") or {}).get("admissions")
+        admitted = set()
+        for row in admissions or ():
+            if isinstance(row, Mapping) and row.get("capability") == capability:
+                admitted.update(str(name) for name in (row.get("profiles") or ()))
+        return admitted
+
     def _reload_bridge(self) -> dict[str, Any]:
         """Restart the Bridge service so it binds the files that are here now."""
 
@@ -2757,28 +2801,48 @@ class FactoryLifecycle:
         return self._bridge_doctor()
 
     def _refresh_capacity(self, contract):
+        """Observe every declared runtime; require that one of them is usable.
+
+        Every profile is still observed and every observation is still
+        recorded, because a constrained runtime's own reading is what the
+        capacity plane narrows on later.  What changed is the refusal: a
+        contract that declares a failover is refused only when *none* of its
+        runtimes can take work, not when one of them cannot.
+        """
+
+        usable = []
         for profile in contract.provider_profiles:
-            result, status = self._bridge_json("capacity", "observe", profile)
+            try:
+                result, status = self._bridge_json("capacity", "observe", profile)
+            except FactoryRefusal:
+                # A runtime the execution layer cannot report on is not a
+                # usable runtime.  It is not the whole contract's failure
+                # either, which is the point of declaring more than one.
+                continue
             if result.returncode not in (0, 1) or status.get("state") != "fresh":
-                raise FactoryRefusal(
-                    "CAPACITY_UNAVAILABLE",
-                    "%s provider capacity is unavailable. Try again later."
-                    % self._display_profile(profile))
+                continue
             status["profile_id"] = profile
             try:
                 observation = capacity.observation_from_bridge_status(
                     status, self.clock(), runtime_id=profile)
             except (capacity.PolicyError, TypeError, ValueError):
                 observation = None
-            if observation is None or observation.state not in capacity.USABLE:
-                raise FactoryRefusal(
-                    "CAPACITY_UNAVAILABLE",
-                    "%s provider capacity is unavailable. Try again later."
-                    % self._display_profile(profile))
+            if observation is None:
+                continue
             latest = self.store.latest_observations().get(profile)
             if latest is None or (latest.observed_at, latest.source_ref) != \
                     (observation.observed_at, observation.source_ref):
                 self.store.observe_capacity(observation)
+            if observation.state in capacity.USABLE:
+                usable.append(profile)
+        if not usable:
+            display = " or ".join(sorted(
+                {self._display_profile(profile)
+                 for profile in contract.provider_profiles}))
+            raise FactoryRefusal(
+                "CAPACITY_UNAVAILABLE",
+                "%s provider capacity is unavailable. Try again later."
+                % display)
         return self.store.capacity_readings()
 
     # -- final bounded shift gate -------------------------------------- #

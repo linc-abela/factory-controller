@@ -63,8 +63,14 @@ class FakeHost:
         self.containment = True
         self.primary_ready = True
         self.capacity_fresh = True
+        # Profiles whose runtime reports a reading that is not usable. Per
+        # profile because a contract that declares a failover has to be
+        # testable against one constrained runtime and one that is not.
+        self.capacity_constrained = set()
         self.source_drift = False
         self.capability_admitted = False
+        # What the execution layer has been told to serve, per profile.
+        self.capability_admissions = []
         self.serving_drift = "none"
         self.loaded = {config.legacy_label}
         self.calls = []
@@ -178,8 +184,16 @@ class FakeHost:
                 "after": {"capabilities": ["prototype", "bug"]},
             }))
         if arguments == ("capability", "admit", "-"):
+            request = json.loads(input_text)
             self.capability_admitted = True
             self.capability_admits += 1
+            self.capability_admissions = [
+                row for row in self.capability_admissions
+                if row["capability"] != request["capability"]]
+            self.capability_admissions.append({
+                "capability": request["capability"],
+                "profiles": list(request.get("profiles") or ()),
+                "projects": list(request.get("projects") or ())})
             return HostCommandResult(0, json.dumps({"outcome": "admitted"}))
         if arguments[:1] == ("capacity",) and arguments[1:2] in (
                 ("observe",), ("status",)) and arguments[2:3] and (
@@ -187,12 +201,13 @@ class FakeHost:
                 or arguments[2] in {row["profile_id"] for row in self.extra_profiles}):
             if not self.capacity_fresh:
                 return HostCommandResult(1, json.dumps({"state": "absent"}))
+            constrained = arguments[2] in self.capacity_constrained
             return HostCommandResult(0, json.dumps({
                 "schema_version": "factory.bridge.capacity_observation.v1",
                 "profile_id": arguments[2],
                 "state": "fresh",
                 "classification": "available",
-                "quota_state": "available",
+                "quota_state": "exhausted" if constrained else "available",
                 "observed_at": self.observed_at,
                 "remaining_seconds": 3600,
                 "stale_after_seconds": 3600,
@@ -343,8 +358,17 @@ class FakeHost:
             "capabilities": ["prototype", "bug"] if self.capability_admitted
             else ["prototype"],
             "capability_admissions": {
-                "serving": ["prototype", "bug"] if self.capability_admitted
-                else ["prototype"],
+                # Derived from the admissions, as the real report is: a
+                # capability is served because something admitted it.
+                "serving": (["prototype"] + [
+                    row["capability"] for row in self.capability_admissions]
+                    if self.capability_admissions
+                    else ["prototype", "bug"] if self.capability_admitted
+                    else ["prototype"]),
+                # Per-profile, as the real report is: an admission names the
+                # runtimes it widened, and a second declared runtime is only
+                # served once one of these rows says so.
+                "admissions": list(self.capability_admissions),
             },
             "provider": {"profiles": [{
                 "profile_id": "codex-primary",

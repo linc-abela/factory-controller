@@ -78,10 +78,14 @@ class FactoryProductTests(unittest.TestCase):
             "resolution": "resolved", "capabilities": ["development"],
             "checkout": CHECKOUT,
         }]
-        self.host.extra_profiles = [{
-            "profile_id": "codex-product", "status": "available",
-            "readiness": "available",
-        }]
+        # Both product runtimes, because the contract now declares a failover
+        # and a harness that modelled one of them would test the wrong shape.
+        self.host.extra_profiles = [
+            {"profile_id": "codex-product", "status": "available",
+             "readiness": "available"},
+            {"profile_id": "claude-product", "status": "available",
+             "readiness": "available"},
+        ]
         self.lifecycle = FactoryLifecycle(
             Controller(MissionStore(root / "controller.db"), NoopAdapter()),
             config=self.config, runner=self.host,
@@ -259,7 +263,8 @@ class FactoryProductTests(unittest.TestCase):
                     if text and command[-3:-1] == ("capability", "admit")]
         self.assertEqual(self.host.capability_admits, admits_before + 1)
         self.assertEqual(requests[-1]["capability"], "development")
-        self.assertEqual(requests[-1]["profiles"], ["codex-product"])
+        self.assertEqual(requests[-1]["profiles"],
+                         ["codex-product", "claude-product"])
         self.assertEqual(requests[-1]["projects"], ["lodus-casino"])
         self.assertEqual(requests[-1]["authorized_by"], "owner")
 
