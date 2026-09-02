@@ -781,7 +781,8 @@ class FactoryLifecycle:
             contract, None, mission, doctor, grant, brief=brief,
             portfolio_ref=contract.run_ref,
             corpus_identity="package://%s@%s" % (accepted.mission["source_pcp"],
-                                                 accepted.package_digest))
+                                                 accepted.package_digest),
+            checkout=base["revision_checkout"])
         try:
             submitted, created = self.controller.submit(
                 intake.payload, intake.idempotency_key)
@@ -820,6 +821,7 @@ class FactoryLifecycle:
                 "owner_decision": validation.decision,
                 "revision_sha": base["revision_sha"],
                 "revision_ref": base["ref"],
+                "revision_checkout": base["revision_checkout"],
                 "baseline_sha": mission.baseline_sha,
                 "approval_ref": approval_ref,
                 "owner_act_hash": act["act_hash"],
@@ -859,6 +861,16 @@ class FactoryLifecycle:
                 str(report.get("detail")
                     or "The execution layer could not open a revision base "
                        "from the candidate you reviewed."))
+        # A base nothing can be grounded on is not a base this mission can be
+        # admitted from: the repository grounding is built from this path, and
+        # guessing one here would put the Controller back in the business of
+        # deciding which local copy a mission reads.
+        if not isinstance(report.get("revision_checkout"), str) \
+                or not report["revision_checkout"]:
+            raise FactoryRefusal(
+                "REVISION_CHECKOUT_NOT_OPENED",
+                "The execution layer opened a revision base but no checkout "
+                "the repository grounding could be read from.")
         return report
 
     def review(self) -> FactoryResult:
@@ -1630,7 +1642,8 @@ class FactoryLifecycle:
         return row["experiment_ref"]
 
     def _materialize(self, contract, entry, mission, doctor, grant, attempt=1,
-                     brief=None, *, portfolio_ref=None, corpus_identity=None):
+                     brief=None, *, portfolio_ref=None, corpus_identity=None,
+                     checkout=None):
         """Derive the whole mission, and refuse rather than guess any part.
 
         ``portfolio_ref`` and ``corpus_identity`` default to the frozen
@@ -1638,6 +1651,14 @@ class FactoryLifecycle:
         them instead -- its corpus is the submitted package's digest, not a
         portfolio file -- so both paths keep one identity scheme, one manifest
         rule and one admission document between them.
+
+        ``checkout`` names the local copy the repository grounding is read
+        from, and defaults to the registered one.  Only the revision path
+        overrides it: its mission's baseline is an immutable base on no
+        product branch, and the Context Broker grounds only a checkout's
+        current ``HEAD``.  The execution layer opens a checkout that is at
+        that base and names it here, so the freshness invariant is satisfied
+        rather than relaxed.
         """
 
         registry = self._registry_rows(doctor)
@@ -1650,7 +1671,7 @@ class FactoryLifecycle:
                 "mission could be bound to. Run './dev factory install'.")
         interpreter = self._resolve_supported_python()
         registered = dogfood_intake.registry_row(registry, mission.project_id)
-        checkout = registered.get("checkout")
+        checkout = checkout or registered.get("checkout")
         builder = self.context_builder
         if builder is None:
             builder = lambda wire: self._build_context(

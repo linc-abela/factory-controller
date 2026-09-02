@@ -90,6 +90,8 @@ class FakeHost:
         # What the revision seam was asked for, and what it may refuse with.
         self.revision_requests = []
         self.revision_error = None
+        # Where the execution layer keeps one checkout per opened base.
+        self.revision_root = "/state/revisions"
         # What the prototype lab's own gates say at the frozen baseline,
         # copied from a real run of them: two tests, five of five labels
         # linked, no false matches.  The improvement slot measures its
@@ -254,6 +256,13 @@ class FakeHost:
                 addendum.encode()).hexdigest(),
             "mission_bytes": len(addendum.encode()),
             "created": True,
+            # The checkout the base is grounded on. It is a different local
+            # copy from the registered one on purpose: the registered checkout
+            # is on the product branch and the base is on no branch, so a fake
+            # that returned the registered path would hide the whole seam.
+            "revision_checkout": "%s/%s/%s" % (
+                self.revision_root, project_id, hashlib.sha1(seed).hexdigest()),
+            "revision_checkout_created": True,
         }))
 
     def _artifact(self, arguments):

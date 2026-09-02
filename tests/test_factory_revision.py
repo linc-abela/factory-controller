@@ -24,7 +24,8 @@ import unittest
 
 from factory_controller import pcp, product, release
 
-from tests.test_factory_product import CONTRACT, ProductReviewTests
+from tests.test_factory_lifecycle import fake_context
+from tests.test_factory_product import CHECKOUT, CONTRACT, ProductReviewTests
 
 
 REQUESTED = [
@@ -257,6 +258,75 @@ class FactoryRevisionTests(unittest.TestCase):
                          second.details["revision_sha"])
         self.assertEqual(len(self.validations()), 1)
         self.assertEqual(len(self.missions()), 2)
+
+    # -- SF-162: where the revision is grounded --------------------------- #
+    #
+    # The Owner ran this command for real and it refused: the Context Broker
+    # grounds only the current HEAD of the checkout it reads, the registered
+    # checkout is on the product branch, and the base is deliberately on no
+    # branch.  The repair is a checkout of the base, not a weaker Broker.
+
+    def watch_grounding(self):
+        """Record which local copy each repository grounding is read from."""
+
+        seen = []
+        # The injected builder never sees a checkout, so it cannot show which
+        # one was used.  Preflighting through the real seam is the only place
+        # that argument exists.
+        self.lifecycle.context_builder = None
+
+        def build(wire, *, checkout, interpreter):
+            seen.append({"checkout": checkout,
+                         "baseline_sha": wire.get("baseline_sha")})
+            return fake_context(wire)
+
+        self.lifecycle._build_context = build
+        return seen
+
+    def test_the_revision_is_grounded_on_the_base_not_the_product_branch(self):
+        self.reviewed()
+        self.serve_the_reviewed_bytes()
+        seen = self.watch_grounding()
+        result = self.revise()
+        self.assertTrue(result.ok, result.render())
+        self.assertEqual(len(seen), 1)
+        self.assertEqual(seen[0]["baseline_sha"], result.details["revision_sha"])
+        self.assertEqual(seen[0]["checkout"], result.details["revision_checkout"])
+        # The registered checkout is where the STALE_HEAD came from.
+        self.assertNotEqual(seen[0]["checkout"], CHECKOUT)
+
+    def test_an_ordinary_build_is_still_grounded_on_the_registered_checkout(self):
+        """Nothing about ordinary work moves; only the revision path is new."""
+
+        self.ready()
+        seen = self.watch_grounding()
+        self.assertTrue(self.submit().ok)
+        self.assertEqual([call["checkout"] for call in seen], [CHECKOUT])
+        self.assertEqual(seen[0]["baseline_sha"], CONTRACT.baseline_sha)
+
+    def test_a_base_with_no_checkout_to_ground_on_is_refused(self):
+        self.reviewed()
+        self.serve_the_reviewed_bytes()
+        original = self.host._revision
+
+        def without_checkout(arguments):
+            answer = original(arguments)
+            body = json.loads(answer.stdout)
+            body.pop("revision_checkout")
+            return type(answer)(0, json.dumps(body), "")
+
+        self.host._revision = without_checkout
+        result = self.revise()
+        self.assertFalse(result.ok)
+        self.assertEqual(result.details.get("code"),
+                         "REVISION_CHECKOUT_NOT_OPENED")
+
+    def test_the_checkout_the_base_was_grounded_on_is_recorded(self):
+        self.reviewed()
+        self.serve_the_reviewed_bytes()
+        result = self.revise()
+        self.assertTrue(result.details["revision_checkout"].endswith(
+            result.details["revision_sha"]))
 
     # -- what must survive the revision ---------------------------------- #
 
