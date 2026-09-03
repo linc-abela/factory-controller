@@ -29,14 +29,18 @@ ADAPTER_SEAM = {"adapter.py", "stage1_adapter.py", "context_adapter.py"}
 #: The Controller's own runtime. Nothing here may execute anything.
 CORE = {"engine.py", "store.py", "routing.py", "cli.py", "context.py", "__init__.py"}
 
-#: The two files permitted to name an external system, on the same principle
-#: as ADAPTER_SEAM: a seam is allowed to speak its counterpart's dialect, and
+#: The files permitted to name an external system, on the same principle as
+#: ADAPTER_SEAM: a seam is allowed to speak its counterpart's dialect, and
 #: confining that to a named file is what makes the rest of the package
 #: checkable.  `gateway.py` names the model gateway the Owner admitted;
-#: `advisor.py` names the advisory service the Owner may point it at.  Both are
-#: still scanned for everything else, and the list is pinned below so a third
-#: file cannot join it quietly.
-EXTERNAL_SEAM = {"advisor.py", "gateway.py"}
+#: `advisor.py` names the advisory service the Owner may point it at;
+#: `google_production.py` speaks the static hosting API's own HTTP dialect,
+#: whose request header is a credential-shaped name it cannot avoid sending.
+#: An exemption is the honest form of that: the alternative found in review was
+#: a split string literal, which defeats the scan instead of declaring itself.
+#: All three are still scanned for everything else, and the list is pinned
+#: below so a fourth file cannot join it quietly.
+EXTERNAL_SEAM = {"advisor.py", "gateway.py", "google_production.py"}
 
 #: The modules that decide what a mission is and what context it may have.
 #: None of them may touch a file system at all. `cli.py` is deliberately absent:
@@ -117,10 +121,11 @@ class ProviderNeutralityTests(unittest.TestCase):
             for token in VENDOR_TOKENS:
                 self.assertNotIn(token, code, "%s names %r" % (path.name, token))
 
-    def test_the_external_seam_is_exactly_two_files(self):
+    def test_the_external_seam_is_exactly_three_files(self):
         """An exemption nobody can extend without changing this line."""
 
-        self.assertEqual(EXTERNAL_SEAM, {"advisor.py", "gateway.py"})
+        self.assertEqual(EXTERNAL_SEAM,
+                         {"advisor.py", "gateway.py", "google_production.py"})
         present = {path.name for path, _ in sources()}
         self.assertTrue(EXTERNAL_SEAM <= present)
 
@@ -143,6 +148,8 @@ class ProviderNeutralityTests(unittest.TestCase):
                     imported.update(alias.name.split(".")[-1] for alias in node.names)
             self.assertNotIn("advisor", imported, "%s imports the advisory seam" % path.name)
             self.assertNotIn("gateway", imported, "%s imports the gateway seam" % path.name)
+            self.assertNotIn("google_production", imported,
+                             "%s imports the hosting seam" % path.name)
 
     def test_the_external_seam_holds_no_credential_of_its_own(self):
         """The seam may send a credential it was handed.  It may not find one.

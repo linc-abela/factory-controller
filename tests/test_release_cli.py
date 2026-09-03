@@ -205,6 +205,46 @@ class ReleaseCommandTests(unittest.TestCase):
         self.assertEqual(code, 1)
         self.assertEqual(result["refused"]["code"], "RELEASE_ARGUMENTS_INVALID")
 
+    def test_the_live_adapter_takes_the_owners_token_from_the_file_they_named(self):
+        """The one thing that makes the live path reachable at all.
+
+        Without this the live transport is constructed with nothing, so the
+        Owner-facing command is *incapable* of contacting the host however
+        complete its setup is.  The token is read for this command only: it
+        reaches the transport as an argument and nothing writes it anywhere.
+        The deploy still refuses before any network call, because no artifact
+        bytes were named -- which is the fail-closed order this asserts too.
+        """
+
+        from unittest import mock
+        from factory_controller import google_production
+
+        seen = {}
+
+        class CapturingTransport(google_production.FirebaseHostingRestTransport):
+            def __init__(self, **keywords):
+                seen.update(keywords)
+                super().__init__(**keywords)
+
+        token_file = self.root / "deploy-token"
+        token_file.write_text("owner-issued-value\n")
+        self.seal(1)
+        with mock.patch.object(google_production, "FirebaseHostingRestTransport",
+                               CapturingTransport):
+            code, deployed = self.run_cli(
+                "release", "deploy-review", "--rc", "CASINO-MVP-RC-001",
+                "--environment", "lodus-casino-review", "--actor", "factory",
+                "--review-url", "https://lodus-casino-review.web.app",
+                "--adapter", "google", "--deploy-token-file", str(token_file),
+                "--passed", "3")
+
+        self.assertEqual(seen.get("token"), "owner-issued-value")
+        self.assertEqual(code, 0)
+        self.assertEqual(deployed["state"], "failed")
+        self.assertTrue(deployed["receipt"]["operation_ref"].endswith(":rejected"))
+        receipt_text = json.dumps(deployed, sort_keys=True)
+        self.assertNotIn("owner-issued-value", receipt_text)
+
     def test_deploy_review_with_google_adapter(self):
         # 1. Missing artifact bytes fails closed (never returns reached=True with zero bytes)
         self.seal(1)

@@ -109,9 +109,12 @@ class GoogleTargetConfig:
         return f"https://{self.site_id}--{self.channel_id}.web.app"
 
 
-# Safe string parts avoiding credential tokens in package AST scan
-_AUTH_HEADER_KEY = "".join(["Auth", "orization"])
-_AUTH_SCHEME = "".join(["Bea", "rer "])
+# The header the Hosting API requires.  Spelled plainly: this file is a named
+# external seam in `tests/test_authority_boundaries.py`, so the credential-name
+# scan exempts it by name rather than being defeated by a split string literal.
+# The value is never sourced here -- it arrives as an argument from the operator.
+_AUTH_HEADER_KEY = "Authorization"
+_AUTH_SCHEME = "Bearer "
 
 
 class FirebaseTransport(Protocol):
@@ -652,6 +655,63 @@ class FirebaseHostingDeploymentAdapter:
         self._recorded_operations[operation_key] = outcome
         return outcome
 
+    def _ledger_prior_version(
+        self,
+        target: GoogleTargetConfig,
+        operation_key: str,
+        attempted_digest: str,
+    ) -> dict[str, Any] | None:
+        """The prior known-good platform version, read from durable Production state.
+
+        In-process history covers only a deploy and a rollback inside one
+        command.  Every real rollback is a separate Owner command in a separate
+        process, so that history is empty exactly when it matters.  Nothing new
+        is written for this: the ledger already chose the rollback target
+        (``deployments.rollback_of``, restricted by it to a healthy or recovered
+        release) and this adapter already recorded the platform version inside
+        that deployment's ``operation_ref``.  This reads both back.  Returning
+        ``None`` leaves the caller refusing, which is the fail-closed path.
+        """
+
+        if self._store is None:
+            return None
+        deployment_id = operation_key.split(":")[0]
+        prefix = f"google-firebase:{target.site_id}:{target.channel_id}:"
+        try:
+            with self._store.transaction() as db:
+                row = db.execute(
+                    "SELECT rollback_of FROM deployments WHERE id=?",
+                    (deployment_id,)).fetchone()
+                if row is None or not row["rollback_of"]:
+                    return None
+                prior = db.execute(
+                    "SELECT operation_ref, adapter, bundle_json FROM deployments WHERE id=?",
+                    (row["rollback_of"],)).fetchone()
+        except Exception:  # noqa: BLE001 -- an unreadable ledger is not a rollback target
+            return None
+        if prior is None or prior["adapter"] != self.name:
+            return None
+        recorded_ref = prior["operation_ref"] or ""
+        if not recorded_ref.startswith(prefix):
+            return None
+        version_id = recorded_ref[len(prefix):]
+        # The non-version endings this adapter writes for an outcome that never
+        # produced a platform version.  None of them is a rollback target.
+        if not version_id or version_id in {"uncertain", "refused", "failed", "rejected"}:
+            return None
+        try:
+            prior_digest = json.loads(prior["bundle_json"]).get("artifact", {}).get("identity")
+        except (TypeError, ValueError):
+            return None
+        if prior_digest == attempted_digest:
+            return None
+        return {
+            "version_id": version_id,
+            "release_id": None,
+            "artifact_digest": prior_digest,
+            "source": "production_ledger",
+        }
+
     def rollback(
         self,
         bundle: production.ReleaseBundle,
@@ -668,6 +728,10 @@ class FirebaseHostingDeploymentAdapter:
         # Requirement 5: Real rollback identity from history
         history = self._target_history.get(target_key, [])
         prior_records = [r for r in history if r.get("artifact_digest") != attempted_digest]
+        if not prior_records:
+            recorded = self._ledger_prior_version(target, operation_key, attempted_digest)
+            if recorded is not None:
+                prior_records = [recorded]
 
         if not prior_records:
             outcome = production.DeploymentOutcome(
@@ -779,7 +843,6 @@ class StaticWebHealthVerifier:
         self,
         base_url: str,
         *,
-        expected_digest: str | None = None,
         expected_entry_content: bytes | None = None,
         expected_health_json: Mapping[str, Any] | None = None,
         allow_loopback: bool = True,
@@ -824,14 +887,6 @@ class StaticWebHealthVerifier:
                 passed += 1
             else:
                 failed += 1
-
-        if expected_digest is not None:
-            body_hash = f"sha256:{hashlib.sha256(body).hexdigest()}"
-            if expected_digest.startswith("sha256:") and len(expected_digest) == 71:
-                if body_hash == expected_digest or expected_entry_content is not None:
-                    passed += 1
-                else:
-                    failed += 1
 
         # 4. App health endpoint
         health_url = f"{normalized_base}/health.json"

@@ -883,5 +883,177 @@ class FirebaseTransportAndRollbackClosureTests(unittest.TestCase):
         self.assertIn("auth token missing", str(ctx.exception).lower())
 
 
+class RecordingRollbackTransport:
+    """A transport that answers a rollback and records which version was named."""
+
+    def __init__(self) -> None:
+        self.rollback_targets: list[str] = []
+
+    def deploy_release(self, config, artifact_digest, files, operation_key):
+        raise AssertionError("this transport exists to observe a rollback")
+
+    def rollback_release(self, config, target_version_id, operation_key):
+        self.rollback_targets.append(target_version_id)
+        return {"version_id": target_version_id, "release_id": "rel_restored"}
+
+
+class DurableRollbackIdentityTests(unittest.TestCase):
+    """SF-170A: the rollback target has to survive the process that deployed.
+
+    Every rollback the Owner performs is a separate command in a separate
+    process from the deploy it undoes, so an adapter instance that remembers
+    its own deployments remembers nothing at the moment it is asked.  These
+    tests use a *fresh* adapter for the rollback -- the state a second command
+    actually starts in -- against the same durable ledger.
+    """
+
+    def setUp(self):
+        self.temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temporary.cleanup)
+        self.store = MissionStore(str(Path(self.temporary.name) / "controller.db"))
+        self.ledger = production.ProductionLedger(self.store)
+        self.lifecycle = release.ReleaseLifecycle(self.store, clock=lambda: 100.0)
+        self.ledger.register_environment(production.EnvironmentPolicy(
+            environment_id=REVIEW_ENV_ID, project_id=CASINO_PROJECT,
+            environment_class="staging", repository=REPOSITORY,
+            service_ref="lodus-casino-review-web", approver_refs=("owner",),
+            autonomous=True, policy_version="phase-1"))
+        self.ledger.register_environment(production.EnvironmentPolicy(
+            environment_id=PROD_ENV_ID, project_id=CASINO_PROJECT,
+            environment_class="production", repository=REPOSITORY,
+            service_ref="lodus-casino-production-web", approver_refs=("owner",),
+            policy_version="phase-1"))
+
+        self.bundles = {
+            1: make_casino_bundle(1, CASINO_FILES_V1),
+            2: make_casino_bundle(2, CASINO_FILES_V2),
+        }
+        files_by_digest = {
+            self.bundles[1].artifact["identity"]: CASINO_FILES_V1,
+            self.bundles[2].artifact["identity"]: CASINO_FILES_V2,
+        }
+        self.resolver = lambda d: files_by_digest.get(d, {})
+        self.deploy_transport = google_production.SimulatedFirebaseTransport()
+        self.deploy_adapter = google_production.FirebaseHostingDeploymentAdapter(
+            {}, transport=self.deploy_transport,
+            artifact_resolver=self.resolver, store=self.store)
+
+    def last_adapter_detail(self, deployment_id: str) -> dict:
+        """The adapter's own detail, as the ledger durably recorded it."""
+
+        with self.store.transaction() as db:
+            rows = db.execute(
+                "SELECT detail_json FROM production_events WHERE deployment_id=?"
+                " ORDER BY sequence", (deployment_id,)).fetchall()
+        for row in reversed(rows):
+            detail = json.loads(row["detail_json"]).get("detail")
+            if isinstance(detail, str) and detail.startswith("{"):
+                return json.loads(detail)
+        raise AssertionError("no adapter detail recorded for %s" % deployment_id)
+
+    def health(self, passed: int, failed: int) -> production.HealthRecord:
+        return production.HealthRecord(
+            checks_passed=passed, checks_failed=failed,
+            evidence_ref="probe/lodus-casino", observed_at=1.0)
+
+    def promote(self, number: int, *, health: production.HealthRecord) -> dict:
+        rc_id = "CASINO-MVP-RC-%03d" % number
+        self.lifecycle.seal(
+            rc_id, self.bundles[number],
+            verification_refs=("verification/casino/%03d" % number,),
+            qa_refs=("qa/casino/%03d" % number,))
+        review = self.lifecycle.deploy_review(
+            rc_id, self.ledger, self.deploy_adapter,
+            review_environment_id=REVIEW_ENV_ID, requested_by="factory",
+            review_url="https://lodus-casino-review.web.app",
+            health=self.health(3, 0))
+        validation = self.lifecycle.record_owner_validation(
+            "CASINO-MVP-VALIDATION-%03d" % number, rc_id,
+            deployment_ref=review["deployment_ref"], decision="VALIDATED",
+            decided_by="owner", decided_at=101.0,
+            notes="hands-on Owner Validation recorded by test")
+        return self.lifecycle.promote_validated(
+            rc_id, validation.validation_id, self.ledger, self.deploy_adapter,
+            production_environment_id=PROD_ENV_ID, requested_by="factory",
+            health=health)
+
+    def test_a_fresh_adapter_rolls_back_to_the_platform_version_the_ledger_recorded(self):
+        first = self.promote(1, health=self.health(3, 0))
+        second = self.promote(2, health=self.health(0, 2))
+        self.assertEqual(
+            first["receipt"]["operation_ref"],
+            "google-firebase:lodus-casino-production:live:v0001")
+        self.assertEqual(second["state"], "failed")
+
+        # The state a second Owner command starts in: nothing remembered.
+        transport = RecordingRollbackTransport()
+        fresh = google_production.FirebaseHostingDeploymentAdapter(
+            {}, transport=transport, artifact_resolver=self.resolver,
+            store=self.store)
+        self.assertEqual(fresh._target_history, {})
+
+        rolled_back = self.lifecycle.rollback_production(
+            "CASINO-MVP-RC-002", self.ledger, fresh,
+            production_environment_id=PROD_ENV_ID)
+
+        self.assertEqual(rolled_back["state"], "recovered")
+        self.assertEqual(transport.rollback_targets, ["v0001"])
+        detail = self.last_adapter_detail(rolled_back["deployment_id"])
+        self.assertEqual(detail["restored_version_id"], "v0001")
+        self.assertEqual(detail["attempted_artifact_digest"],
+                         self.bundles[2].artifact["identity"])
+        self.assertEqual(detail["restored_artifact_digest"],
+                         self.bundles[1].artifact["identity"])
+        self.assertEqual(rolled_back["receipt"]["operation_ref"],
+                         "google-firebase-rollback:lodus-casino-production:live:v0001")
+
+    def test_a_fresh_adapter_without_the_durable_ledger_refuses_rather_than_guessing(self):
+        """The fail-closed half: no recorded version is never a first-release guess."""
+
+        self.promote(1, health=self.health(3, 0))
+        self.promote(2, health=self.health(0, 2))
+
+        transport = RecordingRollbackTransport()
+        blind = google_production.FirebaseHostingDeploymentAdapter(
+            {}, transport=transport, artifact_resolver=self.resolver)
+
+        rolled_back = self.lifecycle.rollback_production(
+            "CASINO-MVP-RC-002", self.ledger, blind,
+            production_environment_id=PROD_ENV_ID)
+
+        self.assertEqual(rolled_back["state"], "rollback_failed")
+        self.assertEqual(transport.rollback_targets, [])
+        detail = self.last_adapter_detail(rolled_back["deployment_id"])
+        self.assertEqual(detail["error"], "NO_PREVIOUS_VERSION_FOR_ROLLBACK")
+
+    def test_a_deployment_that_never_reached_a_platform_version_is_not_a_target(self):
+        """`:uncertain`, `:failed` and `:rejected` refs name no Firebase version."""
+
+        self.promote(1, health=self.health(3, 0))
+        target = google_production.GoogleTargetConfig(
+            project_id=CASINO_PROJECT, site_id=PROD_ENV_ID, channel_id="live")
+        with self.store.transaction() as db:
+            row = db.execute(
+                "SELECT id, operation_ref FROM deployments"
+                " WHERE environment_id=? AND state='healthy'", (PROD_ENV_ID,)).fetchone()
+            healthy_id, healthy_ref = row["id"], row["operation_ref"]
+            db.execute("UPDATE deployments SET rollback_of=? WHERE id=?",
+                       (healthy_id, healthy_id))
+        key = production.operation_key(healthy_id, "rollback", 1)
+
+        resolved = self.deploy_adapter._ledger_prior_version(
+            target, key, self.bundles[2].artifact["identity"])
+        self.assertEqual(resolved["version_id"], "v0001")
+
+        for ending in ("uncertain", "failed", "rejected", ""):
+            with self.store.transaction() as db:
+                db.execute("UPDATE deployments SET operation_ref=? WHERE id=?",
+                           (healthy_ref.rsplit(":", 1)[0] + ":" + ending, healthy_id))
+            self.assertIsNone(
+                self.deploy_adapter._ledger_prior_version(
+                    target, key, self.bundles[2].artifact["identity"]),
+                "%r was accepted as a platform version" % ending)
+
+
 if __name__ == "__main__":
     unittest.main()
