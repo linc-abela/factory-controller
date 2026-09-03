@@ -419,6 +419,56 @@ class RevisionLifecycleTests(unittest.TestCase):
         self.assertEqual(refused["terminal_reason"], "CANDIDATE_WORKSPACE_MISMATCH")
         self.assertNotIn("IDEMPOTENCY_KEY_UNPROVEN", refused["terminal_reason"])
 
+    def test_candidate_without_echoed_idempotency_key_is_not_reconcilable(self):
+        """A legacy candidate hint cannot reopen an unproven provider leg."""
+        class UnechoedMismatchAdapter(RecoveryAdapter):
+            def execute(self, step, operation_key, value):
+                if step == "dispatch":
+                    route = value["route"]
+                    return {
+                        "status": "refused",
+                        "candidate_sha": None,
+                        "execution_id": "e-unechoed",
+                        "diagnostic": "CANDIDATE_WORKSPACE_MISMATCH",
+                        "stage1_result": {
+                            "execution_envelope": {
+                                "candidate_sha": CANDIDATE,
+                                "idempotency_key": None,
+                            },
+                        },
+                        "receipt": {
+                            "provider_profile": route["provider_profile"],
+                            "provider": "factory-evidence-core/first-live",
+                            "execution_mode": "real",
+                            "duration_ms": 100,
+                            "process_started": True,
+                            "idempotency_key": None,
+                            "refusal_code": "CANDIDATE_WORKSPACE_MISMATCH",
+                            "usage": {"cost_state": "unknown"},
+                        },
+                    }
+                return super().execute(step, operation_key, value)
+
+        value = self.payload()
+        mission, _ = Controller(self.store, RecoveryAdapter(), lease_seconds=0).submit(
+            value, self.key(value))
+        Controller(self.store, RecoveryAdapter(), lease_seconds=0).work_once("worker-1")
+        self.store.resume_pre_provider(mission["id"], revision_binding())
+
+        refused = Controller(
+            self.store, UnechoedMismatchAdapter(mode="real"), lease_seconds=0
+        ).work_once("worker-2")
+        self.assertEqual(refused["state"], "refused")
+        self.assertIn("IDEMPOTENCY_KEY_UNPROVEN", refused["terminal_reason"])
+
+        from factory_controller import factory as lifecycle
+
+        factory = lifecycle.FactoryLifecycle(
+            Controller(MissionStore(self.path), RecoveryAdapter()),
+            owner=lifecycle.OwnerIdentity(username="owner", uid=501))
+        contract = SimpleNamespace(project_id="lodus-casino", package_id="lodus-casino")
+        self.assertEqual(factory._recoverable_revision_missions(contract), [])
+
     def test_a_sealed_candidate_alone_never_reopens_the_mission(self):
         """SF-167 built this scenario and drew the wrong conclusion from it.
 

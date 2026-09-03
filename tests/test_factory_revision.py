@@ -268,6 +268,41 @@ class FactoryRevisionTests(unittest.TestCase):
         self.assertEqual(len(self.validations()), 1)
         self.assertEqual(len(self.missions()), 2)
 
+    def test_an_unproven_terminal_revision_opens_a_distinct_successor_attempt(self):
+        """A legacy key conflict gets a fresh manifest, never a rewritten row."""
+        self.reviewed()
+        self.serve_the_reviewed_bytes()
+        first = self.revise()
+        self.assertTrue(first.ok, first.render())
+
+        # Reproduce the legacy admission shape: the old row owns the stable
+        # attempt-1 key but its serialized input predates the current payload.
+        with self.lifecycle.store.transaction() as db:
+            db.execute("UPDATE missions SET payload_hash=?, state=?, "
+                       "terminal_reason=? WHERE id=?",
+                       ("legacy-payload-hash", "refused",
+                        "IDEMPOTENCY_KEY_UNPROVEN: layer echoed no key",
+                        first.details["mission_id"]))
+        legacy = self.lifecycle.store.get(first.details["mission_id"])
+
+        second = self.revise()
+        self.assertTrue(second.ok, second.render())
+        self.assertEqual(second.details["attempt"], 2)
+        self.assertEqual(second.details["predecessor_mission_id"],
+                         first.details["mission_id"])
+        self.assertNotEqual(second.details["mission_id"],
+                            first.details["mission_id"])
+        self.assertEqual(len(self.missions()), 3)
+
+        after = self.lifecycle.store.get(first.details["mission_id"])
+        self.assertEqual(after["state"], legacy["state"])
+        self.assertEqual(after["terminal_reason"], legacy["terminal_reason"])
+        self.assertEqual(after["payload_hash"], "legacy-payload-hash")
+        self.assertTrue(any(
+            row["reason"] == "REVISION_SUCCESSOR_OPENED"
+            and row["mission_id"] == second.details["mission_id"]
+            for row in self.lifecycle.store.coordination(None)))
+
     # -- SF-162: where the revision is grounded --------------------------- #
     #
     # The Owner ran this command for real and it refused: the Context Broker

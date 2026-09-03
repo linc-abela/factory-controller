@@ -786,6 +786,13 @@ class FactoryLifecycle:
         except product.ProductRefusal as refusal:
             raise FactoryRefusal(refusal.code, refusal.detail) from None
 
+        # A revision admitted by an older Factory may already own attempt 1
+        # under this package's stable work-item identity. Reuse that identity
+        # only when the exact same successor attempt is already present; a
+        # terminal legacy refusal gets the next manifest/key through the
+        # existing attempt scheme below.
+        attempt = self._revision_attempt(mission)
+
         approval_ref = self._approval_reference(
             "%s-%s" % (contract.run_ref, accepted.package_digest[:12]))
         act = product.owner_act(
@@ -811,19 +818,68 @@ class FactoryLifecycle:
         self._bootstrap_service(self._install_supervisor_definition())
 
         intake = self._materialize(
-            contract, None, mission, doctor, grant, brief=brief,
+            contract, None, mission, doctor, grant, attempt=attempt, brief=brief,
             portfolio_ref=contract.run_ref,
             corpus_identity="package://%s@%s" % (accepted.mission["source_pcp"],
                                                  accepted.package_digest),
             checkout=base["revision_checkout"], grounding=base)
+        successor_of = None
         try:
             submitted, created = self.controller.submit(
                 intake.payload, intake.idempotency_key)
+        except store_mod.ConflictError:
+            # The only safe product retry here is the known historical shape
+            # this lifecycle was built to retire: a terminal revision whose
+            # provider identity was never proven. Other conflicts remain a
+            # request defect and stay fail-closed.
+            existing = next((row for summary in self.store.all_missions()
+                             for row in [self.store.get(summary["id"])]
+                             if row is not None
+                             and row.get("idempotency_key")
+                             == intake.idempotency_key), None)
+            reason = "" if existing is None else existing.get("terminal_reason") or ""
+            if (attempt != 1 or existing is None
+                    or existing.get("state") not in store_mod.TERMINAL
+                    or not str(reason).startswith("IDEMPOTENCY_KEY_UNPROVEN")):
+                raise FactoryRefusal(
+                    "REVISION_NOT_SUBMITTED",
+                    "The revision mission could not be submitted. Retry the "
+                    "command.") from None
+            successor_of = existing
+            attempt = 2
+            intake = self._materialize(
+                contract, None, mission, doctor, grant, attempt=attempt,
+                brief=brief,
+                portfolio_ref=contract.run_ref,
+                corpus_identity="package://%s@%s"
+                                % (accepted.mission["source_pcp"],
+                                   accepted.package_digest),
+                checkout=base["revision_checkout"], grounding=base)
+            try:
+                submitted, created = self.controller.submit(
+                    intake.payload, intake.idempotency_key)
+            except Exception:
+                raise FactoryRefusal(
+                    "REVISION_NOT_SUBMITTED",
+                    "The revision mission could not be submitted. Retry the "
+                    "command.") from None
         except Exception as exc:  # noqa: BLE001
             raise FactoryRefusal(
                 "REVISION_NOT_SUBMITTED",
                 "The revision mission could not be submitted. Retry the "
                 "command.") from exc
+
+        if successor_of is not None and created:
+            self.store.coordinate(
+                submitted["id"], contract.project_id, "factory",
+                "REVISION_SUCCESSOR_OPENED", {
+                    "predecessor_mission_id": successor_of["id"],
+                    "predecessor_state": successor_of["state"],
+                    "predecessor_terminal_reason":
+                        successor_of.get("terminal_reason"),
+                    "successor_attempt": intake.attempt,
+                    "successor_idempotency_key": intake.idempotency_key,
+                })
 
         return FactoryResult(
             action="revise", ok=True,
@@ -833,6 +889,9 @@ class FactoryLifecycle:
                    % rejected.rc_id,
                    "Revision: %s, built from the candidate you reviewed."
                    % mission.mission_ref,
+                   *(('Clean successor attempt %d opened; the prior terminal '
+                      'mission remains preserved.' % intake.attempt,)
+                     if successor_of is not None and created else ()),
                    "Submitted %s. This mission was %s."
                    % (accepted.mission["source_pcp"],
                       "admitted now" if created
@@ -856,6 +915,9 @@ class FactoryLifecycle:
                 "revision_ref": base["ref"],
                 "revision_checkout": base["revision_checkout"],
                 "baseline_sha": mission.baseline_sha,
+                "attempt": intake.attempt,
+                **({} if successor_of is None else {
+                    "predecessor_mission_id": successor_of["id"]}),
                 "approval_ref": approval_ref,
                 "owner_act_hash": act["act_hash"],
                 "created": created,
@@ -1228,6 +1290,15 @@ class FactoryLifecycle:
         if store_mod.sealed_candidate_sha(record) is None:
             return False
         receipt = output.get("receipt") if isinstance(output.get("receipt"), dict) else {}
+        # A candidate/refusal is reconcilable only when the provider leg also
+        # proved the operation identity that the mission is about to resume.
+        # Historical responses from before the Bridge echoed this key can carry
+        # a candidate hint, but cannot establish that it belongs to this
+        # mission; treating them as SF-168 would attempt to reconcile an
+        # unrecoverable leg and block the next clean revision.
+        if receipt.get("process_started") is not True \
+                or receipt.get("idempotency_key") != mission.get("idempotency_key"):
+            return False
         refusal = receipt.get("refusal_code") or output.get("diagnostic") \
             or mission.get("terminal_reason") or ""
         return str(refusal).startswith(store_mod.REVISION_REPLAY_REFUSAL)
@@ -2230,6 +2301,34 @@ class FactoryLifecycle:
             return None if not rows else self.store.get(rows[-1]["id"])
         except Exception:  # noqa: BLE001
             return None
+
+    def _revision_attempt(self, mission) -> int:
+        """Return the latest durable attempt for one product revision.
+
+        Product revisions normally have one mission identity. If a prior
+        implementation admitted that identity and then left a terminal,
+        unrecoverable provider record behind, the next clean provider leg must
+        use the existing attempt identity scheme instead of reusing its key.
+        The mission row is history; the attempt number is the new identity.
+        """
+
+        work_item = getattr(mission, "mission_ref", None)
+        baseline = getattr(mission, "baseline_sha", None)
+        payloads = []
+        for summary in self.store.all_missions():
+            row = self.store.get(summary["id"])
+            if row is None:
+                continue
+            payload = row.get("payload") or {}
+            if (row.get("project_id") == getattr(mission, "project_id", None)
+                    and payload.get("work_item_id") == work_item
+                    and payload.get("baseline_sha") == baseline):
+                payloads.append(payload)
+        attempts = [payload.get("attempt", 1) for payload in payloads]
+        attempts = [value for value in attempts
+                    if isinstance(value, int) and not isinstance(value, bool)
+                    and value >= 1]
+        return max(attempts, default=1)
 
     @staticmethod
     def _age_text(seconds: float) -> str:
