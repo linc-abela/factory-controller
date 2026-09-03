@@ -34,6 +34,15 @@ REQUESTED = [
 ]
 
 
+class StaleContextAdapter:
+    """Reproduce SF-162's settled pre-provider Context Broker refusal."""
+
+    def execute(self, step, operation_key, value):
+        if step == "context":
+            return {"status": "refused", "refusal_code": "STALE_HEAD"}
+        return {"status": "completed", "candidate_sha": "a" * 40}
+
+
 def revision_package(*, rc_id, candidate_sha, validation_id="ov-1",
                      version=2, changes=None, decision=None):
     """A superseding package, built from the frozen one it supersedes."""
@@ -295,6 +304,49 @@ class FactoryRevisionTests(unittest.TestCase):
         # The registered checkout is where the STALE_HEAD came from.
         self.assertNotEqual(seen[0]["checkout"], CHECKOUT)
 
+    def test_the_admitted_revision_carries_the_same_execution_grounding(self):
+        """The checkout used in preflight is the one durable Stage-1 receives."""
+
+        self.reviewed()
+        self.serve_the_reviewed_bytes()
+        result = self.revise()
+        self.assertTrue(result.ok, result.render())
+        mission = self.missions()[1]
+        stage1 = mission["payload"]["stage1"]
+        grounding = stage1["revision_grounding"]
+        self.assertEqual(stage1["repository"], result.details["revision_checkout"])
+        self.assertEqual(stage1["gate_workdir"], result.details["revision_checkout"])
+        self.assertEqual(stage1["gate_commands"]["dev-evaluate"], [
+            result.details["revision_checkout"] + "/dev", "evaluate"])
+        self.assertEqual(grounding["revision_sha"], result.details["revision_sha"])
+        self.assertEqual(grounding["checkout"], result.details["revision_checkout"])
+        self.assertEqual(grounding["revision_ref"], result.details["revision_ref"])
+
+    def test_start_rebinds_the_existing_refusal_without_starting_a_provider(self):
+        self.reviewed()
+        self.serve_the_reviewed_bytes()
+        revised = self.revise()
+        mission_id = revised.details["mission_id"]
+
+        self.lifecycle.controller.adapter = StaleContextAdapter()
+        refused = self.lifecycle.controller.work_once("stale-worker")
+        self.assertEqual(refused["state"], "refused")
+        self.assertIn("STALE_HEAD", refused["terminal_reason"])
+        self.assertEqual(self.lifecycle.store.runs(mission_id), [])
+
+        started = self.lifecycle.dispatch("start")
+        self.assertTrue(started.ok, started.render())
+        self.assertIn("Existing revision mission rebound", started.render())
+        resumed = self.lifecycle.store.get(mission_id)
+        self.assertEqual(resumed["state"], "admitted")
+        self.assertEqual(resumed["attempt_count"], 1)
+        self.assertEqual(self.lifecycle.store.runs(mission_id), [])
+        self.assertEqual(len(self.host.revision_resolves), 1)
+        self.assertEqual(self.host.revision_resolves[0]["revision_sha"],
+                         revised.details["revision_sha"])
+        self.assertTrue(any(event["kind"] == "REVISION_CONTEXT_REBOUND"
+                            for event in self.lifecycle.store.history(mission_id)))
+
     def test_an_ordinary_build_is_still_grounded_on_the_registered_checkout(self):
         """Nothing about ordinary work moves; only the revision path is new."""
 
@@ -303,6 +355,23 @@ class FactoryRevisionTests(unittest.TestCase):
         self.assertTrue(self.submit().ok)
         self.assertEqual([call["checkout"] for call in seen], [CHECKOUT])
         self.assertEqual(seen[0]["baseline_sha"], CONTRACT.baseline_sha)
+
+    def test_an_ordinary_stale_checkout_is_still_refused(self):
+        """SF-163 must not turn the ordinary stale-head guard into a retry."""
+
+        self.ready()
+        self.lifecycle.context_builder = None
+
+        def stale(wire, *, checkout, interpreter):
+            answer = fake_context(wire)
+            answer["measurement"]["head_sha"] = "c" * 40
+            return answer
+
+        self.lifecycle._build_context = stale
+        result = self.submit()
+        self.assertFalse(result.ok)
+        self.assertEqual(result.details["code"], "CONTEXT_HEAD_MISMATCH")
+        self.assertEqual(self.missions(), [])
 
     def test_a_base_with_no_checkout_to_ground_on_is_refused(self):
         self.reviewed()

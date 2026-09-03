@@ -8,7 +8,9 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
+from factory_controller import context
 from factory_controller.stage1_adapter import _execution_mode, execute
 
 
@@ -51,6 +53,55 @@ class Stage1AdapterTest(unittest.TestCase):
         result = execute(request)
         self.assertEqual(result["diagnostic"], "MISSING_OPERATOR_OPT_IN")
         self.assertIs(result["receipt"]["process_started"], False)
+
+    def test_revision_context_uses_the_verified_execution_checkout(self):
+        checkout = "/state/revisions/lodus-casino/" + "b" * 40
+        grounding = {
+            "schema_version": context.REVISION_GROUNDING_SCHEMA,
+            "kind": "revision",
+            "source": "factory-bridge",
+            "project_id": "lodus-casino",
+            "repository_remote_url": "https://example.invalid/lodus-casino.git",
+            "revision_sha": "b" * 40,
+            "checkout": checkout,
+        }
+        mission = {
+            "project_id": "lodus-casino",
+            "repository_remote_url": grounding["repository_remote_url"],
+            "baseline_sha": grounding["revision_sha"],
+            "stage1": {"repository": checkout,
+                        "revision_grounding": grounding},
+        }
+        with patch("factory_controller.stage1_adapter.context_adapter.build",
+                   return_value={"status": "built"}) as broker:
+            result = self._run("context", mission,
+                               context_request={"baseline_sha": "b" * 40})
+        self.assertEqual(result["status"], "built")
+        self.assertEqual(broker.call_args.kwargs["repo"], checkout)
+
+    def test_invalid_revision_grounding_refuses_before_the_broker(self):
+        mission = self._mission(
+            project_id="lodus-casino",
+            repository_remote_url="https://example.invalid/lodus-casino.git",
+            baseline_sha="b" * 40,
+            stage1={
+                "repository": "/state/revisions/lodus-casino/" + "b" * 40,
+                "revision_grounding": {
+                    "schema_version": context.REVISION_GROUNDING_SCHEMA,
+                    "kind": "revision", "source": "factory-bridge",
+                    "project_id": "lodus-casino",
+                    "repository_remote_url":
+                        "https://example.invalid/lodus-casino.git",
+                    "revision_sha": "c" * 40,
+                    "checkout": "/state/revisions/lodus-casino/" + "b" * 40,
+                },
+            })
+        with patch("factory_controller.stage1_adapter.context_adapter.build") as broker:
+            result = self._run("context", mission,
+                               context_request={"baseline_sha": "b" * 40})
+        self.assertEqual(result, {"status": "refused",
+                                  "refusal_code": "REVISION_GROUNDING_INVALID"})
+        broker.assert_not_called()
 
     def test_dispatch_then_projects_verification_and_evidence(self):
         mission = self._mission(acceptance_gate_ids=["G1"])

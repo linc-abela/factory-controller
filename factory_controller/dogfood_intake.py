@@ -194,6 +194,7 @@ def build(mission, *, portfolio_ref: str, run_ref: str,
           provider_profiles: Sequence[str], corpus_identity: str,
           owner: str, approval_ref: str, granted_at: float, expires_at: float,
           now: float, stage1: Mapping[str, Any], attempt: int = 1,
+          checkout: str | None = None,
           context_builder: Callable[[dict[str, Any]], Mapping[str, Any]] | None = None
           ) -> Intake:
     """Turn one frozen portfolio mission into one submittable real mission.
@@ -226,7 +227,7 @@ def build(mission, *, portfolio_ref: str, run_ref: str,
             "The project this mission targets is not available. "
             "Run './dev factory install'.")
     remote_url = row.get("repository_remote_url")
-    checkout = row.get("checkout")
+    checkout = row.get("checkout") if checkout is None else checkout
     if not isinstance(remote_url, str) or not remote_url:
         raise IntakeError(
             "PROJECT_NOT_REGISTERED",

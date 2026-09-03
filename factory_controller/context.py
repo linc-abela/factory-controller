@@ -30,12 +30,20 @@ from __future__ import annotations
 
 import hashlib
 import json
+import re
 from dataclasses import dataclass, field
 from typing import Any, Sequence
 
 
 #: Reproduced from factory-evidence-core ``src/contracts/mvp.py``.
 CONTEXT_SCHEMA_VERSION = "1.0"
+
+# A revision's local checkout is execution-layer provenance, not part of the
+# Context Broker manifest identity.  These schemas name the small durable
+# binding that lets a replacement Controller resolve the same checkout without
+# changing the mission or its manifest hash.
+REVISION_GROUNDING_SCHEMA = "factory.controller.revision_grounding.v1"
+REVISION_CONTEXT_BINDING_SCHEMA = "factory.controller.revision_context_binding.v1"
 
 #: The broker's answer to one request.  ``built`` is the only one that carries a
 #: manifest; the other two carry a refusal code and nothing else.
@@ -75,6 +83,113 @@ def sha256_hex(value: Any) -> str:
 def _is_sha256(value: Any) -> bool:
     return isinstance(value, str) and len(value) == 64 and \
         all(char in "0123456789abcdef" for char in value)
+
+
+_REVISION_REF = re.compile(
+    r"^refs/heads/factory/revision/v[1-9][0-9]*$")
+_REVISION_BINDING_FIELDS = frozenset({
+    "schema_version", "kind", "project_id", "repository_remote_url",
+    "revision_sha", "predecessor_sha", "revision_ref", "checkout",
+    "grounding", "stage1",
+})
+_REVISION_GROUNDING_FIELDS = frozenset({
+    "schema_version", "kind", "source", "project_id",
+    "repository_remote_url", "revision_sha", "predecessor_sha",
+    "revision_ref", "checkout",
+})
+_REVISION_STAGE1_FIELDS = frozenset({
+    "repository", "gate_workdir", "gate_commands", "revision_grounding",
+})
+
+
+def validate_revision_context_binding(
+        value: Any, *, expected_project_id: str | None = None,
+        expected_repository_remote_url: str | None = None,
+        expected_revision_sha: str | None = None,
+        expected_predecessor_sha: str | None = None,
+        expected_revision_ref: str | None = None) -> dict[str, Any]:
+    """Validate the immutable execution overlay before it can be used.
+
+    This is intentionally pure: the Controller and the mission ledger both
+    need to reject the same malformed overlay, but neither should ask the
+    other to decide whether a JSON value is structurally safe.  Correlating
+    the binding with a mission or a Bridge report remains the caller's job.
+    """
+
+    if not isinstance(value, dict) or set(value) != _REVISION_BINDING_FIELDS:
+        raise ContextError("revision context binding has the wrong shape")
+    if value["schema_version"] != REVISION_CONTEXT_BINDING_SCHEMA \
+            or value["kind"] != "revision":
+        raise ContextError("revision context binding schema is unsupported")
+    _binding_text(value["project_id"], "project_id")
+    _binding_text(value["repository_remote_url"], "repository_remote_url")
+    if not _is_sha1(value["revision_sha"]):
+        raise ContextError("revision_sha must be a full commit id")
+    if not _is_sha1(value["predecessor_sha"]):
+        raise ContextError("predecessor_sha must be a full commit id")
+    if not isinstance(value["revision_ref"], str) \
+            or _REVISION_REF.fullmatch(value["revision_ref"]) is None:
+        raise ContextError("revision_ref is not a revision ref")
+    if not _is_checkout(value["checkout"]):
+        raise ContextError("checkout must be an absolute local path")
+    for expected, name in (
+            (expected_project_id, "project_id"),
+            (expected_repository_remote_url, "repository_remote_url"),
+            (expected_revision_sha, "revision_sha"),
+            (expected_predecessor_sha, "predecessor_sha"),
+            (expected_revision_ref, "revision_ref")):
+        if expected is not None and value[name] != expected:
+            raise ContextError("revision context binding does not match %s" % name)
+
+    grounding = value["grounding"]
+    if not isinstance(grounding, dict) \
+            or set(grounding) != _REVISION_GROUNDING_FIELDS:
+        raise ContextError("revision grounding has the wrong shape")
+    if grounding.get("schema_version") != REVISION_GROUNDING_SCHEMA \
+            or grounding.get("kind") != "revision" \
+            or grounding.get("source") != "factory-bridge":
+        raise ContextError("revision grounding schema is unsupported")
+    if any(grounding[name] != value[name] for name in (
+            "project_id", "repository_remote_url", "revision_sha",
+            "predecessor_sha", "revision_ref", "checkout")):
+        raise ContextError("revision grounding disagrees with its binding")
+
+    stage1 = value["stage1"]
+    if not isinstance(stage1, dict) or set(stage1) != _REVISION_STAGE1_FIELDS:
+        raise ContextError("revision Stage-1 overlay has the wrong shape")
+    if stage1["repository"] != value["checkout"] \
+            or stage1["gate_workdir"] != value["checkout"] \
+            or stage1["revision_grounding"] != grounding:
+        raise ContextError("revision Stage-1 overlay disagrees with its binding")
+    commands = stage1["gate_commands"]
+    if not isinstance(commands, dict) or not commands:
+        raise ContextError("revision gate commands are missing")
+    prefix = value["checkout"].rstrip("/") + "/"
+    for gate_id, command in commands.items():
+        if not isinstance(gate_id, str) or not gate_id \
+                or not isinstance(command, list) or len(command) != 2 \
+                or not isinstance(command[0], str) \
+                or not command[0].startswith(prefix) \
+                or not isinstance(command[1], str) or not command[1]:
+            raise ContextError("revision gate command is malformed")
+    return value
+
+
+def _is_sha1(value: Any) -> bool:
+    return isinstance(value, str) and len(value) == 40 and \
+        all(char in "0123456789abcdef" for char in value)
+
+
+def _binding_text(value: Any, name: str) -> None:
+    if not isinstance(value, str) or not value or len(value) > 2048 \
+            or any(ord(char) < 0x20 for char in value):
+        raise ContextError("%s is malformed" % name)
+
+
+def _is_checkout(value: Any) -> bool:
+    return isinstance(value, str) and len(value) > 1 and len(value) <= 4096 \
+        and value.startswith("/") \
+        and not any(ord(char) < 0x20 for char in value)
 
 
 # --------------------------------------------------------------------------- #

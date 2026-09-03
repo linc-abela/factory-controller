@@ -31,7 +31,7 @@ import time
 from pathlib import Path
 from typing import Any
 
-from . import context_adapter, safe_provider
+from . import context, context_adapter, safe_provider
 
 
 def _stage1_config(request: dict[str, Any]) -> dict[str, Any]:
@@ -48,13 +48,42 @@ def _mission(request: dict[str, Any]) -> dict[str, Any]:
     return mission
 
 
+def _repository(mission: dict[str, Any], stage1: dict[str, Any]) -> str:
+    """Select the admitted checkout and validate revision provenance metadata."""
+
+    repository = stage1.get("repository")
+    if not isinstance(repository, str) or not repository:
+        raise ValueError("CONTEXT_REPOSITORY_UNCONFIGURED")
+    grounding = stage1.get("revision_grounding")
+    if grounding is None:
+        return repository
+    if not Path(repository).is_absolute():
+        raise ValueError("REVISION_GROUNDING_INVALID")
+    if not isinstance(grounding, dict) \
+            or grounding.get("schema_version") \
+            != context.REVISION_GROUNDING_SCHEMA \
+            or grounding.get("kind") != "revision" \
+            or grounding.get("source") != "factory-bridge" \
+            or grounding.get("project_id") != mission.get("project_id") \
+            or grounding.get("repository_remote_url") \
+            != mission.get("repository_remote_url") \
+            or grounding.get("revision_sha") != mission.get("baseline_sha") \
+            or grounding.get("checkout") != repository:
+        raise ValueError("REVISION_GROUNDING_INVALID")
+    return repository
+
+
 def _context(request: dict[str, Any]) -> dict[str, Any]:
     """Bind a real mission's context to the checkout it declares."""
 
     mission = _mission(request)
     stage1 = mission.get("stage1")
-    repository = stage1.get("repository") if isinstance(stage1, dict) else None
-    if not isinstance(repository, str) or not repository:
+    try:
+        repository = _repository(mission, stage1) \
+            if isinstance(stage1, dict) else None
+    except ValueError as exc:
+        return {"status": "refused", "refusal_code": str(exc)}
+    if repository is None:
         return {"status": "unavailable",
                 "refusal_code": "CONTEXT_REPOSITORY_UNCONFIGURED"}
     return context_adapter.build(
@@ -522,7 +551,7 @@ def _evaluate(request: dict[str, Any], config: dict[str, Any],
 
 def execute(request: dict[str, Any]) -> dict[str, Any]:
     step = request["step"]
-    if step == "context":
+    if step in {"context", "context-recovery"}:
         return _context(request)
     config = _stage1_config(request)
     if step == "dispatch":

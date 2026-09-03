@@ -89,6 +89,7 @@ class FakeHost:
         self.extra_profiles = []
         # What the revision seam was asked for, and what it may refuse with.
         self.revision_requests = []
+        self.revision_resolves = []
         self.revision_error = None
         # Where the execution layer keeps one checkout per opened base.
         self.revision_root = "/state/revisions"
@@ -219,6 +220,8 @@ class FakeHost:
             return self._artifact(arguments)
         if arguments[:2] == ("revision", "base"):
             return self._revision(arguments)
+        if arguments[:2] == ("revision", "resolve"):
+            return self._resolve_revision(arguments)
         return HostCommandResult(127, "", "unknown Bridge command")
 
     def _revision(self, arguments):
@@ -263,6 +266,29 @@ class FakeHost:
             "revision_checkout": "%s/%s/%s" % (
                 self.revision_root, project_id, hashlib.sha1(seed).hexdigest()),
             "revision_checkout_created": True,
+        }))
+
+    def _resolve_revision(self, arguments):
+        project_id, revision_sha = arguments[2], arguments[3]
+        predecessor = arguments[arguments.index("--predecessor-sha") + 1]
+        ref = arguments[arguments.index("--ref") + 1]
+        if project_id not in self.checkouts:
+            return HostCommandResult(1, "", "unknown project")
+        self.revision_resolves.append({
+            "project_id": project_id, "revision_sha": revision_sha,
+            "predecessor_sha": predecessor, "ref": ref})
+        return HostCommandResult(0, json.dumps({
+            "schema_version": "factory.bridge.revision_base.v1",
+            "project_id": project_id,
+            "repository_remote_url":
+                "https://github.com/linc-abela/%s.git" % project_id,
+            "predecessor_sha": predecessor,
+            "revision_sha": revision_sha,
+            "ref": ref,
+            "revision_checkout": "%s/%s/%s" % (
+                self.revision_root, project_id, revision_sha),
+            "revision_checkout_created": False,
+            "resolved": True,
         }))
 
     def _artifact(self, arguments):

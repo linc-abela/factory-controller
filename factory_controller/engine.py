@@ -140,7 +140,8 @@ class Controller:
 
     def _step(self, mission: dict[str, Any], name: str, value: dict[str, Any],
               *, memo_value: dict[str, Any] | None = None,
-              replay_input: bool = False) -> dict[str, Any]:
+              replay_input: bool = False,
+              adapter_step: str | None = None) -> dict[str, Any]:
         """Run one durable step, or return the output a previous run recorded.
 
         ``memo_value`` is the step's durable identity; ``value`` is what the
@@ -174,7 +175,8 @@ class Controller:
         if self.lease_seconds > 0:
             thread.start()
         try:
-            output = self.adapter.execute(name, started["operation_key"], adapter_value)
+            output = self.adapter.execute(
+                adapter_step or name, started["operation_key"], adapter_value)
         finally:
             stopped.set()
             if thread.is_alive():
@@ -185,6 +187,38 @@ class Controller:
         if not (isinstance(output, dict) and output.get("status") in incomplete):
             self.store.complete_step(mission["id"], mission["lease_token"], name, output)
         return output
+
+    def _runtime_payload(self, mission: dict[str, Any]) -> dict[str, Any]:
+        """Overlay an immutable recovery binding onto the adapter input.
+
+        The original mission payload is the admission identity and remains
+        untouched.  A pre-provider revision recovery stores its verified
+        execution checkout in ``context_bindings``; every later adapter step
+        sees that same binding, while the Context Broker remains responsible
+        for checking the checkout's actual remote, HEAD, and cleanliness.
+        """
+
+        payload = mission["payload"]
+        binding = self.store.context_binding(mission["id"])
+        if binding is None:
+            return payload
+        try:
+            context.validate_revision_context_binding(
+                binding,
+                expected_project_id=payload.get("project_id"),
+                expected_repository_remote_url=payload.get(
+                    "repository_remote_url"),
+                expected_revision_sha=payload.get("baseline_sha"),
+            )
+        except context.ContextError:
+            raise NonRetryableFailure("INVALID_REVISION_CONTEXT_BINDING")
+        stage1 = payload.get("stage1")
+        overlay = binding.get("stage1")
+        checkout = binding.get("checkout")
+        if not isinstance(stage1, dict) or not isinstance(overlay, dict) \
+                or not isinstance(checkout, str) or not checkout:
+            raise NonRetryableFailure("INVALID_REVISION_CONTEXT_BINDING")
+        return {**payload, "stage1": {**stage1, **overlay}}
 
     def _cancelled(self, mission_id: str, lease_token: str) -> bool:
         current = self.store.get(mission_id)
@@ -233,12 +267,26 @@ class Controller:
                 "%s: ceiling %s reported input tokens"
                 % (token_refusal, budget.max_reported_input_tokens))
 
+        runtime_payload = self._runtime_payload(mission)
+        context_step = "context"
+        binding = self.store.context_binding(mission["id"])
+        prior_context = self.store.step_record(mission["id"], "context")
+        if binding is not None and prior_context is not None \
+                and prior_context.get("status") == "COMPLETED" \
+                and isinstance(prior_context.get("output"), dict) \
+                and prior_context["output"].get("refusal_code") == "STALE_HEAD":
+            # Keep the original refusal row as evidence and give the repaired
+            # attempt a new durable step identity. Reusing the completed
+            # refusal would replay it forever; overwriting it would erase why
+            # the first attempt stopped.
+            context_step = "context-recovery"
         response = self._step(
-            mission, "context",
+            mission, context_step,
             {"context_request": request.as_wire(),
-             # The adapter may bind the declared request to the registered
+             # The adapter may bind the declared request to the execution-layer
              # checkout, but it remains the only process allowed to inspect it.
-             "mission": mission["payload"]})
+             "mission": runtime_payload},
+            adapter_step="context")
         package = context.ContextPackage.from_response(response)
         if package.status == "unavailable":
             # Nothing was memoized, so a later attempt may ask again.  Only a
@@ -297,7 +345,7 @@ class Controller:
     def _dispatch(self, mission: dict[str, Any], resume_state: str) -> dict[str, Any]:
         """Produce this mission's dispatch result, routing only where it is safe."""
 
-        payload = mission["payload"]
+        payload = self._runtime_payload(mission)
         policy = ExecutionPolicy.from_payload(payload)
         direct = routing.candidates_from_payload(payload)
         admitted, refused = _gateway_candidates(payload)
@@ -644,14 +692,15 @@ class Controller:
                 raise NonRetryableFailure(dispatch.get("diagnostic", "DISPATCH_REFUSED"))
             if resume_state == "dispatching":
                 self.store.transition(mission_id, token, "dispatched", detail={"candidate_sha": dispatch["candidate_sha"], "execution_id": dispatch.get("execution_id")})
-            verification = self._step(mission, "verify", {"mission": mission["payload"], "dispatch": dispatch})
+            runtime_payload = self._runtime_payload(mission)
+            verification = self._step(mission, "verify", {"mission": runtime_payload, "dispatch": dispatch})
             if self._cancelled(mission_id, token):
                 return self.store.get(mission_id)
             if not verification.get("verified"):
                 raise NonRetryableFailure(verification.get("diagnostic", "CANDIDATE_VERIFICATION_FAILED"))
             if resume_state in {"dispatching", "dispatched"}:
                 self.store.transition(mission_id, token, "candidate_verified", detail={"candidate_sha": dispatch["candidate_sha"]})
-            evaluation = self._step(mission, "evaluate", {"mission": mission["payload"], "dispatch": dispatch, "verification": verification})
+            evaluation = self._step(mission, "evaluate", {"mission": runtime_payload, "dispatch": dispatch, "verification": verification})
             gate_refusal = _gate_refusal(mission["payload"], evaluation)
             if gate_refusal:
                 self.store.transition(mission_id, token, "escalated", reason=gate_refusal, release_lease=True)
@@ -661,7 +710,7 @@ class Controller:
                 return self.store.get(mission_id)
             if resume_state in {"dispatching", "dispatched", "candidate_verified"}:
                 self.store.transition(mission_id, token, "evaluated", detail={"gate_outcomes": evaluation.get("gate_outcomes", [])})
-            evidence = self._step(mission, "evidence", {"mission": mission["payload"], "dispatch": dispatch, "verification": verification, "evaluation": evaluation})
+            evidence = self._step(mission, "evidence", {"mission": runtime_payload, "dispatch": dispatch, "verification": verification, "evaluation": evaluation})
             if not evidence.get("accepted"):
                 if evidence.get("retryable"):
                     raise RetryableFailure(evidence.get("diagnostic", "EVIDENCE_BINDING_FAILED"))

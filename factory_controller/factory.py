@@ -406,6 +406,15 @@ class FactoryLifecycle:
                 "SHIFT_NOT_READY",
                 self._plain_gate_blocker(gate_preview.get("blockers") or ()))
 
+        # A revision admitted before SF-163 can have a durable context refusal
+        # whose only defect was that admission wrote the registered checkout.
+        # Rebind that exact, pre-provider mission after all start gates pass and
+        # before the supervisor is made runnable.  The recovery is narrow and
+        # append-only: it never submits a mission, opens a base, or touches a
+        # provider leg.
+        recovered = self._resume_revision_missions(
+            self._product_contract_or_none(), doctor)
+
         approval = {
             "approved": True,
             "approved_by": self.owner.username,
@@ -453,10 +462,14 @@ class FactoryLifecycle:
         return FactoryResult(
             action="start", ok=True, state="ready",
             lines=("FACTORY READY",
-                   "Shift active. Supervisor running."),
+                   "Shift active. Supervisor running.",
+                   *(("READY TO RESUME EXISTING REVISION",
+                      "Existing revision mission rebound and queued for resume.")
+                     if recovered else ())),
             details={"grant": applied, "gate": gate_preview,
                      "bridge": doctor, "readiness": readiness,
-                     "supervisor": service_doctor},
+                     "supervisor": service_doctor,
+                     "pre_provider_recovery": recovered},
         )
 
     def stop(self) -> FactoryResult:
@@ -782,7 +795,7 @@ class FactoryLifecycle:
             portfolio_ref=contract.run_ref,
             corpus_identity="package://%s@%s" % (accepted.mission["source_pcp"],
                                                  accepted.package_digest),
-            checkout=base["revision_checkout"])
+            checkout=base["revision_checkout"], grounding=base)
         try:
             submitted, created = self.controller.submit(
                 intake.payload, intake.idempotency_key)
@@ -872,6 +885,308 @@ class FactoryLifecycle:
                 "The execution layer opened a revision base but no checkout "
                 "the repository grounding could be read from.")
         return report
+
+    def _product_contract_or_none(self):
+        """Load the product contract only when a product recovery is possible."""
+
+        try:
+            return product.ProductContract.load(self.config.product_contract_path)
+        except product.ProductRefusal:
+            return None
+
+    @staticmethod
+    def _revision_work_item(value: Any) -> tuple[str, int] | None:
+        if not isinstance(value, str):
+            return None
+        match = re.fullmatch(
+            r"([A-Za-z0-9][A-Za-z0-9._-]*):revision:([1-9][0-9]*)", value)
+        return None if match is None else (match.group(1), int(match.group(2)))
+
+    @staticmethod
+    def _full_sha(value: Any) -> bool:
+        return isinstance(value, str) and bool(re.fullmatch(r"[0-9a-f]{40}", value))
+
+    def _revision_owner_act(self, mission: Mapping[str, Any], contract
+                            ) -> dict[str, Any]:
+        """Read and verify the Owner act that opened an existing revision."""
+
+        payload = mission.get("payload") or {}
+        work_item = payload.get("work_item_id")
+        parsed_work_item = self._revision_work_item(work_item)
+        if parsed_work_item is None:
+            raise FactoryRefusal(
+                "REVISION_RECOVERY_PROVENANCE_INVALID",
+                "The existing mission does not carry a revision work-item id.")
+        path = self._mission_path(str(work_item), "owner-intake")
+        try:
+            body = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            raise FactoryRefusal(
+                "REVISION_RECOVERY_PROVENANCE_UNAVAILABLE",
+                "The existing revision's Owner act is unavailable; its "
+                "grounding cannot be recovered safely.") from None
+        if not isinstance(body, dict) or body.get("work_item_id") != work_item:
+            raise FactoryRefusal(
+                "REVISION_RECOVERY_PROVENANCE_INVALID",
+                "The existing revision's Owner act does not name this mission.")
+        act_hash = body.get("act_hash")
+        unsigned = {key: value for key, value in body.items() if key != "act_hash"}
+        if not isinstance(act_hash, str) or context.sha256_hex(unsigned) != act_hash:
+            raise FactoryRefusal(
+                "REVISION_RECOVERY_PROVENANCE_INVALID",
+                "The existing revision's Owner act failed its integrity check.")
+        version = parsed_work_item[1]
+        if (body.get("schema_version") != product.OWNER_ACT_SCHEMA
+                or body.get("evidence_class") != "human_authority"
+                or body.get("run_ref") != contract.run_ref
+                or body.get("package_id") != contract.package_id
+                or body.get("package_version") != version
+                or body.get("source_pcp") != "%s@v%d" % (
+                    contract.package_id, version)
+                or body.get("project_id") != contract.project_id
+                or body.get("baseline_sha") != contract.baseline_sha
+                or body.get("chosen_action") != "submit"):
+            raise FactoryRefusal(
+                "REVISION_RECOVERY_PROVENANCE_INVALID",
+                "The existing revision's Owner act is not bound to this "
+                "product contract.")
+        revision = body.get("revision")
+        if (not isinstance(revision, dict)
+                or set(revision) != {
+                    "predecessor_rc", "predecessor_candidate_sha",
+                    "owner_validation_id", "owner_decision",
+                    "requested_changes"}
+                or not isinstance(revision.get("predecessor_rc"), str)
+                or not revision["predecessor_rc"]
+                or not isinstance(revision.get("owner_validation_id"), str)
+                or not revision["owner_validation_id"]
+                or revision.get("owner_decision") != pcp.RETURN_FOR_CHANGES
+                or not self._full_sha(revision.get("predecessor_candidate_sha"))
+                or not isinstance(revision.get("requested_changes"), list)
+                or not revision["requested_changes"]
+                or len(revision["requested_changes"]) > 64
+                or any(not isinstance(item, str) or not item or len(item) > 2048
+                       for item in revision["requested_changes"])):
+            raise FactoryRefusal(
+                "REVISION_RECOVERY_PROVENANCE_INVALID",
+                "The existing revision does not carry a verified returned "
+                "candidate.")
+        return body
+
+    def _revision_grounding(self, mission: Mapping[str, Any],
+                            registered: Mapping[str, Any],
+                            report: Mapping[str, Any], checkout: Any, *,
+                            expected_predecessor_sha: str | None = None,
+                            expected_revision_ref: str | None = None
+                            ) -> dict[str, Any]:
+        """Reduce one verified Bridge report to the durable runtime binding."""
+
+        if isinstance(mission, Mapping):
+            payload = mission.get("payload") or {}
+            project_id = mission.get("project_id")
+        else:
+            payload = {"baseline_sha": getattr(mission, "baseline_sha", None)}
+            project_id = getattr(mission, "project_id", None)
+        remote = registered.get("repository_remote_url")
+        predecessor = report.get("predecessor_sha")
+        revision_sha = report.get("revision_sha")
+        revision_ref = report.get("ref")
+        mission_remote = payload.get("repository_remote_url")
+        if (report.get("schema_version") != "factory.bridge.revision_base.v1"
+                or report.get("project_id") != project_id
+                or report.get("repository_remote_url") != remote
+                or (isinstance(mission, Mapping)
+                    and mission_remote != remote)
+                or revision_sha != payload.get("baseline_sha")
+                or not self._full_sha(revision_sha)
+                or report.get("revision_checkout") != checkout
+                or not isinstance(checkout, str) or len(checkout) > 4096
+                or len(checkout) <= 1 or not checkout.startswith("/")
+                or any(ord(char) < 0x20 for char in checkout)
+                or checkout == registered.get("checkout")
+                or not self._full_sha(predecessor)
+                or not isinstance(revision_ref, str)
+                or re.fullmatch(
+                    r"refs/heads/factory/revision/v[1-9][0-9]*",
+                    revision_ref) is None
+                or (expected_predecessor_sha is not None
+                    and predecessor != expected_predecessor_sha)
+                or (expected_revision_ref is not None
+                    and revision_ref != expected_revision_ref)):
+            raise FactoryRefusal(
+                "REVISION_GROUNDING_INVALID",
+                "The execution layer returned a revision checkout that cannot "
+                "be bound to this mission.")
+        return {
+            "schema_version": context.REVISION_GROUNDING_SCHEMA,
+            "kind": "revision",
+            "source": "factory-bridge",
+            "project_id": project_id,
+            "repository_remote_url": remote,
+            "revision_sha": payload["baseline_sha"],
+            "predecessor_sha": predecessor,
+            "revision_ref": revision_ref,
+            "checkout": checkout,
+        }
+
+    def _revision_context_binding(self, mission: Mapping[str, Any],
+                                  contract, registered: Mapping[str, Any],
+                                  report: Mapping[str, Any], *,
+                                  expected_predecessor_sha: str | None = None,
+                                  expected_revision_ref: str | None = None
+                                  ) -> dict[str, Any]:
+        """Build the verified Stage-1 overlay used only by recovery."""
+
+        grounding = self._revision_grounding(
+            mission, registered, report, report.get("revision_checkout"),
+            expected_predecessor_sha=expected_predecessor_sha,
+            expected_revision_ref=expected_revision_ref)
+        checkout = grounding["checkout"]
+        try:
+            gates = dogfood_intake.gate_commands(
+                contract.acceptance_gate_ids, contract.acceptance_gate_source,
+                checkout)
+        except dogfood_intake.IntakeError as refusal:
+            raise FactoryRefusal(refusal.code, refusal.detail) from None
+        stage1 = {
+            "repository": checkout,
+            "gate_workdir": checkout,
+            "gate_commands": gates,
+            "revision_grounding": grounding,
+        }
+        binding = {
+            "schema_version": context.REVISION_CONTEXT_BINDING_SCHEMA,
+            "kind": "revision",
+            "project_id": grounding["project_id"],
+            "repository_remote_url": grounding["repository_remote_url"],
+            "revision_sha": grounding["revision_sha"],
+            "predecessor_sha": grounding["predecessor_sha"],
+            "revision_ref": grounding["revision_ref"],
+            "checkout": checkout,
+            "grounding": grounding,
+            "stage1": stage1,
+        }
+        try:
+            return context.validate_revision_context_binding(
+                binding,
+                expected_project_id=grounding["project_id"],
+                expected_repository_remote_url=grounding[
+                    "repository_remote_url"],
+                expected_revision_sha=grounding["revision_sha"],
+                expected_predecessor_sha=expected_predecessor_sha,
+                expected_revision_ref=expected_revision_ref)
+        except context.ContextError:
+            raise FactoryRefusal(
+                "REVISION_GROUNDING_INVALID",
+                "The execution layer returned revision provenance that cannot "
+                "be bound to Stage-1.") from None
+
+    def _resolve_revision_binding(self, mission: Mapping[str, Any],
+                                 contract, registered: Mapping[str, Any]
+                                 ) -> dict[str, Any]:
+        """Ask the Bridge to resolve, not mint, the existing revision checkout."""
+
+        act = self._revision_owner_act(mission, contract)
+        revision = act["revision"]
+        baseline = (mission.get("payload") or {}).get("baseline_sha")
+        if not self._full_sha(baseline):
+            raise FactoryRefusal(
+                "REVISION_RECOVERY_PROVENANCE_INVALID",
+                "The existing revision does not carry a full immutable base id.")
+        work_item = self._revision_work_item(
+            (mission.get("payload") or {}).get("work_item_id"))
+        if work_item is None:
+            raise FactoryRefusal(
+                "REVISION_RECOVERY_PROVENANCE_INVALID",
+                "The existing mission does not carry a revision work-item id.")
+        expected_ref = "%sv%d" % (product.REVISION_REF_PREFIX, work_item[1])
+        try:
+            lifecycle = release.ReleaseLifecycle(self.store, clock=self.clock)
+            validation = lifecycle.owner_validation(
+                revision["owner_validation_id"])
+            candidate = lifecycle.candidate(revision["predecessor_rc"])
+        except release.ReleaseRefusal:
+            raise FactoryRefusal(
+                "REVISION_RECOVERY_PROVENANCE_INVALID",
+                "The existing revision's Owner Validation is unavailable.") from None
+        if (validation.rc_id != revision["predecessor_rc"]
+                or validation.candidate_sha
+                != revision["predecessor_candidate_sha"]
+                or validation.decision != pcp.RETURN_FOR_CHANGES
+                or candidate.project_id != contract.project_id
+                or candidate.candidate_sha
+                != revision["predecessor_candidate_sha"]):
+            raise FactoryRefusal(
+                "REVISION_RECOVERY_PROVENANCE_INVALID",
+                "The existing revision's Owner Validation does not match its "
+                "returned candidate.")
+        result, report = self._bridge_json(
+            "revision", "resolve", str(mission["project_id"]), baseline,
+            "--predecessor-sha", revision["predecessor_candidate_sha"],
+            "--ref", expected_ref)
+        if result.returncode != 0 or report.get("refused"):
+            raise FactoryRefusal(
+                str(report.get("code") or "REVISION_CHECKOUT_UNAVAILABLE"),
+                str(report.get("detail") or
+                    "The execution layer could not re-verify the revision checkout."))
+        return self._revision_context_binding(
+            mission, contract, registered, report,
+            expected_predecessor_sha=revision["predecessor_candidate_sha"],
+            expected_revision_ref=expected_ref)
+
+    def _resume_revision_missions(self, contract, doctor) -> list[dict[str, Any]]:
+        """Recover only terminal, pre-provider revision context refusals."""
+
+        if contract is None:
+            return []
+        candidates = []
+        for summary in self.store.all_missions():
+            if summary.get("project_id") != contract.project_id:
+                continue
+            mission = self.store.get(summary["id"])
+            if mission is None or mission.get("state") not in {
+                    "refused", "failed", "escalated"}:
+                continue
+            item = self._revision_work_item(
+                (mission.get("payload") or {}).get("work_item_id"))
+            if item is None or item[0] != contract.package_id:
+                continue
+            context_step = self.store.step_record(mission["id"], "context")
+            if (context_step is None
+                    or context_step.get("status") != "COMPLETED"
+                    or not isinstance(context_step.get("output"), dict)
+                    or context_step["output"].get("refusal_code") != "STALE_HEAD"
+                    or self.store.step_record(mission["id"], "dispatch") is not None
+                    or self.store.runs(mission["id"])):
+                continue
+            candidates.append(mission)
+        if not candidates:
+            return []
+        if len(candidates) > 1:
+            raise FactoryRefusal(
+                "REVISION_RECOVERY_AMBIGUOUS",
+                "More than one stopped revision mission is present; none was "
+                "reopened automatically.")
+        mission = candidates[0]
+        registered = dogfood_intake.registry_row(
+            self._registry_rows(doctor), contract.project_id)
+        binding = self._resolve_revision_binding(
+            mission, contract, registered)
+        try:
+            recovered = self.store.resume_pre_provider(mission["id"], binding)
+        except (KeyError, ValueError) as exc:
+            raise FactoryRefusal(
+                "REVISION_RECOVERY_UNSAFE",
+                "The stopped revision was not safe to resume before its "
+                "provider boundary (%s)." % type(exc).__name__) from None
+        return [{
+            "mission_id": mission["id"],
+            "work_item_id": (mission.get("payload") or {}).get("work_item_id"),
+            "revision_sha": binding["revision_sha"],
+            "checkout": binding["checkout"],
+            "changed": recovered["changed"],
+            "provider_started": False,
+        }]
 
     def review(self) -> FactoryResult:
         """Take the completed product mission to a reviewable Release Candidate.
@@ -1643,7 +1958,7 @@ class FactoryLifecycle:
 
     def _materialize(self, contract, entry, mission, doctor, grant, attempt=1,
                      brief=None, *, portfolio_ref=None, corpus_identity=None,
-                     checkout=None):
+                     checkout=None, grounding=None):
         """Derive the whole mission, and refuse rather than guess any part.
 
         ``portfolio_ref`` and ``corpus_identity`` default to the frozen
@@ -1671,7 +1986,7 @@ class FactoryLifecycle:
                 "mission could be bound to. Run './dev factory install'.")
         interpreter = self._resolve_supported_python()
         registered = dogfood_intake.registry_row(registry, mission.project_id)
-        checkout = checkout or registered.get("checkout")
+        checkout = registered.get("checkout") if checkout is None else checkout
         builder = self.context_builder
         if builder is None:
             builder = lambda wire: self._build_context(
@@ -1700,7 +2015,11 @@ class FactoryLifecycle:
                     "timeout_seconds": 3600,
                     "gate_timeout_seconds": 1800,
                     **({} if brief is None else {"mission_brief": brief}),
+                    **({} if grounding is None else {
+                        "revision_grounding": self._revision_grounding(
+                            mission, registered, grounding, checkout)}),
                 },
+                checkout=checkout,
                 attempt=attempt,
                 context_builder=builder,
             )

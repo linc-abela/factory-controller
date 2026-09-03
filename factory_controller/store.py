@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import re
 import sqlite3
 import time
 import uuid
@@ -65,6 +66,8 @@ INFRASTRUCTURE_REASON_PREFIXES = (
 #: whether to dispatch the same work again must honour that refusal rather than
 #: reopen it one layer up.
 SIDE_EFFECT_POSSIBLE_PREFIXES = ("PROVIDER_SWITCH_AFTER_",)
+REVISION_WORK_ITEM = re.compile(
+    r"^[A-Za-z0-9][A-Za-z0-9._-]*:revision:[1-9][0-9]*$")
 
 
 class ConflictError(ValueError):
@@ -171,6 +174,15 @@ class MissionStore:
                   input_json TEXT,
                   PRIMARY KEY(mission_id, name)
                 );
+                CREATE TABLE IF NOT EXISTS context_bindings (
+                  mission_id TEXT PRIMARY KEY REFERENCES missions(id),
+                  binding_json TEXT NOT NULL,
+                  created_at REAL NOT NULL
+                );
+                CREATE TRIGGER IF NOT EXISTS context_bindings_no_update
+                BEFORE UPDATE ON context_bindings BEGIN SELECT RAISE(ABORT, 'context bindings are append-only'); END;
+                CREATE TRIGGER IF NOT EXISTS context_bindings_no_delete
+                BEFORE DELETE ON context_bindings BEGIN SELECT RAISE(ABORT, 'context bindings are append-only'); END;
                 CREATE TABLE IF NOT EXISTS events (
                   sequence INTEGER PRIMARY KEY AUTOINCREMENT,
                   mission_id TEXT NOT NULL REFERENCES missions(id),
@@ -782,6 +794,161 @@ class MissionStore:
                 raise KeyError(name)
             self._event(db, mission_id, "STEP_COMPLETED", mission["state"], mission["state"], {"step": name})
 
+    def context_binding(self, mission_id: str) -> dict[str, Any] | None:
+        """Read the immutable execution-layer binding for a mission, if any."""
+
+        with self.connect() as db:
+            row = db.execute(
+                "SELECT binding_json FROM context_bindings WHERE mission_id=?",
+                (mission_id,)).fetchone()
+        if row is None:
+            return None
+        try:
+            value = json.loads(row["binding_json"])
+        except (TypeError, ValueError) as exc:
+            raise ValueError("CONTEXT_BINDING_CORRUPT") from exc
+        if not isinstance(value, dict):
+            raise ValueError("CONTEXT_BINDING_CORRUPT")
+        return value
+
+    def resume_pre_provider(self, mission_id: str,
+                            binding: dict[str, Any]) -> dict[str, Any]:
+        """Reopen one refused context mission without changing its identity.
+
+        This is deliberately narrower than ``retry``.  It accepts only the
+        known revision-grounding seam, only when the old context step recorded
+        ``STALE_HEAD``, and only before a dispatch step or routing leg exists.
+        Existing mission, step, attempt, run, and refusal rows are never
+        rewritten; the new binding and recovery event are the durable proof of
+        what changed.
+        """
+
+        if not isinstance(binding, dict) or not binding:
+            raise ValueError("CONTEXT_BINDING_INVALID")
+        try:
+            context_contract.validate_revision_context_binding(binding)
+        except context_contract.ContextError:
+            raise ValueError("CONTEXT_BINDING_INVALID") from None
+        encoded = canonical_json(binding)
+        with self.transaction() as db:
+            row = db.execute(
+                "SELECT * FROM missions WHERE id=?", (mission_id,)).fetchone()
+            if row is None:
+                raise KeyError(mission_id)
+            try:
+                payload = json.loads(row["payload_json"])
+            except (TypeError, ValueError) as exc:
+                raise ValueError("PRE_PROVIDER_MISSION_CORRUPT") from exc
+            if not isinstance(payload, dict):
+                raise ValueError("PRE_PROVIDER_MISSION_CORRUPT")
+            if (not isinstance(row["project_id"], str)
+                    or row["project_id"] != payload.get("project_id")
+                    or not isinstance(payload.get("repository_remote_url"), str)
+                    or not payload["repository_remote_url"]
+                    or not isinstance(payload.get("baseline_sha"), str)
+                    or len(payload["baseline_sha"]) != 40
+                    or any(char not in "0123456789abcdef"
+                           for char in payload["baseline_sha"])
+                    or REVISION_WORK_ITEM.fullmatch(
+                        str(payload.get("work_item_id") or "")) is None):
+                raise ValueError("PRE_PROVIDER_RECOVERY_NOT_REVISION")
+            try:
+                context_contract.validate_revision_context_binding(
+                    binding,
+                    expected_project_id=row["project_id"],
+                    expected_repository_remote_url=payload.get(
+                        "repository_remote_url"),
+                    expected_revision_sha=payload.get("baseline_sha"),
+                )
+            except context_contract.ContextError:
+                raise ValueError("CONTEXT_BINDING_MISSION_MISMATCH") from None
+            original_stage1 = payload.get("stage1")
+            if (not isinstance(original_stage1, dict)
+                    or not isinstance(original_stage1.get("repository"), str)
+                    or not original_stage1["repository"]):
+                raise ValueError("PRE_PROVIDER_RECOVERY_CHECKOUT_UNSAFE")
+            existing_binding = db.execute(
+                "SELECT binding_json FROM context_bindings WHERE mission_id=?",
+                (mission_id,)).fetchone()
+            if existing_binding is not None:
+                try:
+                    stored_binding = json.loads(existing_binding["binding_json"])
+                    context_contract.validate_revision_context_binding(
+                        stored_binding,
+                        expected_project_id=row["project_id"],
+                        expected_repository_remote_url=payload.get(
+                            "repository_remote_url"),
+                        expected_revision_sha=payload.get("baseline_sha"),
+                    )
+                except (TypeError, ValueError, json.JSONDecodeError):
+                    raise ValueError("CONTEXT_BINDING_CORRUPT") from None
+                if canonical_json(stored_binding) != existing_binding["binding_json"]:
+                    raise ValueError("CONTEXT_BINDING_CORRUPT")
+                if existing_binding["binding_json"] != encoded:
+                    raise ConflictError("CONTEXT_BINDING_CONFLICT")
+                return {"changed": False, "mission": self._row(row),
+                        "binding": binding}
+            if row["state"] not in {"refused", "failed", "escalated"}:
+                raise ValueError(
+                    "PRE_PROVIDER_RECOVERY_STATE: %s" % row["state"])
+            if row["cancel_requested"] or row["lease_token"] is not None:
+                raise ValueError("PRE_PROVIDER_RECOVERY_NOT_IDLE")
+
+            context_step = db.execute(
+                "SELECT status,output_json FROM steps WHERE mission_id=?"
+                " AND name='context'", (mission_id,)).fetchone()
+            if context_step is None or context_step["status"] != "COMPLETED":
+                raise ValueError("PRE_PROVIDER_CONTEXT_NOT_SETTLED")
+            try:
+                context_output = json.loads(context_step["output_json"])
+            except (TypeError, ValueError) as exc:
+                raise ValueError("PRE_PROVIDER_CONTEXT_CORRUPT") from exc
+            if not isinstance(context_output, dict) \
+                    or context_output.get("refusal_code") != "STALE_HEAD":
+                raise ValueError("PRE_PROVIDER_RECOVERY_REFUSAL_UNSAFE")
+
+            dispatch = db.execute(
+                "SELECT 1 FROM steps WHERE mission_id=? AND name='dispatch'",
+                (mission_id,)).fetchone()
+            if dispatch is not None:
+                raise ValueError("PRE_PROVIDER_RECOVERY_AFTER_DISPATCH")
+            legs = db.execute(
+                "SELECT 1 FROM runs WHERE mission_id=? LIMIT 1",
+                (mission_id,)).fetchone()
+            if legs is not None:
+                raise ValueError("PRE_PROVIDER_RECOVERY_AFTER_PROVIDER")
+
+            now = self.clock()
+            if existing_binding is None:
+                db.execute(
+                    "INSERT INTO context_bindings(mission_id,binding_json,created_at)"
+                    " VALUES(?,?,?)", (mission_id, encoded, now))
+            self._event(db, mission_id, "REVISION_CONTEXT_REBOUND",
+                        row["state"], row["state"], {
+                            "binding_schema": binding.get("schema_version"),
+                            "revision_sha": binding.get("revision_sha"),
+                            "checkout": binding.get("checkout"),
+                            "preserved_context_refusal": "STALE_HEAD",
+                            "preserved_terminal_reason": row["terminal_reason"],
+                            "provider_started": False,
+                        })
+            db.execute(
+                "UPDATE missions SET state='admitted',next_run_at=?,"
+                "lease_owner=NULL,lease_token=NULL,lease_expires_at=NULL,"
+                "terminal_reason=NULL,updated_at=? WHERE id=?",
+                (now, now, mission_id))
+            self._event(db, mission_id, "PRE_PROVIDER_MISSION_RESUMED",
+                        row["state"], "admitted", {
+                            "recovery_class": "revision_context",
+                            "preserved_context_refusal": "STALE_HEAD",
+                            "preserved_terminal_reason": row["terminal_reason"],
+                            "provider_started": False,
+                        })
+            updated = db.execute(
+                "SELECT * FROM missions WHERE id=?", (mission_id,)).fetchone()
+            return {"changed": True, "mission": self._row(updated),
+                    "binding": binding}
+
     def step_output(self, mission_id: str, name: str) -> Any | None:
         """What a completed step recorded, or ``None`` if it never completed."""
 
@@ -930,7 +1097,7 @@ class MissionStore:
         payload = mission.get("payload") or {}
         request = context_contract.ContextRequest.from_payload(payload)
         budget = context_contract.ContextBudget.from_payload(payload)
-        row = self.step_output(mission_id, "context")
+        row = self._context_output(mission_id)
         package = None if row is None else context_contract.package_from_row(row)
         refusals = [
             {"attempt": event["detail"].get("attempt"), "code": event["detail"].get("code"),
@@ -1062,7 +1229,7 @@ class MissionStore:
                     if event["kind"] == "CONTEXT_REFUSED"]
         if payload.get("context_request") is None:
             return {"state": "not_applicable", "context_refusals": refusals}
-        row = self.step_output(mission_id, "context")
+        row = self._context_output(mission_id)
         if row is None:
             return {"state": "not_run", "context_refusals": refusals}
         package = context_contract.package_from_row(row)
@@ -1083,6 +1250,13 @@ class MissionStore:
             "reduction": package.measurement.reduction,
             "context_refusals": refusals,
         }
+
+    def _context_output(self, mission_id: str) -> Any | None:
+        """Return the effective context, retaining the original refusal history."""
+
+        recovery = self.step_output(mission_id, "context-recovery")
+        return recovery if recovery is not None else self.step_output(
+            mission_id, "context")
 
 
     # ------------------------------------------------------------------ #
