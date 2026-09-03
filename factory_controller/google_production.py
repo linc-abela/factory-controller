@@ -456,11 +456,7 @@ def file_system_artifact_resolver(
         except OSError:
             continue
         if files:
-            hasher = hashlib.sha256()
-            for name in sorted(files):
-                hasher.update(name.encode("utf-8"))
-                hasher.update(files[name])
-            if f"sha256:{hasher.hexdigest()}" == artifact_digest:
+            if production.deployable_digest(files) == artifact_digest:
                 return files
     return {}
 
@@ -571,11 +567,7 @@ class FirebaseHostingDeploymentAdapter:
             return outcome
 
         # Requirement 4: Re-derive exact digest before network mutation
-        hasher = hashlib.sha256()
-        for name in sorted(files):
-            hasher.update(name.encode("utf-8"))
-            hasher.update(files[name])
-        computed_digest = f"sha256:{hasher.hexdigest()}"
+        computed_digest = production.deployable_digest(files)
         if computed_digest != artifact_digest:
             outcome = production.DeploymentOutcome(
                 reached=False,

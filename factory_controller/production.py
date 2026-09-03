@@ -590,6 +590,24 @@ class EnvironmentPolicy:
 # health
 # --------------------------------------------------------------------------- #
 
+
+def deployable_digest(files: Mapping[str, bytes]) -> str:
+    """The identity of a deployable file set: its names and its bytes.
+
+    Each sorted name as UTF-8, then that file's exact bytes.  A packaging
+    container's own hash is a different fact about a different object: two
+    archives of identical bytes differ by their headers, and the digest an
+    adapter re-derives immediately before serving has to be derived from what
+    it is about to serve.
+    """
+
+    hasher = hashlib.sha256()
+    for name in sorted(files):
+        hasher.update(name.encode("utf-8"))
+        hasher.update(files[name])
+    return "sha256:" + hasher.hexdigest()
+
+
 @dataclass(frozen=True)
 class HealthRecord:
     """What an environment reported, as observed.  Not a decision."""

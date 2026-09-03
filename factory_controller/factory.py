@@ -806,7 +806,7 @@ class FactoryLifecycle:
             self.production.record_health(
                 deployment["deployment_id"],
                 self._probe_review_surface(
-                    contract, rejected, deployment["validation_surface"]))
+                    rejected, deployment["validation_surface"]))
         try:
             validation = lifecycle.record_owner_validation(
                 superseded["owner_validation_id"], rejected.rc_id,
@@ -1495,6 +1495,17 @@ class FactoryLifecycle:
         registry = dogfood_intake.registry_row(
             self._registry_rows(doctor), contract.project_id)
         artifact = self._build_artifact(contract, candidate)
+        # The execution layer's identity is the hash of the packaging
+        # container it wrote.  What a release *is* is the file set that gets
+        # served, so the Release Candidate is sealed on that -- the same
+        # identity the resolver re-derives from the review root and the same
+        # one the deployment adapter re-derives before any network mutation.
+        deployable = self._deployable_files(artifact)
+        artifact = {**artifact,
+                    "archive_identity": artifact["artifact"]["identity"],
+                    "artifact": {**artifact["artifact"],
+                                 "identity":
+                                     production.deployable_digest(deployable)}}
         self._provision_product_store(contract, doctor)
 
         self.store.coordinate(
@@ -1502,6 +1513,7 @@ class FactoryLifecycle:
             "FACTORY_PRODUCT_QA_HELD",
             {**boundary, "candidate_sha": candidate,
              "artifact": artifact["artifact"],
+             "archive_identity": artifact["archive_identity"],
              "gate_outcomes": [
                  {"gate_id": row.get("gate_id"), "passed": row.get("passed"),
                   "exit_code": row.get("exit_code")}
@@ -1545,7 +1557,7 @@ class FactoryLifecycle:
                 getattr(refusal, "detail", "The review could not be prepared."),
             ) from None
 
-        root = self._materialize_review(artifact, sealed.artifact_digest)
+        root = self._materialize_review(deployable, sealed.artifact_digest)
         self._record_owner_act("review", sealed.rc_id, {
             "rc_id": sealed.rc_id, "candidate_sha": candidate,
             "artifact_digest": sealed.artifact_digest,
@@ -1625,49 +1637,79 @@ class FactoryLifecycle:
                 "from the verified candidate.")
         return report
 
-    def _materialize_review(self, report: Mapping[str, Any], identity: str) -> Path:
-        """Unpack the sealed artifact where the review surface can serve it.
+    @staticmethod
+    def _deployable_files(report: Mapping[str, Any]) -> dict[str, bytes]:
+        """The exact bytes this release serves, read from the sealed archive.
 
-        The bytes served are the archive the identity was taken over, not the
-        working copy and not a fresh checkout -- otherwise the digest the Owner
-        validates is not the digest that would be promoted, which is the one
-        invariant the package states about its own release.
+        The archive is packaging; a release is the file set under the declared
+        publish prefix, with that prefix removed -- because that is what a
+        hosting target serves at ``/``.  Reading it here once means the review
+        surface, the artifact resolver and the deployment adapter are all
+        looking at one tree, so the bytes the Owner validates cannot differ in
+        layout from the bytes Production receives.
+
+        The two rules `tarfile`'s data filter enforces are applied rather than
+        assumed: the filter landed in 3.12 and the Owner's own `./dev factory`
+        runs whichever python3 the host has.
+        """
+
+        prefix = str(report.get("publish_prefix") or "").strip("/")
+        prefix = prefix + "/" if prefix else ""
+        files: dict[str, bytes] = {}
+        try:
+            with tarfile.open(str(report["archive_path"]), "r:") as archive:
+                for member in archive.getmembers():
+                    if not member.isfile():
+                        continue
+                    if member.name.startswith("/") \
+                            or ".." in member.name.split("/"):
+                        raise FactoryRefusal(
+                            "REVIEW_ARTIFACT_UNSAFE",
+                            "The artifact archive names a path outside itself.")
+                    if not member.name.startswith(prefix):
+                        raise FactoryRefusal(
+                            "REVIEW_ARTIFACT_UNSAFE",
+                            "The artifact archive names a path outside the "
+                            "publish prefix it declares.")
+                    handle = archive.extractfile(member)
+                    files[member.name[len(prefix):]] = \
+                        b"" if handle is None else handle.read()
+        except (OSError, tarfile.TarError):
+            raise FactoryRefusal(
+                "REVIEW_NOT_MATERIALIZED",
+                "The reviewable bytes could not be read from the artifact "
+                "the execution layer built.") from None
+        if not files:
+            raise FactoryRefusal(
+                "REVIEW_NOT_MATERIALIZED",
+                "The artifact publishes no file under the prefix it declares.")
+        return files
+
+    def _materialize_review(self, files: Mapping[str, bytes],
+                            identity: str) -> Path:
+        """Write the sealed file set where the review surface can serve it.
+
+        Named by the identity taken over these exact bytes, so the directory
+        the artifact resolver finds by digest is the directory the Owner
+        reviewed -- and a release whose bytes changed cannot land on top of
+        one the Owner already looked at.
         """
 
         root = self.config.state_dir / "review" / identity.split(":", 1)[-1]
-        prefix = str(report.get("publish_prefix") or "").rstrip("/")
         try:
             if root.exists():
                 shutil.rmtree(root)
             root.mkdir(parents=True)
-            with tarfile.open(str(report["archive_path"]), "r:") as archive:
-                # The extraction filter this needs landed in 3.12 and the
-                # Owner's own `./dev factory` runs whichever python3 the host
-                # has, so the two rules the filter enforces are applied here
-                # instead of assumed.  A directory entry is not extracted at
-                # all: the archive is a canonical repack of files only, and a
-                # member that is not one is not something to unpack quietly.
-                members = []
-                for member in archive.getmembers():
-                    if not member.isfile():
-                        continue
-                    parts = member.name.split("/")
-                    if member.name.startswith("/") or ".." in parts:
-                        raise FactoryRefusal(
-                            "REVIEW_ARTIFACT_UNSAFE",
-                            "The artifact archive names a path outside itself.")
-                    members.append(member)
-                # Pass the filter as well wherever the interpreter has it:
-                # the checks above are the floor, not a replacement for it.
-                filtered = ({"filter": "data"}
-                            if hasattr(tarfile, "data_filter") else {})
-                archive.extractall(str(root), members=members, **filtered)
-        except (OSError, tarfile.TarError) as error:
+            for name, body in files.items():
+                target = root / name
+                target.parent.mkdir(parents=True, exist_ok=True)
+                target.write_bytes(body)
+        except OSError as error:
             raise FactoryRefusal(
                 "REVIEW_NOT_MATERIALIZED",
                 "The reviewable bytes could not be written: %s"
                 % type(error).__name__) from None
-        served = root / prefix if prefix else root
+        served = root
         marker = self.config.state_dir / "review" / "current"
         try:
             if marker.is_symlink() or marker.exists():
@@ -1708,7 +1750,7 @@ class FactoryLifecycle:
                 "new release decision, not a revision of a review.")
         return dict(row)
 
-    def _probe_review_surface(self, contract, rc, surface: str):
+    def _probe_review_surface(self, rc, surface: str):
         """Observe the Owner's own review surface, and never assert it.
 
         Owner Validation requires the exact review deployment to be durably
@@ -1730,8 +1772,7 @@ class FactoryLifecycle:
         """
 
         root = self.config.state_dir / "review" / rc.artifact_digest.split(":", 1)[-1]
-        prefix = contract.publish_prefix.strip("/")
-        entry = (root / prefix if prefix else root) / "index.html"
+        entry = root / "index.html"
         try:
             expected = entry.read_bytes()
         except OSError:

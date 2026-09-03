@@ -701,7 +701,7 @@ class ProductReviewTests(unittest.TestCase):
         report = {"archive_path": str(hostile), "publish_prefix": "public/"}
 
         with self.assertRaises(Exception) as caught:
-            self.lifecycle._materialize_review(report, "sha256:" + "a" * 64)
+            self.lifecycle._deployable_files(report)
         self.assertEqual(caught.exception.code, "REVIEW_ARTIFACT_UNSAFE")
 
     def test_the_review_environment_is_registered_by_provisioning(self):
