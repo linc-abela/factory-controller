@@ -165,9 +165,12 @@ def _reconcile(request: dict[str, Any], config: dict[str, Any]) -> dict[str, Any
     before a lane is allocated or an adapter is asked for anything.
     """
 
-    proof = request.get("input", {}).get("route", {})
-    proof = proof.get("reconcile_proof") if isinstance(proof, dict) else None
-    if not isinstance(proof, str) or len(proof) != 64:
+    route = request.get("input", {}).get("route", {})
+    route = route if isinstance(route, dict) else {}
+    proof = route.get("reconcile_proof")
+    record = route.get("reconcile_proof_record")
+    if not isinstance(proof, str) or len(proof) != 64 \
+            or not isinstance(record, dict) or record.get("proof_digest") != proof:
         return {"status": "refused",
                 "diagnostic": "RECONCILE_PROOF_MISSING",
                 "receipt": {"provider": "factory-evidence-core/first-live",
@@ -186,11 +189,13 @@ def _reconcile(request: dict[str, Any], config: dict[str, Any]) -> dict[str, Any
                             "execution_mode": "not_applicable",
                             "usage": {"cost_state": "not_applicable"},
                             "refusal_code": "RECONCILE_NOT_A_REAL_MISSION"}}
-    return _dispatch(request, config, reconcile_proof=proof)
+    return _dispatch(request, config, reconcile_proof=proof,
+                     reconcile_record=record)
 
 
 def _dispatch(request: dict[str, Any], config: dict[str, Any], *,
-              reconcile_proof: str | None = None) -> dict[str, Any]:
+              reconcile_proof: str | None = None,
+              reconcile_record: dict[str, Any] | None = None) -> dict[str, Any]:
     command = config.get("command")
     if not isinstance(command, list) or not command or not all(isinstance(x, str) for x in command):
         raise ValueError("stage1.command must be a non-empty argument array")
@@ -222,6 +227,15 @@ def _dispatch(request: dict[str, Any], config: dict[str, Any], *,
             # replay response bound to this key, or refuse.  The Bridge, not
             # this process, is what enforces it.
             argv.extend(("--reconcile-replay", reconcile_proof))
+            # The proof body itself, written beside the result the runner is
+            # about to produce -- provably the same filesystem, because this
+            # process reads that result back from it.  The runner cross-checks
+            # the body against the digest above before either is used.
+            proof_path = output.with_name(output.name + ".reconciliation.json")
+            proof_path.parent.mkdir(parents=True, exist_ok=True)
+            proof_path.write_text(
+                json.dumps(reconcile_record, sort_keys=True), encoding="utf-8")
+            argv.extend(("--reconciliation-proof", str(proof_path)))
         argv.append("--operator-opt-in")
     started = time.monotonic()
     completed = subprocess.run(

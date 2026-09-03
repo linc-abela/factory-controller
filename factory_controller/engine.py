@@ -173,8 +173,15 @@ class Controller:
             # durable step input records which derived evidence licensed it and
             # the execution layer can be asked for a lookup rather than a run.
             proof = self.store.reconciliation(mission["id"]) or {}
-            value = {**value, "route": {**value["route"],
-                                        "reconcile_proof": proof.get("proof_digest")}}
+            # The body travels beside its digest.  The consumer has to prove
+            # the sealed response against the *original* request it was
+            # emitted for, and the digest alone names that binding without
+            # carrying it.  Recorded input only -- ``memo_value`` is the
+            # mission payload, so the step's durable identity is unchanged.
+            value = {**value, "route": {
+                **value["route"],
+                "reconcile_proof": proof.get("proof_digest"),
+                "reconcile_proof_record": proof or None}}
         started = self.store.begin_step(
             mission["id"], mission["lease_token"], name,
             value if memo_value is None else memo_value,
