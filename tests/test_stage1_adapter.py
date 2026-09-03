@@ -420,6 +420,50 @@ class Stage1AdapterTest(unittest.TestCase):
         self.assertTrue(outcome["expected_failure"])
         self.assertTrue(outcome["satisfied"])
 
+    def test_bound_idempotency_key_requires_both_on_completed_but_preserves_echo_on_refusal(self):
+        # Completed run requires both envelope and binding keys
+        self.assertIsNone(_bound_idempotency_key({
+            "status": "completed",
+            "execution_envelope": {"idempotency_key": "k1"},
+        }))
+        self.assertEqual(_bound_idempotency_key({
+            "status": "completed",
+            "execution_envelope": {"idempotency_key": "k1"},
+            "execution_binding": {"idempotency_key": "k1"},
+        }), "k1")
+        # Refused run preserves echoed key from envelope even if binding is absent
+        self.assertEqual(_bound_idempotency_key({
+            "status": "refused",
+            "refusal_code": "CANDIDATE_WORKSPACE_MISMATCH",
+            "execution_envelope": {"idempotency_key": "k1"},
+        }), "k1")
+        # Conflicting keys return None
+        self.assertIsNone(_bound_idempotency_key({
+            "status": "refused",
+            "execution_envelope": {"idempotency_key": "k1"},
+            "execution_binding": {"idempotency_key": "k2"},
+        }))
+
+    def test_refusal_clears_candidate_sha_and_workspace(self):
+        script = self.root / "refusal_stage1.py"
+        script.write_text(
+            "import json,sys\n"
+            "p=sys.argv[sys.argv.index('--output')+1]\n"
+            "json.dump({'status':'refused','refusal_code':'CANDIDATE_WORKSPACE_MISMATCH',"
+            "'fixture_only':False,"
+            "'execution_envelope':{'candidate_sha':'a'*40,'execution_id':'e-refuse',"
+            "'execution_mode':'real','idempotency_key':'k-1'},"
+            "'transport_invocations':1},open(p,'w'))\n"
+        )
+        mission = {"stage1": dict(self.config, command=[sys.executable, str(script)], mode="real", operator_opt_in=True)}
+        dispatch = self._run("dispatch", {"mission": mission})
+        self.assertEqual(dispatch["status"], "refused")
+        self.assertIsNone(dispatch["candidate_sha"])
+        self.assertIsNone(dispatch["candidate_workspace"])
+        self.assertEqual(dispatch["receipt"]["refusal_code"], "CANDIDATE_WORKSPACE_MISMATCH")
+        self.assertEqual(dispatch["receipt"]["idempotency_key"], "k-1")
+        self.assertEqual(dispatch["receipt"]["execution_mode"], "real")
+
     @staticmethod
     def _git(repository: Path, *arguments: str) -> str:
         completed = subprocess.run(

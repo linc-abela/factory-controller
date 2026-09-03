@@ -108,7 +108,12 @@ def _bound_idempotency_key(result: dict[str, Any]) -> str | None:
             if not isinstance(key, str) or not key:
                 return None
             keys.append(key)
-    if len(keys) != 2 or len(set(keys)) != 1:
+    if not keys:
+        return None
+    if len(keys) > 1 and len(set(keys)) != 1:
+        return None
+    status = result.get("status")
+    if status in {"completed", "passed"} and len(keys) != 2:
         return None
     return keys[0]
 
@@ -190,8 +195,8 @@ def _dispatch(request: dict[str, Any], config: dict[str, Any]) -> dict[str, Any]
         mapped = "retryable_error" if completed.returncode else "refused"
     return {
         "status": mapped,
-        "candidate_sha": candidate,
-        "candidate_workspace": workspace,
+        "candidate_sha": candidate if mapped == "completed" else None,
+        "candidate_workspace": workspace if mapped == "completed" else None,
         "execution_id": envelope.get("execution_id"),
         "diagnostic": result.get("refusal_code") or result.get("status"),
         "stage1_result": result,

@@ -1189,11 +1189,28 @@ class FactoryLifecycle:
                 continue
             legs = self.store.runs(mission["id"])
             dispatch = self.store.step_record(mission["id"], store_mod.DISPATCH_STEP)
+            dispatch_rec = self.store.step_record(mission["id"], store_mod.DISPATCH_RECOVERY_STEP)
             if dispatch is None and not legs:
                 candidates.append(mission)                     # SF-163
             elif (store_mod.pre_provider_dispatch_refusal(dispatch)
                     and all(leg.get("process_started") is False for leg in legs)):
                 candidates.append(mission)                     # SF-164
+            elif dispatch_rec is not None or dispatch is not None:
+                rec = dispatch_rec if dispatch_rec is not None else dispatch
+                out = rec.get("output") or {}
+                has_cand = bool(
+                    out.get("candidate_sha")
+                    or (isinstance(out.get("candidate_workspace"), dict)
+                        and out["candidate_workspace"].get("candidate_sha"))
+                    or (isinstance(out.get("stage1_result"), dict)
+                        and out["stage1_result"].get("execution_envelope", {}).get("candidate_sha")))
+                rec_refusal = (isinstance(out.get("receipt"), dict) and out["receipt"].get("refusal_code")) \
+                    or out.get("diagnostic") or (mission.get("terminal_reason") or "")
+                is_replay_ref = any(str(rec_refusal).startswith(p) for p in (
+                    "CANDIDATE_WORKSPACE_MISMATCH", "IDEMPOTENCY_KEY_UNPROVEN",
+                    *store_mod.INFRASTRUCTURE_REASON_PREFIXES))
+                if has_cand and is_replay_ref:
+                    candidates.append(mission)                 # SF-167
         return candidates
 
     def _resume_revision_missions(self, contract, doctor) -> list[dict[str, Any]]:

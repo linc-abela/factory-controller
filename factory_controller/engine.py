@@ -172,7 +172,11 @@ class Controller:
             value if memo_value is None else memo_value,
             recorded_input=value)
         if started["status"] == "COMPLETED":
-            return started["output"]
+            route = value.get("route") if isinstance(value, dict) else None
+            recover_only = isinstance(route, dict) and route.get("recover_only") is True
+            output = started.get("output")
+            if not (recover_only and isinstance(output, dict) and output.get("status") != "completed"):
+                return started["output"]
         adapter_value = value
         if replay_input and isinstance(started.get("input"), dict):
             adapter_value = started["input"]

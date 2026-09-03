@@ -78,6 +78,7 @@ INFRASTRUCTURE_REASON_PREFIXES = (
     "PROJECT_REPOSITORY_UNRESOLVED",
     "REPOSITORY_REMOTE_MISMATCH",
     "BASELINE_SHA_UNKNOWN",
+    "CANDIDATE_WORKSPACE_MISMATCH",
 )
 
 #: The subset of the above that leaves a provider effect possible.  ``engine``
@@ -919,26 +920,38 @@ class MissionStore:
         rows = [row for row in self.step_records(mission_id)
                 if row["name"] in (DISPATCH_STEP, DISPATCH_RECOVERY_STEP)]
         _, record = effective_dispatch_step(rows)
-        if record is not None:
-            # A live recovery identity means the repaired attempt itself
-            # settled; it is eligible only on the same proof as the first.
-            if not pre_provider_dispatch_refusal(record):
-                return None
-        else:
+        if record is None:
             record = next((row for row in rows if row["name"] == DISPATCH_STEP), None)
-            if not pre_provider_dispatch_refusal(record):
-                return None
-        legs = db.execute(
-            "SELECT 1 FROM runs WHERE mission_id=? AND (process_started IS NULL"
-            " OR process_started<>0) LIMIT 1", (mission_id,)).fetchone()
-        if legs is not None:
-            # One leg that did not prove it started nothing is enough: a second
-            # dispatch could then be a duplicate provider leg.
+        if record is None:
             return None
+
         output = record.get("output") or {}
         receipt = output.get("receipt") if isinstance(output, Mapping) else {}
         refusal = (isinstance(receipt, Mapping) and receipt.get("refusal_code")) \
             or output.get("diagnostic") or "DISPATCH_REFUSED"
+
+        legs = db.execute(
+            "SELECT 1 FROM runs WHERE mission_id=? AND (process_started IS NULL"
+            " OR process_started<>0) LIMIT 1", (mission_id,)).fetchone()
+        if legs is not None:
+            has_candidate = bool(
+                output.get("candidate_sha")
+                or (isinstance(output.get("candidate_workspace"), Mapping)
+                    and output["candidate_workspace"].get("candidate_sha"))
+                or (isinstance(output.get("stage1_result"), Mapping)
+                    and output["stage1_result"].get("execution_envelope", {}).get("candidate_sha")))
+            ref_str = str(refusal)
+            is_replay_refusal = (
+                ref_str.startswith("CANDIDATE_WORKSPACE_MISMATCH")
+                or ref_str.startswith("IDEMPOTENCY_KEY_UNPROVEN")
+                or any(ref_str.startswith(p) for p in INFRASTRUCTURE_REASON_PREFIXES)
+            )
+            if has_candidate and is_replay_refusal:
+                return "revision_replay", ref_str
+            return None
+
+        if not pre_provider_dispatch_refusal(record):
+            return None
         return "revision_dispatch", str(refusal)
 
     def resume_pre_provider(self, mission_id: str,
