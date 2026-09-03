@@ -1189,29 +1189,48 @@ class FactoryLifecycle:
                 continue
             legs = self.store.runs(mission["id"])
             dispatch = self.store.step_record(mission["id"], store_mod.DISPATCH_STEP)
-            dispatch_rec = self.store.step_record(mission["id"], store_mod.DISPATCH_RECOVERY_STEP)
             if dispatch is None and not legs:
                 candidates.append(mission)                     # SF-163
             elif (store_mod.pre_provider_dispatch_refusal(dispatch)
                     and all(leg.get("process_started") is False for leg in legs)):
                 candidates.append(mission)                     # SF-164
-            elif dispatch_rec is not None or dispatch is not None:
-                rec = dispatch_rec if dispatch_rec is not None else dispatch
-                out = rec.get("output") or {}
-                has_cand = bool(
-                    out.get("candidate_sha")
-                    or (isinstance(out.get("candidate_workspace"), dict)
-                        and out["candidate_workspace"].get("candidate_sha"))
-                    or (isinstance(out.get("stage1_result"), dict)
-                        and out["stage1_result"].get("execution_envelope", {}).get("candidate_sha")))
-                rec_refusal = (isinstance(out.get("receipt"), dict) and out["receipt"].get("refusal_code")) \
-                    or out.get("diagnostic") or (mission.get("terminal_reason") or "")
-                is_replay_ref = any(str(rec_refusal).startswith(p) for p in (
-                    "CANDIDATE_WORKSPACE_MISMATCH", "IDEMPOTENCY_KEY_UNPROVEN",
-                    *store_mod.INFRASTRUCTURE_REASON_PREFIXES))
-                if has_cand and is_replay_ref:
-                    candidates.append(mission)                 # SF-167
+            elif self._reconcilable_revision(mission, dispatch):
+                candidates.append(mission)                     # SF-168
         return candidates
+
+    def _reconcilable_revision(self, mission, dispatch) -> bool:
+        """Whether a stopped revision's *own already-produced* candidate is
+        the only thing between it and its next step.
+
+        Deliberately narrow.  The layer proved a provider ran, so the mission
+        is not pre-provider and nothing here pretends otherwise: what makes it
+        recoverable is that the result is sealed, immutable, and re-servable
+        without a second leg.  SF-167 selected on a candidate hint plus a set
+        of refusal prefixes that included every generic infrastructure reason
+        and ``IDEMPOTENCY_KEY_UNPROVEN`` -- states in which the provider's
+        effect and identity are exactly what is *not* established.
+
+        One refusal qualifies, and only one: the candidate exists and could not
+        be proved to be in the revision checkout.  The proof that closes it is
+        derived by the execution layer, recorded durably, and re-checked by
+        ``store.resume_pre_provider`` before anything is reopened.
+        """
+
+        rows = [row for row in self.store.step_records(mission["id"])
+                if row["name"] in store_mod.DISPATCH_STEP_NAMES]
+        _, record = store_mod.effective_dispatch_step(rows)
+        record = record if record is not None else dispatch
+        if record is None or record.get("status") != "COMPLETED":
+            return False
+        output = record.get("output") or {}
+        if not isinstance(output, dict) or output.get("status") == "completed":
+            return False
+        if store_mod.sealed_candidate_sha(record) is None:
+            return False
+        receipt = output.get("receipt") if isinstance(output.get("receipt"), dict) else {}
+        refusal = receipt.get("refusal_code") or output.get("diagnostic") \
+            or mission.get("terminal_reason") or ""
+        return str(refusal).startswith(store_mod.REVISION_REPLAY_REFUSAL)
 
     def _resume_revision_missions(self, contract, doctor) -> list[dict[str, Any]]:
         """Reopen the one stopped revision this contract owns, if there is one."""
@@ -1229,6 +1248,7 @@ class FactoryLifecycle:
             self._registry_rows(doctor), contract.project_id)
         binding = self._resolve_revision_binding(
             mission, contract, registered)
+        proof = self._reconcile_revision_candidate(mission, binding)
         try:
             recovered = self.store.resume_pre_provider(mission["id"], binding)
         except (KeyError, ValueError) as exc:
@@ -1243,7 +1263,44 @@ class FactoryLifecycle:
             "checkout": binding["checkout"],
             "changed": recovered["changed"],
             "provider_started": False,
+            "reconciliation_proof_digest": (proof or {}).get("proof_digest"),
+            "reconciled_candidate_sha": (proof or {}).get("candidate_sha"),
         }]
+
+    def _reconcile_revision_candidate(self, mission, binding):
+        """Derive and record the proof a post-provider revision recovery needs.
+
+        Returns ``None`` for the pre-provider classes, which need no proof and
+        must not acquire one.  For the SF-168 class it asks the execution layer
+        to reconcile -- a lookup and a materialization, no admission and no
+        execution -- and records the answer through ``record_reconciliation``,
+        which binds it to this mission, key, base and sealed candidate before
+        it can license anything.
+        """
+
+        dispatch = self.store.step_record(mission["id"], store_mod.DISPATCH_STEP)
+        if not self._reconcilable_revision(mission, dispatch):
+            return None
+        payload = mission.get("payload") or {}
+        result, report = self._bridge_json(
+            "revision", "reconcile", str(mission["project_id"]),
+            binding["revision_sha"],
+            "--work-item-id", str(payload.get("work_item_id")),
+            "--idempotency-key", str(mission["idempotency_key"]),
+            "--predecessor-sha", binding["predecessor_sha"])
+        if result.returncode != 0 or report.get("refused"):
+            raise FactoryRefusal(
+                str(report.get("code") or "CANDIDATE_WORKSPACE_MISMATCH"),
+                str(report.get("detail") or
+                    "The execution layer could not reconcile the sealed "
+                    "candidate into the revision checkout."))
+        try:
+            return self.store.record_reconciliation(mission["id"], report)
+        except (KeyError, ValueError, store_mod.ConflictError) as exc:
+            raise FactoryRefusal(
+                "REVISION_RECONCILIATION_UNSAFE",
+                "The reconciliation proof does not bind to this stopped "
+                "revision (%s)." % type(exc).__name__) from None
 
     def review(self) -> FactoryResult:
         """Take the completed product mission to a reviewable Release Candidate.

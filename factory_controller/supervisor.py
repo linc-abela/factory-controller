@@ -961,7 +961,7 @@ class OperationsSupervisor:
             " WHERE state IN ('dispatched','candidate_verified','evaluated',"
             "'evidence_sealed') OR (state='dispatching' AND EXISTS ("
             "SELECT 1 FROM steps s WHERE s.mission_id=missions.id"
-            " AND s.name IN ('dispatch','dispatch-recovery')"
+            " AND s.name IN " + ledger.DISPATCH_STEP_SQL +
             " AND s.status='STARTED'"
             ") AND (NOT EXISTS (SELECT 1 FROM runs r0"
             " WHERE r0.mission_id=missions.id) OR EXISTS ("
@@ -999,7 +999,7 @@ class OperationsSupervisor:
                 " ('dispatched','candidate_verified','evaluated','evidence_sealed')"
                 " OR (lease_token IS NULL AND state='dispatching' AND EXISTS ("
                 "SELECT 1 FROM steps s WHERE s.mission_id=missions.id"
-                " AND s.name IN ('dispatch','dispatch-recovery')"
+                " AND s.name IN " + ledger.DISPATCH_STEP_SQL +
                 " AND s.status='STARTED'"
                 ") AND (NOT EXISTS (SELECT 1 FROM runs r0"
                 " WHERE r0.mission_id=missions.id) OR EXISTS ("

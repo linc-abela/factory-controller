@@ -17,7 +17,8 @@ from typing import Any, Mapping, Protocol
 from . import capacity, context, gateway, routing
 from .context import ContextBudget, ContextError, ContextRequest
 from .routing import ExecutionPolicy, PolicyError, Selection
-from .store import DISPATCH_STEP, MissionStore, effective_dispatch_step
+from .store import (DISPATCH_STEP, RECONCILE_STEP, MissionStore,
+                    effective_dispatch_step)
 
 
 class StepAdapter(Protocol):
@@ -167,16 +168,26 @@ class Controller:
         between fallback legs while the step itself stays the same operation.
         """
 
+        if adapter_step == RECONCILE_STEP and isinstance(value.get("route"), dict):
+            # The proof's own digest travels with the leg it authorizes, so the
+            # durable step input records which derived evidence licensed it and
+            # the execution layer can be asked for a lookup rather than a run.
+            proof = self.store.reconciliation(mission["id"]) or {}
+            value = {**value, "route": {**value["route"],
+                                        "reconcile_proof": proof.get("proof_digest")}}
         started = self.store.begin_step(
             mission["id"], mission["lease_token"], name,
             value if memo_value is None else memo_value,
             recorded_input=value)
         if started["status"] == "COMPLETED":
-            route = value.get("route") if isinstance(value, dict) else None
-            recover_only = isinstance(route, dict) and route.get("recover_only") is True
-            output = started.get("output")
-            if not (recover_only and isinstance(output, dict) and output.get("status") != "completed"):
-                return started["output"]
+            # A COMPLETED step is historical truth and is returned, never
+            # re-run.  SF-167 let a ``recover_only`` route fall through this
+            # guard and call the dispatch adapter again over a settled row,
+            # which both duplicated the provider leg and overwrote the output
+            # that recorded why the first attempt stopped.  A repaired attempt
+            # gets its own durable identity instead -- see
+            # ``store.effective_dispatch_step``.
+            return started["output"]
         adapter_value = value
         if replay_input and isinstance(started.get("input"), dict):
             adapter_value = started["input"]
@@ -414,7 +425,8 @@ class Controller:
             response = self._step(
                 mission, step,
                 {"mission": payload, "route": recovery_route},
-                memo_value={"mission": payload}, adapter_step=DISPATCH_STEP)
+                memo_value={"mission": payload},
+                adapter_step=self._dispatch_operation(mission))
             receipt = _with_gateway(
                 routing.receipt_from_response(response, Selection(
                     route.get("provider_profile"),
@@ -489,7 +501,8 @@ class Controller:
                 mission, step,
                 {"mission": payload, "route": _route(selection, attempted, mission, False,
                                                      gateways.get(selection.profile))},
-                memo_value={"mission": payload}, adapter_step=DISPATCH_STEP)
+                memo_value={"mission": payload},
+                adapter_step=self._dispatch_operation(mission))
             receipt = _with_gateway(routing.receipt_from_response(response, selection, attempted),
                                     response, gateways.get(selection.profile))
             self._record(mission, selection, receipt)
@@ -596,7 +609,23 @@ class Controller:
         find the memo the repaired attempt wrote, not the refusal before it.
         """
 
-        return effective_dispatch_step(self.store.step_records(mission["id"]))[0]
+        return effective_dispatch_step(
+            self.store.step_records(mission["id"]),
+            reconciled=self.store.reconciliation(mission["id"]) is not None)[0]
+
+    def _dispatch_operation(self, mission: dict[str, Any]) -> str:
+        """Which adapter operation this attempt is allowed to perform.
+
+        A mission carrying a durable reconciliation proof may only *look up*
+        the result its provider already produced.  Naming a different adapter
+        operation is what makes that structural: ``dispatch-reconcile`` reaches
+        no provider selection and no provider process, and the frame it sends
+        is refused by the Bridge unless the sealed response is already there.
+        """
+
+        if self.store.reconciliation(mission["id"]) is None:
+            return DISPATCH_STEP
+        return RECONCILE_STEP
 
     def _recover(self, mission: dict[str, Any], committed: list[dict[str, Any]],
                  prior: list[dict[str, Any]],
@@ -615,7 +644,7 @@ class Controller:
             mission, step,
             {"mission": payload, "route": _route(selection, (), mission, True)},
             memo_value={"mission": payload},
-            adapter_step=DISPATCH_STEP)
+            adapter_step=self._dispatch_operation(mission))
         receipt = _with_gateway(routing.receipt_from_response(response, selection, ()),
                                 response, None)
         served_model = (receipt.gateway or {}).get("actual_model")

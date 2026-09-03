@@ -419,8 +419,22 @@ class RevisionLifecycleTests(unittest.TestCase):
         self.assertEqual(refused["terminal_reason"], "CANDIDATE_WORKSPACE_MISMATCH")
         self.assertNotIn("IDEMPOTENCY_KEY_UNPROVEN", refused["terminal_reason"])
 
-    def test_revision_replay_recovery_reopens_and_recovers_without_duplicate_provider(self):
-        """Regressions 3 & 5: Revision replay recovery resumes stopped mission and recovers candidate."""
+    def test_a_sealed_candidate_alone_never_reopens_the_mission(self):
+        """SF-167 built this scenario and drew the wrong conclusion from it.
+
+        A provider ran and its candidate is real, so ``process_started`` is
+        ``True`` and every pre-provider class correctly refuses.  SF-167 then
+        reopened it anyway, on "a candidate exists and the refusal starts with
+        one of these prefixes" -- a rule that also covers
+        ``IDEMPOTENCY_KEY_UNPROVEN`` and every generic infrastructure reason,
+        which are the states where the provider's effect is not established.
+
+        The scenario is kept because it is the real one.  What it proves now is
+        that nothing happens without a durable reconciliation proof; the
+        recovery it *does* license lives in
+        ``tests/test_revision_replay_reconciliation.py``.
+        """
+
         class InitialMismatchAdapter(RecoveryAdapter):
             def __init__(self, **kwargs):
                 super().__init__(**kwargs)
@@ -429,9 +443,7 @@ class RevisionLifecycleTests(unittest.TestCase):
             def execute(self, step, operation_key, value):
                 if step == "dispatch":
                     route = value.get("route", {})
-                    if not route.get("recover_only"):
-                        self.provider_runs += 1
-                    key = route.get("idempotency_key")
+                    self.provider_runs += 1
                     return {
                         "status": "refused",
                         "candidate_sha": None,
@@ -440,16 +452,17 @@ class RevisionLifecycleTests(unittest.TestCase):
                         "stage1_result": {
                             "execution_envelope": {
                                 "candidate_sha": CANDIDATE,
-                                "candidate_workspace": {"source_checkout": REGISTERED, "candidate_sha": CANDIDATE},
+                                "idempotency_key": route.get("idempotency_key"),
                             },
                         },
                         "receipt": {
-                            "provider_profile": route.get("provider_profile", "codex-product"),
+                            "provider_profile": route.get("provider_profile",
+                                                          "codex-product"),
                             "provider": "factory-evidence-core/first-live",
                             "execution_mode": "real",
                             "duration_ms": 100,
                             "process_started": True,
-                            "idempotency_key": key,
+                            "idempotency_key": route.get("idempotency_key"),
                             "refusal_code": "CANDIDATE_WORKSPACE_MISMATCH",
                             "usage": {"cost_state": "unknown"},
                         },
@@ -457,55 +470,29 @@ class RevisionLifecycleTests(unittest.TestCase):
                 return super().execute(step, operation_key, value)
 
         value = self.payload()
-        mission, _ = Controller(self.store, RecoveryAdapter(), lease_seconds=0).submit(value, self.key(value))
-        Controller(self.store, RecoveryAdapter(), lease_seconds=0).work_once("worker-1")
+        mission, _ = Controller(self.store, RecoveryAdapter(),
+                                lease_seconds=0).submit(value, self.key(value))
+        Controller(self.store, RecoveryAdapter(),
+                   lease_seconds=0).work_once("worker-1")
         self.store.resume_pre_provider(mission["id"], revision_binding())
 
-        initial_adapter = InitialMismatchAdapter(mode="real")
-        Controller(self.store, initial_adapter, lease_seconds=0).work_once("worker-2")
+        adapter = InitialMismatchAdapter(mode="real")
+        Controller(self.store, adapter, lease_seconds=0).work_once("worker-2")
         self.assertEqual(self.store.get(mission["id"])["state"], "refused")
-        self.assertEqual(initial_adapter.provider_runs, 1)
+        self.assertEqual(adapter.provider_runs, 1)
 
-        # Now resume the mission using resume_pre_provider
         resumed = self.store.resume_pre_provider(mission["id"], revision_binding())
-        self.assertTrue(resumed["changed"])
-        self.assertEqual(self.store.get(mission["id"])["state"], "admitted")
-
-        # Recovering adapter returns candidate on recovery
-        class ReplayRecoveringAdapter(RecoveryAdapter):
-            def __init__(self, **kwargs):
-                super().__init__(**kwargs)
-                self.recover_calls = []
-
-            def execute(self, step, operation_key, value):
-                if step == "dispatch":
-                    route = value.get("route", {})
-                    self.recover_calls.append(dict(route))
-                    key = route.get("idempotency_key")
-                    return {
-                        "status": "completed",
-                        "candidate_sha": CANDIDATE,
-                        "execution_id": "e-rebound",
-                        "diagnostic": None,
-                        "candidate_workspace": {"source_checkout": REVISION_CHECKOUT, "candidate_sha": CANDIDATE},
-                        "receipt": {
-                            "provider_profile": route.get("provider_profile", "codex-product"),
-                            "provider": "factory-evidence-core/first-live",
-                            "execution_mode": "real",
-                            "duration_ms": 50,
-                            "process_started": False,
-                            "idempotency_key": key,
-                            "refusal_code": None,
-                            "usage": {"cost_state": "unknown"},
-                        },
-                    }
-                return super().execute(step, operation_key, value)
-
-        recovering_adapter = ReplayRecoveringAdapter(mode="real")
-        completed = Controller(self.store, recovering_adapter, lease_seconds=0).work_once("worker-3")
-        self.assertEqual(completed["state"], "completed")
-        self.assertEqual(len(recovering_adapter.recover_calls), 1)
-        self.assertTrue(recovering_adapter.recover_calls[0].get("recover_only"))
+        self.assertFalse(resumed["changed"])
+        self.assertEqual(self.store.get(mission["id"])["state"], "refused")
+        self.assertIsNone(self.store.reconciliation(mission["id"]))
+        # The settled row is exactly as the layer left it.
+        row = self.store.step_record(mission["id"], "dispatch")
+        self.assertEqual(row["status"], "COMPLETED")
+        self.assertEqual(row["output"]["diagnostic"],
+                         "CANDIDATE_WORKSPACE_MISMATCH")
+        self.assertIsNone(
+            self.store.step_record(mission["id"], "dispatch-recovery"))
+        self.assertEqual(adapter.provider_runs, 1)
 
 
 class RevisionRecoveryTests(unittest.TestCase):

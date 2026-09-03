@@ -78,8 +78,17 @@ INFRASTRUCTURE_REASON_PREFIXES = (
     "PROJECT_REPOSITORY_UNRESOLVED",
     "REPOSITORY_REMOTE_MISMATCH",
     "BASELINE_SHA_UNKNOWN",
-    "CANDIDATE_WORKSPACE_MISMATCH",
 )
+
+#: What a mission stopped on when its candidate exists but could not be proved
+#: to live in the revision checkout its Stage-1 verification reads.  It is not
+#: an infrastructure reason: the layer *did* start a provider, the provider
+#: *did* produce a commit, and asking again without proof would start a second
+#: leg.  SF-167 added it to the list above, which made every generic
+#: infrastructure refusal recoverable on the strength of a candidate hint; it
+#: is named separately here because the only thing that makes it recoverable is
+#: a durable reconciliation proof, checked below.
+REVISION_REPLAY_REFUSAL = "CANDIDATE_WORKSPACE_MISMATCH"
 
 #: The subset of the above that leaves a provider effect possible.  ``engine``
 #: writes these exactly when ``gateway.may_reroute`` refused a second dispatch
@@ -98,6 +107,28 @@ REVISION_WORK_ITEM = re.compile(
 #: stopped, and the repaired attempt runs under the recovery name.
 DISPATCH_STEP = "dispatch"
 DISPATCH_RECOVERY_STEP = "dispatch-recovery"
+
+#: The *adapter operation* a reconciliation-backed recovery performs.  It is
+#: not a durable step name -- the durable row is still
+#: ``DISPATCH_RECOVERY_STEP`` -- it is what the execution layer is asked to do
+#: under that row: look the already-sealed result up, and nothing else.  The
+#: Bridge refuses a frame carrying the reconcile key unless that sealed result
+#: exists, so this operation cannot select a provider or start a process even
+#: on a host with provider configuration present.
+RECONCILE_STEP = "dispatch-reconcile"
+
+#: Every durable identity one mission's dispatch can wear, newest last.  Three
+#: exist because a revision really can meet all three walls in one mission:
+#: SF-163's context refusal, SF-164's proven pre-provider refusal, and SF-168's
+#: reconciled replay.  Each keeps the row before it exactly as it settled, so a
+#: mission that used the recovery identity still has a free name for the
+#: lookup -- which two identities did not provide.
+DISPATCH_STEP_NAMES = (DISPATCH_STEP, DISPATCH_RECOVERY_STEP, RECONCILE_STEP)
+
+#: The same set as one SQL literal, for the raw queries that cannot import it.
+#: SF-165 found three predicates still saying ``name='dispatch'`` after SF-164
+#: added a second identity; a named constant is what stops a fourth.
+DISPATCH_STEP_SQL = "('dispatch','dispatch-recovery','dispatch-reconcile')"
 
 #: The terminal states a pre-provider recovery may reopen.  ``completed`` and
 #: ``cancelled`` are absent deliberately: one had effects and the other was an
@@ -130,7 +161,31 @@ def pre_provider_dispatch_refusal(record: Any) -> bool:
     return isinstance(receipt, Mapping) and receipt.get("process_started") is False
 
 
-def effective_dispatch_step(steps: Any) -> tuple[str, Any]:
+def sealed_candidate_sha(record: Any) -> str | None:
+    """The candidate commit the execution layer sealed for a settled dispatch.
+
+    Read from the *envelope* the layer returned, not from the adapter's own
+    projection: a refused dispatch deliberately carries no ``candidate_sha`` of
+    its own, and the envelope is the immutable statement of what the provider
+    produced before anything downstream refused it.
+    """
+
+    if not isinstance(record, Mapping):
+        return None
+    output = record.get("output")
+    if not isinstance(output, Mapping):
+        return None
+    result = output.get("stage1_result")
+    envelope = result.get("execution_envelope") if isinstance(result, Mapping) else None
+    value = envelope.get("candidate_sha") if isinstance(envelope, Mapping) else None
+    if isinstance(value, str) and len(value) == 40 \
+            and all(char in "0123456789abcdef" for char in value):
+        return value
+    return None
+
+
+def effective_dispatch_step(steps: Any, *,
+                            reconciled: bool = False) -> tuple[str, Any]:
     """The name and record of the dispatch step that describes this attempt.
 
     Every reader of "the dispatch step" -- the Owner's stage line, the capacity
@@ -141,6 +196,15 @@ def effective_dispatch_step(steps: Any) -> tuple[str, Any]:
 
     by_name = {row["name"]: row for row in steps
                if isinstance(row, Mapping) and row.get("name")}
+    reconcile = by_name.get(RECONCILE_STEP)
+    if reconcile is not None:
+        return RECONCILE_STEP, reconcile
+    if reconciled:
+        # A durable reconciliation proof exists and its lookup has not run yet.
+        # It gets the third identity whatever the first two settled as, so a
+        # mission that already spent the recovery name is not stuck behind its
+        # own memo -- and neither settled row is touched.
+        return RECONCILE_STEP, None
     recovery = by_name.get(DISPATCH_RECOVERY_STEP)
     if recovery is not None:
         return DISPATCH_RECOVERY_STEP, recovery
@@ -265,6 +329,18 @@ class MissionStore:
                 BEFORE UPDATE ON context_bindings BEGIN SELECT RAISE(ABORT, 'context bindings are append-only'); END;
                 CREATE TRIGGER IF NOT EXISTS context_bindings_no_delete
                 BEFORE DELETE ON context_bindings BEGIN SELECT RAISE(ABORT, 'context bindings are append-only'); END;
+                CREATE TABLE IF NOT EXISTS replay_reconciliations (
+                  mission_id TEXT PRIMARY KEY REFERENCES missions(id),
+                  idempotency_key TEXT NOT NULL,
+                  candidate_sha TEXT NOT NULL,
+                  proof_digest TEXT NOT NULL,
+                  proof_json TEXT NOT NULL,
+                  created_at REAL NOT NULL
+                );
+                CREATE TRIGGER IF NOT EXISTS replay_reconciliations_no_update
+                BEFORE UPDATE ON replay_reconciliations BEGIN SELECT RAISE(ABORT, 'reconciliation proofs are append-only'); END;
+                CREATE TRIGGER IF NOT EXISTS replay_reconciliations_no_delete
+                BEFORE DELETE ON replay_reconciliations BEGIN SELECT RAISE(ABORT, 'reconciliation proofs are append-only'); END;
                 CREATE TABLE IF NOT EXISTS events (
                   sequence INTEGER PRIMARY KEY AUTOINCREMENT,
                   mission_id TEXT NOT NULL REFERENCES missions(id),
@@ -754,7 +830,7 @@ class MissionStore:
         # the settled refusal it was recovered from -- which would otherwise
         # read as a completed dispatch that never ran.
         steps[DISPATCH_STEP] = (dispatch_record or {}).get("status") \
-            if dispatch_name == DISPATCH_RECOVERY_STEP else steps.get(DISPATCH_STEP)
+            if dispatch_name != DISPATCH_STEP else steps.get(DISPATCH_STEP)
         dispatch = (dispatch_record or {}).get("output") or {}
         evidence = self.step_output(mission_id, "evidence") or {}
         project = self.project(mission["project_id"]) if mission["project_id"] else None
@@ -829,7 +905,7 @@ class MissionStore:
 
         step = db.execute(
             "SELECT status FROM steps WHERE mission_id=?"
-            " AND name IN ('dispatch','dispatch-recovery')"
+            " AND name IN " + DISPATCH_STEP_SQL +
             " AND status='STARTED' LIMIT 1",
             (mission_id,)).fetchone()
         if step is None:
@@ -918,41 +994,156 @@ class MissionStore:
         """
 
         rows = [row for row in self.step_records(mission_id)
-                if row["name"] in (DISPATCH_STEP, DISPATCH_RECOVERY_STEP)]
+                if row["name"] in DISPATCH_STEP_NAMES]
         _, record = effective_dispatch_step(rows)
-        if record is None:
+        if record is not None:
+            # A live recovery identity means the repaired attempt itself
+            # settled; it is eligible only on the same proof as the first.
+            if not pre_provider_dispatch_refusal(record):
+                return self._reconciled_recovery_class(db, mission_id, rows)
+        else:
             record = next((row for row in rows if row["name"] == DISPATCH_STEP), None)
-        if record is None:
-            return None
-
-        output = record.get("output") or {}
-        receipt = output.get("receipt") if isinstance(output, Mapping) else {}
-        refusal = (isinstance(receipt, Mapping) and receipt.get("refusal_code")) \
-            or output.get("diagnostic") or "DISPATCH_REFUSED"
-
+            if not pre_provider_dispatch_refusal(record):
+                return self._reconciled_recovery_class(db, mission_id, rows)
         legs = db.execute(
             "SELECT 1 FROM runs WHERE mission_id=? AND (process_started IS NULL"
             " OR process_started<>0) LIMIT 1", (mission_id,)).fetchone()
         if legs is not None:
-            has_candidate = bool(
-                output.get("candidate_sha")
-                or (isinstance(output.get("candidate_workspace"), Mapping)
-                    and output["candidate_workspace"].get("candidate_sha"))
-                or (isinstance(output.get("stage1_result"), Mapping)
-                    and output["stage1_result"].get("execution_envelope", {}).get("candidate_sha")))
-            ref_str = str(refusal)
-            is_replay_refusal = (
-                ref_str.startswith("CANDIDATE_WORKSPACE_MISMATCH")
-                or ref_str.startswith("IDEMPOTENCY_KEY_UNPROVEN")
-                or any(ref_str.startswith(p) for p in INFRASTRUCTURE_REASON_PREFIXES)
-            )
-            if has_candidate and is_replay_refusal:
-                return "revision_replay", ref_str
+            # One leg that did not prove it started nothing is enough: a second
+            # dispatch could then be a duplicate provider leg.
             return None
-
-        if not pre_provider_dispatch_refusal(record):
-            return None
+        output = record.get("output") or {}
+        receipt = output.get("receipt") if isinstance(output, Mapping) else {}
+        refusal = (isinstance(receipt, Mapping) and receipt.get("refusal_code")) \
+            or output.get("diagnostic") or "DISPATCH_REFUSED"
         return "revision_dispatch", str(refusal)
+
+    def _reconciled_recovery_class(self, db, mission_id: str, rows):
+        """Why a mission whose provider *did* run may safely run its next step.
+
+        Exactly one reason, and it is never inferred from a refusal code or
+        from the mere presence of a candidate: a durable reconciliation proof,
+        derived by the execution layer from the immutable sealed response,
+        exists for this mission, this idempotency key and this exact candidate
+        commit.  Everything else -- ``IDEMPOTENCY_KEY_UNPROVEN``, a diverged
+        key, a provider switch, an unknown process start, a generic
+        infrastructure refusal -- stays fail-closed, because none of them can
+        be answered side-effect-free.
+
+        The proof licenses a *lookup*, not a second execution: the step it
+        unlocks is refused by the Bridge unless the sealed response is already
+        there to be returned.
+        """
+
+        proof = self._reconciliation_locked(db, mission_id)
+        if proof is None:
+            return None
+        _, record = effective_dispatch_step(rows)
+        if record is None:
+            record = next((row for row in rows
+                           if row["name"] == DISPATCH_STEP), None)
+        if record is None or record.get("status") != "COMPLETED":
+            return None
+        output = record.get("output") or {}
+        if not isinstance(output, Mapping) or output.get("status") == "completed":
+            # Already through dispatch on its own terms; nothing to recover.
+            return None
+        if sealed_candidate_sha(record) != proof.get("candidate_sha"):
+            return None
+        receipt = output.get("receipt") if isinstance(output, Mapping) else {}
+        refusal = (isinstance(receipt, Mapping) and receipt.get("refusal_code")) \
+            or output.get("diagnostic") or REVISION_REPLAY_REFUSAL
+        if not str(refusal).startswith(REVISION_REPLAY_REFUSAL):
+            return None
+        return "revision_replay", str(refusal)
+
+    @staticmethod
+    def _reconciliation_locked(db, mission_id: str) -> dict[str, Any] | None:
+        row = db.execute(
+            "SELECT proof_json FROM replay_reconciliations WHERE mission_id=?",
+            (mission_id,)).fetchone()
+        if row is None:
+            return None
+        try:
+            value = json.loads(row["proof_json"])
+        except (TypeError, ValueError) as exc:
+            raise ValueError("RECONCILIATION_PROOF_CORRUPT") from exc
+        if not isinstance(value, dict):
+            raise ValueError("RECONCILIATION_PROOF_CORRUPT")
+        return value
+
+    def reconciliation(self, mission_id: str) -> dict[str, Any] | None:
+        """The derived reconciliation proof recorded for one mission, if any."""
+
+        with self.connect() as db:
+            return self._reconciliation_locked(db, mission_id)
+
+    def record_reconciliation(self, mission_id: str,
+                              proof: dict[str, Any]) -> dict[str, Any]:
+        """Record one derived reconciliation proof, once, or refuse.
+
+        Append-only by trigger.  Recording is where the proof is bound to the
+        mission: same idempotency key, same revision base, and the same
+        candidate commit the sealed dispatch envelope named.  A second, equal
+        proof is the idempotent no-op a repeated Owner command needs; a
+        different one is a conflict rather than an overwrite.
+        """
+
+        if not isinstance(proof, dict) or not proof:
+            raise ValueError("RECONCILIATION_PROOF_INVALID")
+        required = ("schema_version", "idempotency_key", "candidate_sha",
+                    "revision_sha", "original_response_digest", "proof_digest",
+                    "work_item_id", "project_id")
+        if any(not isinstance(proof.get(name), str) or not proof[name]
+               for name in required):
+            raise ValueError("RECONCILIATION_PROOF_INVALID")
+        encoded = canonical_json(proof)
+        with self.transaction() as db:
+            row = db.execute("SELECT * FROM missions WHERE id=?",
+                             (mission_id,)).fetchone()
+            if row is None:
+                raise KeyError(mission_id)
+            try:
+                payload = json.loads(row["payload_json"])
+            except (TypeError, ValueError) as exc:
+                raise ValueError("PRE_PROVIDER_MISSION_CORRUPT") from exc
+            if (row["idempotency_key"] != proof["idempotency_key"]
+                    or payload.get("baseline_sha") != proof["revision_sha"]
+                    or payload.get("work_item_id") != proof["work_item_id"]
+                    or row["project_id"] != proof["project_id"]):
+                raise ValueError("RECONCILIATION_PROOF_MISSION_MISMATCH")
+            rows = [record for record in self.step_records(mission_id)
+                    if record["name"] in DISPATCH_STEP_NAMES]
+            _, record = effective_dispatch_step(rows)
+            if record is None:
+                record = next((item for item in rows
+                               if item["name"] == DISPATCH_STEP), None)
+            if sealed_candidate_sha(record) != proof["candidate_sha"]:
+                raise ValueError("RECONCILIATION_PROOF_CANDIDATE_MISMATCH")
+            existing = db.execute(
+                "SELECT proof_json FROM replay_reconciliations WHERE mission_id=?",
+                (mission_id,)).fetchone()
+            if existing is not None:
+                if existing["proof_json"] != encoded:
+                    raise ConflictError("RECONCILIATION_PROOF_CONFLICT")
+                return proof
+            db.execute(
+                "INSERT INTO replay_reconciliations(mission_id,idempotency_key,"
+                "candidate_sha,proof_digest,proof_json,created_at)"
+                " VALUES(?,?,?,?,?,?)",
+                (mission_id, proof["idempotency_key"], proof["candidate_sha"],
+                 proof["proof_digest"], encoded, self.clock()))
+            self._event(db, mission_id, "REVISION_REPLAY_RECONCILED",
+                        row["state"], row["state"], {
+                            "proof_schema": proof["schema_version"],
+                            "proof_digest": proof["proof_digest"],
+                            "original_response_digest":
+                                proof["original_response_digest"],
+                            "candidate_sha": proof["candidate_sha"],
+                            "revision_checkout": proof.get("revision_checkout"),
+                            "provider_started": False,
+                        })
+            return proof
 
     def resume_pre_provider(self, mission_id: str,
                             binding: dict[str, Any]) -> dict[str, Any]:
@@ -1773,7 +1964,7 @@ class MissionStore:
             " WHERE (state IN ('admitted','dispatched','candidate_verified','evaluated','evidence_sealed')"
             " OR (state='dispatching' AND EXISTS ("
             "   SELECT 1 FROM steps s WHERE s.mission_id=missions.id"
-            "   AND s.name IN ('dispatch','dispatch-recovery')"
+            "   AND s.name IN " + DISPATCH_STEP_SQL +
             "   AND s.status='STARTED'"
             " ) AND (NOT EXISTS (SELECT 1 FROM runs r0 WHERE r0.mission_id=missions.id)"
             "   OR EXISTS (SELECT 1 FROM runs r1 WHERE r1.mission_id=missions.id"

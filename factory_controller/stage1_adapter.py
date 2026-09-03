@@ -136,7 +136,61 @@ def _execution_mode(result: dict[str, Any]) -> str:
     return "unknown"
 
 
-def _dispatch(request: dict[str, Any], config: dict[str, Any]) -> dict[str, Any]:
+def _revision_argv(config: dict[str, Any]) -> list[str]:
+    """Declare the revision identity, when the mission's grounding names one.
+
+    Nothing is derived here.  The values come from the immutable revision
+    grounding ``_repository`` has already checked against the mission, and the
+    Bridge refuses any declared base that is not the admitted baseline.
+    """
+
+    grounding = config.get("revision_grounding")
+    if not isinstance(grounding, dict):
+        return []
+    argv: list[str] = []
+    if grounding.get("revision_sha"):
+        argv.extend(("--revision-base", str(grounding["revision_sha"])))
+    if grounding.get("predecessor_sha"):
+        argv.extend(("--revision-predecessor", str(grounding["predecessor_sha"])))
+    return argv
+
+
+def _reconcile(request: dict[str, Any], config: dict[str, Any]) -> dict[str, Any]:
+    """Look one already-sealed provider result up.  Never produce a new one.
+
+    This operation exists so that "the recovery step cannot run a provider" is
+    a property of the code path rather than of the caller's intentions.  It
+    refuses outright without a reconciliation proof, and the frame it sends
+    carries that proof's digest -- which puts the Bridge into replay-or-refuse
+    before a lane is allocated or an adapter is asked for anything.
+    """
+
+    proof = request.get("input", {}).get("route", {})
+    proof = proof.get("reconcile_proof") if isinstance(proof, dict) else None
+    if not isinstance(proof, str) or len(proof) != 64:
+        return {"status": "refused",
+                "diagnostic": "RECONCILE_PROOF_MISSING",
+                "receipt": {"provider": "factory-evidence-core/first-live",
+                            "provider_profile": None,
+                            "process_started": False,
+                            "execution_mode": "not_applicable",
+                            "usage": {"cost_state": "not_applicable"},
+                            "refusal_code": "RECONCILE_PROOF_MISSING"}}
+    if config.get("mode") != "real":
+        # A fixture mission has no sealed provider result to reconcile.
+        return {"status": "refused",
+                "diagnostic": "RECONCILE_NOT_A_REAL_MISSION",
+                "receipt": {"provider": "factory-evidence-core/first-live",
+                            "provider_profile": None,
+                            "process_started": False,
+                            "execution_mode": "not_applicable",
+                            "usage": {"cost_state": "not_applicable"},
+                            "refusal_code": "RECONCILE_NOT_A_REAL_MISSION"}}
+    return _dispatch(request, config, reconcile_proof=proof)
+
+
+def _dispatch(request: dict[str, Any], config: dict[str, Any], *,
+              reconcile_proof: str | None = None) -> dict[str, Any]:
     command = config.get("command")
     if not isinstance(command, list) or not command or not all(isinstance(x, str) for x in command):
         raise ValueError("stage1.command must be a non-empty argument array")
@@ -162,6 +216,12 @@ def _dispatch(request: dict[str, Any], config: dict[str, Any]) -> dict[str, Any]
                           ("mission_brief", "--mission-brief")):
             if config.get(key):
                 argv.extend((flag, str(config[key])))
+        argv.extend(_revision_argv(config))
+        if reconcile_proof is not None:
+            # The whole instruction of a reconciliation: answer from the sealed
+            # replay response bound to this key, or refuse.  The Bridge, not
+            # this process, is what enforces it.
+            argv.extend(("--reconcile-replay", reconcile_proof))
         argv.append("--operator-opt-in")
     started = time.monotonic()
     completed = subprocess.run(
@@ -566,6 +626,8 @@ def execute(request: dict[str, Any]) -> dict[str, Any]:
     config = _stage1_config(request)
     if step == "dispatch":
         return _dispatch(request, config)
+    if step == "dispatch-reconcile":
+        return _reconcile(request, config)
     dispatch = request["input"]["dispatch"]
     result = dispatch.get("stage1_result", {})
     if step == "verify":
