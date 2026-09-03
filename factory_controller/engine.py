@@ -17,7 +17,7 @@ from typing import Any, Mapping, Protocol
 from . import capacity, context, gateway, routing
 from .context import ContextBudget, ContextError, ContextRequest
 from .routing import ExecutionPolicy, PolicyError, Selection
-from .store import MissionStore
+from .store import DISPATCH_STEP, MissionStore, effective_dispatch_step
 
 
 class StepAdapter(Protocol):
@@ -66,6 +66,24 @@ LAYER_DEFAULT = "layer_default"
 
 def _layer_default_selection() -> Selection:
     return Selection(None, LAYER_DEFAULT, ())
+
+
+def _unserved_refusal(receipt: routing.Receipt, response: dict[str, Any]) -> bool:
+    """True when the layer named a refusal and proved it served nothing.
+
+    All three facts are required, and each closes a way to launder a run.  A
+    completion or a candidate means something was produced, whatever the status
+    field says.  ``process_started is False`` is the layer's own proof that no
+    provider began -- ``side_effect_possible`` already encodes that an unproven
+    negative is not a proof, so ``None`` does not qualify.  And the refusal must
+    name itself: a leg with nothing to report is left to the served-leg guards
+    rather than passed over silently.
+    """
+
+    return (response.get("status") != "completed"
+            and not response.get("candidate_sha")
+            and not receipt.side_effect_possible
+            and bool(receipt.refusal_code))
 
 
 class Controller:
@@ -363,15 +381,20 @@ class Controller:
                                     for profile in admitted)
         prior = self.store.runs(mission["id"])
         committed = [leg for leg in prior if leg["process_started"] is not False]
+        # Which durable identity this attempt's dispatch belongs to.  A settled
+        # pre-provider refusal keeps its row as the evidence of why the first
+        # attempt stopped, and the repaired attempt runs under the recovery
+        # name -- without it the memo would replay that refusal for ever.
+        step = self._dispatch_step(mission)
 
         if resume_state != "dispatching" or committed:
-            return self._recover(mission, committed, prior)
+            return self._recover(mission, committed, prior, step)
 
         # A lost lease can leave the provider call between its durable STARTED
         # marker and its receipt. Reuse the exact route recorded before that
         # call. Selecting again here would turn an unresolved effect into a
         # second provider leg, even when the operation key is unchanged.
-        started = self.store.step_record(mission["id"], "dispatch")
+        started = self.store.step_record(mission["id"], step)
         # A STARTED marker with no run leg is the only unresolved case here.
         # When every prior leg proved ``process_started=False``, the same
         # marker is a safe pre-boundary capacity deferral; it must return to
@@ -385,9 +408,9 @@ class Controller:
                 raise NonRetryableFailure("UNCERTAIN_DISPATCH_ROUTE_INVALID")
             recovery_route = {**route, "recover_only": True}
             response = self._step(
-                mission, "dispatch",
+                mission, step,
                 {"mission": payload, "route": recovery_route},
-                memo_value={"mission": payload})
+                memo_value={"mission": payload}, adapter_step=DISPATCH_STEP)
             receipt = _with_gateway(
                 routing.receipt_from_response(response, Selection(
                     route.get("provider_profile"),
@@ -459,10 +482,10 @@ class Controller:
                     raise CapacityDeferred("CAPACITY_EXHAUSTED_MID_DISPATCH", resume_at)
                 raise NonRetryableFailure("%s: considered %d candidate(s)" % (code, len(candidates)))
             response = self._step(
-                mission, "dispatch",
+                mission, step,
                 {"mission": payload, "route": _route(selection, attempted, mission, False,
                                                      gateways.get(selection.profile))},
-                memo_value={"mission": payload})
+                memo_value={"mission": payload}, adapter_step=DISPATCH_STEP)
             receipt = _with_gateway(routing.receipt_from_response(response, selection, attempted),
                                     response, gateways.get(selection.profile))
             self._record(mission, selection, receipt)
@@ -560,8 +583,20 @@ class Controller:
                  and readings[receipt.provider_profile].resume_at is not None]
         return (True, min(times) if times else None)
 
+    def _dispatch_step(self, mission: dict[str, Any]) -> str:
+        """This mission's current dispatch step identity.
+
+        Monotonic: a COMPLETED step is never rewritten, so once the original
+        dispatch settled as a proven pre-provider refusal every later attempt
+        resolves to the recovery name -- including a ``_recover`` that has to
+        find the memo the repaired attempt wrote, not the refusal before it.
+        """
+
+        return effective_dispatch_step(self.store.step_records(mission["id"]))[0]
+
     def _recover(self, mission: dict[str, Any], committed: list[dict[str, Any]],
-                 prior: list[dict[str, Any]]) -> dict[str, Any]:
+                 prior: list[dict[str, Any]],
+                 step: str = DISPATCH_STEP) -> dict[str, Any]:
         """Resume a mission that already crossed the boundary.  Never reroute.
 
         The recorded step output is preferred; when a crash landed between the
@@ -572,9 +607,9 @@ class Controller:
         profile = committed[-1]["provider_profile"] if committed else None
         selection = Selection(profile, "recover_existing_result", ())
         response = self._step(
-            mission, "dispatch",
+            mission, step,
             {"mission": mission["payload"], "route": _route(selection, (), mission, True)},
-            memo_value={"mission": mission["payload"]})
+            memo_value={"mission": mission["payload"]}, adapter_step=DISPATCH_STEP)
         receipt = _with_gateway(routing.receipt_from_response(response, selection, ()),
                                 response, None)
         served_model = (receipt.gateway or {}).get("actual_model")
@@ -620,6 +655,20 @@ class Controller:
         wire field to name a profile, so an Owner allow/deny list would be
         advice unless it is also enforced against the profile that actually ran.
         """
+
+        if _unserved_refusal(receipt, response):
+            # Nothing was served, so there is no served leg to check.  These
+            # guards all ask "what did the run prove?", and a layer that
+            # refused before starting a process proves nothing about a run it
+            # never made: its execution_mode is absent, not wrong, and its
+            # idempotency key was never bound.  Applying them here replaced the
+            # layer's own refusal code with EXECUTION_MODE_UNPROVEN, so the
+            # Owner was told the mode could not be proven when the real answer
+            # was UNSUPPORTED_CAPABILITY.  Five of the eight missions on the
+            # host carry that same masked reason.  Returning leaves the refusal
+            # to ``work_once``, which raises the layer's diagnostic verbatim;
+            # the mission still fails, and fails closed.
+            return
 
         policy = ExecutionPolicy.from_payload(mission["payload"])
         served = receipt.provider_profile

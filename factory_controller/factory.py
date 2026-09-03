@@ -41,6 +41,7 @@ from . import release
 from . import shift as shift_plane
 from . import shift_runtime
 from . import stage1_adapter
+from . import store as store_mod
 from . import supervisor
 from .adapter import HostCommandResult, run_host_command
 
@@ -412,8 +413,21 @@ class FactoryLifecycle:
         # before the supervisor is made runnable.  The recovery is narrow and
         # append-only: it never submits a mission, opens a base, or touches a
         # provider leg.
-        recovered = self._resume_revision_missions(
-            self._product_contract_or_none(), doctor)
+        #
+        # The product's own capability is admitted first, and only when there is
+        # a stopped revision to resume.  `start` admits the *run* contract's
+        # capability; the product's is admitted by `product` and `revise`, so a
+        # resume queued by `start` alone ran against a posture that had never
+        # been widened for it -- which is how SF-164's mission reached dispatch
+        # and was refused UNSUPPORTED_CAPABILITY.  Resuming a mission into a
+        # posture that provably cannot serve it is not a recovery.
+        product_contract = self._product_contract_or_none()
+        if self._recoverable_revision_missions(product_contract):
+            doctor, _ = self._admit_capability(
+                self.config.bridge_root / "contracts"
+                / product_contract.capability_request,
+                product_contract, doctor, approval_ref)
+        recovered = self._resume_revision_missions(product_contract, doctor)
 
         approval = {
             "approved": True,
@@ -1134,8 +1148,18 @@ class FactoryLifecycle:
             expected_predecessor_sha=revision["predecessor_candidate_sha"],
             expected_revision_ref=expected_ref)
 
-    def _resume_revision_missions(self, contract, doctor) -> list[dict[str, Any]]:
-        """Recover only terminal, pre-provider revision context refusals."""
+    def _recoverable_revision_missions(self, contract) -> list[dict[str, Any]]:
+        """Terminal, pre-provider revision missions this contract may reopen.
+
+        Two eligible shapes, and both stopped before a provider ran: the SF-163
+        context refusal that has not been rebound yet, and the SF-164 dispatch
+        refusal on a mission already bound, where the layer *proved* it started
+        no process.  Neither is selected on a refusal code; both are selected on
+        the proof that nothing happened, which is what makes asking again safe.
+
+        Read-only, so `start` can ask whether a recovery is pending before it
+        widens anything for it.
+        """
 
         if contract is None:
             return []
@@ -1155,11 +1179,21 @@ class FactoryLifecycle:
             if (context_step is None
                     or context_step.get("status") != "COMPLETED"
                     or not isinstance(context_step.get("output"), dict)
-                    or context_step["output"].get("refusal_code") != "STALE_HEAD"
-                    or self.store.step_record(mission["id"], "dispatch") is not None
-                    or self.store.runs(mission["id"])):
+                    or context_step["output"].get("refusal_code") != "STALE_HEAD"):
                 continue
-            candidates.append(mission)
+            legs = self.store.runs(mission["id"])
+            dispatch = self.store.step_record(mission["id"], store_mod.DISPATCH_STEP)
+            if dispatch is None and not legs:
+                candidates.append(mission)                     # SF-163
+            elif (store_mod.pre_provider_dispatch_refusal(dispatch)
+                    and all(leg.get("process_started") is False for leg in legs)):
+                candidates.append(mission)                     # SF-164
+        return candidates
+
+    def _resume_revision_missions(self, contract, doctor) -> list[dict[str, Any]]:
+        """Reopen the one stopped revision this contract owns, if there is one."""
+
+        candidates = self._recoverable_revision_missions(contract)
         if not candidates:
             return []
         if len(candidates) > 1:

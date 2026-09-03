@@ -24,6 +24,7 @@ from . import capacity
 from . import continuity
 from . import context as context_contract
 from . import supervisor
+from .store import (DISPATCH_STEP, effective_dispatch_step)
 from .store import TERMINAL as LEDGER_TERMINAL
 from .store import MissionStore, canonical_json
 
@@ -467,7 +468,7 @@ def _route_facts(store: MissionStore, mission: Mapping[str, Any],
     history = store.route_history(mission["id"])
     legs = history.get("legs") or []
     selected = history.get("selected_provider_profile")
-    dispatch = next((row for row in steps if row["name"] == "dispatch"), None)
+    _, dispatch = effective_dispatch_step(steps)
     pending_route = {}
     if isinstance(dispatch, Mapping) and isinstance(dispatch.get("input"), Mapping):
         pending_route = dispatch["input"].get("route") or {}
@@ -524,12 +525,18 @@ def _checkpoint_from_store(store: MissionStore, mission_id: str) -> ShiftCheckpo
                            mission_id=mission_id)
     steps = store.step_records(mission_id)
     statuses = {row["name"]: row.get("status") for row in steps}
-    step_states = {name: statuses.get(name, "NOT_STARTED") for name in MISSION_STEPS
+    dispatch_name, _ = effective_dispatch_step(steps)
+    # The Owner's stage line names the stage that is live.  A mission recovered
+    # from a settled dispatch refusal has that refusal row for ever, so reading
+    # the literal name would report `dispatch (complete)` for a dispatch that
+    # has not been attempted since -- the exact sentence SF-164 was handed.
+    statuses[DISPATCH_STEP] = statuses.get(dispatch_name)
+    step_states = {name: statuses.get(name) or "NOT_STARTED" for name in MISSION_STEPS
                    if name != "context" or (mission.get("payload") or {}).get("context_request")}
     for row in steps:
         if row["name"] not in step_states:
             step_states[row["name"]] = row.get("status", "UNKNOWN")
-    dispatch, dispatch_corrupt = _step_value(steps, "dispatch", "output")
+    dispatch, dispatch_corrupt = _step_value(steps, dispatch_name, "output")
     dispatch = dispatch if isinstance(dispatch, Mapping) else {}
     evidence = _evidence_refs(store, mission, steps)
     project = store.project(mission.get("project_id")) if mission.get("project_id") else None
@@ -583,8 +590,9 @@ def _checkpoint_from_store(store: MissionStore, mission_id: str) -> ShiftCheckpo
     lane = _lane(payload, baton_rows)
     route = _route_facts(store, mission, steps, facts)
     uncertainty = dict(facts.get("uncertainty") or {})
+    dispatch_status = statuses.get(dispatch_name)
     if (mission.get("state") == "dispatching"
-            and statuses.get("dispatch") == "STARTED"
+            and dispatch_status == "STARTED"
             and not legs):
         uncertainty = {
             **uncertainty,
@@ -603,7 +611,7 @@ def _checkpoint_from_store(store: MissionStore, mission_id: str) -> ShiftCheckpo
                 + ["UNCERTAIN_DISPATCH_LEG"])),
         }
     elif (
-        statuses.get("dispatch") == "COMPLETED"
+        dispatch_status == "COMPLETED"
         and any(leg.get("process_started") is True for leg in legs)
         and all(leg.get("process_started") is not None for leg in legs)
     ):

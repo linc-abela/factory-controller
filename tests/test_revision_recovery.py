@@ -4,12 +4,13 @@ from __future__ import annotations
 
 import tempfile
 import unittest
+from types import SimpleNamespace
 from pathlib import Path
 
-from factory_controller import context, portfolio
+from factory_controller import context, portfolio, product
 from factory_controller.engine import Controller
 from factory_controller.store import MissionStore
-from tests.test_context_binding import BrokerAdapter
+from tests.test_context_binding import BrokerAdapter, manifest_hash_for
 from tests.support import ALPHA, mission_payload
 
 
@@ -76,8 +77,8 @@ def revision_binding() -> dict:
 
 
 class RecoveryAdapter(BrokerAdapter):
-    def __init__(self):
-        super().__init__()
+    def __init__(self, **kwargs):
+        super().__init__(**kwargs)
         self.recovery_repositories: list[str] = []
 
     def execute(self, step, operation_key, value):
@@ -89,6 +90,272 @@ class RecoveryAdapter(BrokerAdapter):
             self.recovery_repositories.append(repository)
             return self.build(value["context_request"])
         return super().execute(step, operation_key, value)
+
+
+class CapabilityAdapter(RecoveryAdapter):
+    """The real SF-164 shape: the layer refuses dispatch before starting one.
+
+    ``serves`` is the bridge's admitted posture.  While the capability is not
+    served the layer answers exactly as ``factory-bridge`` did for
+    ``lodus-casino:revision:2``: ``status: refused``, no candidate, and
+    ``process_started: False`` -- a refusal it can only make because nothing
+    ran.
+    """
+
+    def __init__(self, *, serves=False):
+        super().__init__(mode="real")
+        self.serves = serves
+        self.dispatch_keys: list[str] = []
+
+    def _dispatch(self, operation_key, value):
+        self.dispatch_keys.append(operation_key)
+        if self.serves:
+            return super()._dispatch(operation_key, value)
+        self.dispatches.append(dict(value["route"]))
+        return {"status": "refused", "candidate_sha": None, "execution_id": None,
+                "diagnostic": "UNSUPPORTED_CAPABILITY",
+                "receipt": {"provider_profile": value["route"]["provider_profile"],
+                            "provider": "factory-evidence-core/first-live",
+                            "execution_mode": "unknown", "duration_ms": 226,
+                            "process_started": False, "idempotency_key": None,
+                            "refusal_code": "UNSUPPORTED_CAPABILITY",
+                            "usage": {"cost_state": "unknown"}}}
+
+
+class RevisionLifecycleTests(unittest.TestCase):
+    """SF-162, SF-163 and SF-164 as the one revision they actually were.
+
+    Each was found separately and fixed separately, and each time the next
+    blocker was one command away.  This is that whole path in one test, so a
+    change that reopens any of the three fails here rather than on the host.
+    """
+
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.path = Path(self.temp.name) / "controller.db"
+        self.store = MissionStore(self.path)
+        self.store.register_project(portfolio.ProjectPolicy(
+            project_id="lodus-casino", repository=REMOTE))
+
+    def payload(self):
+        """The real SF-164 admission: mode ``real``, so every guard applies."""
+
+        value = mission_payload(**{**old_revision_payload(),
+                                   "execution_mode": "real",
+                                   "acceptance_gate_ids": ["G"]})
+        value["context_manifest_hash"] = manifest_hash_for(value)
+        return value
+
+    @staticmethod
+    def key(value):
+        """Derived, never chosen: the Bridge refuses any other value."""
+
+        return "%s:%s" % (value["work_item_id"], value["context_manifest_hash"])
+
+    def test_one_revision_survives_stale_head_then_an_unserved_capability(self):
+        controller = Controller(self.store, RecoveryAdapter())
+        value = self.payload()
+        mission, _ = controller.submit(value, self.key(value))
+
+        # SF-162 -- grounded against the registered checkout, which can never
+        # be at the revision base.
+        stale = controller.work_once("shift-13")
+        self.assertEqual(stale["state"], "refused")
+        self.assertIn("STALE_HEAD", stale["terminal_reason"])
+        self.assertEqual(self.store.runs(mission["id"]), [])
+
+        # SF-163 -- rebind the execution checkout, keep the admission identity.
+        self.assertTrue(
+            self.store.resume_pre_provider(mission["id"], revision_binding())["changed"])
+
+        # SF-164 -- the layer refuses at dispatch, having started nothing.
+        unserved = CapabilityAdapter(serves=False)
+        refused = Controller(MissionStore(self.path), unserved).work_once("shift-14")
+        self.assertEqual(refused["id"], mission["id"])
+        self.assertEqual(refused["state"], "refused")
+        # The layer's own refusal, not the mode symptom it used to be reported
+        # as.  This assertion is the whole of the one-bug-at-a-time loop.
+        self.assertEqual(refused["terminal_reason"], "UNSUPPORTED_CAPABILITY")
+        self.assertNotIn("EXECUTION_MODE_UNPROVEN", refused["terminal_reason"])
+        legs = self.store.runs(mission["id"])
+        self.assertEqual([leg["process_started"] for leg in legs], [False])
+
+        # The Owner's one lifecycle command, run again after the capability is
+        # served.  Same mission, same binding, no second admission.
+        resumed = self.store.resume_pre_provider(mission["id"], revision_binding())
+        self.assertTrue(resumed["changed"])
+        self.assertEqual(resumed["mission"]["id"], mission["id"])
+
+        served = CapabilityAdapter(serves=True)
+        completed = Controller(MissionStore(self.path), served).work_once("shift-15")
+
+        self.assertEqual(completed["id"], mission["id"])
+        self.assertEqual(completed["state"], "completed")
+        # One provider leg per attempt, and only the served one ever started.
+        legs = self.store.runs(mission["id"])
+        self.assertEqual([leg["process_started"] for leg in legs], [False, True])
+        self.assertEqual(len(served.dispatch_keys), 1)
+
+        # Every refusal on the way is still on the record.
+        steps = {row["name"]: row for row in self.store.step_records(mission["id"])}
+        self.assertEqual(steps["context"]["output"]["refusal_code"], "STALE_HEAD")
+        self.assertEqual(steps["dispatch"]["output"]["diagnostic"],
+                         "UNSUPPORTED_CAPABILITY")
+        self.assertEqual(steps["dispatch-recovery"]["status"], "COMPLETED")
+        self.assertEqual(steps["dispatch-recovery"]["output"]["status"], "completed")
+        # And the admission identity was never rewritten.
+        self.assertEqual(self.store.get(mission["id"])["payload"]["stage1"]["repository"],
+                         REGISTERED)
+
+    def test_the_refused_dispatch_does_not_replay_and_does_not_double_dispatch(self):
+        """The memo is why this needed a second identity, not a rerun."""
+
+        controller = Controller(self.store, RecoveryAdapter())
+        value = self.payload()
+        mission, _ = controller.submit(value, self.key(value))
+        controller.work_once("shift-13")
+        self.store.resume_pre_provider(mission["id"], revision_binding())
+        first = CapabilityAdapter(serves=False)
+        Controller(MissionStore(self.path), first).work_once("shift-14")
+        self.assertEqual(len(first.dispatch_keys), 1)
+
+        self.store.resume_pre_provider(mission["id"], revision_binding())
+        second = CapabilityAdapter(serves=False)
+        again = Controller(MissionStore(self.path), second).work_once("shift-15")
+
+        # The layer was asked again -- the refusal was not replayed from the
+        # memo -- and it was asked exactly once.
+        self.assertEqual(len(second.dispatch_keys), 1)
+        self.assertNotEqual(second.dispatch_keys[0], first.dispatch_keys[0])
+        self.assertEqual(again["terminal_reason"], "UNSUPPORTED_CAPABILITY")
+        self.assertEqual([leg["process_started"]
+                          for leg in self.store.runs(mission["id"])], [False, False])
+
+    def test_a_layer_that_cannot_prove_it_started_nothing_is_never_reopened(self):
+        """The eligible class is the proof, and an absence is not a proof."""
+
+        class Silent(CapabilityAdapter):
+            def _dispatch(self, operation_key, value):
+                response = super()._dispatch(operation_key, value)
+                response["receipt"].pop("process_started")
+                return response
+
+        controller = Controller(self.store, RecoveryAdapter())
+        value = self.payload()
+        mission, _ = controller.submit(value, self.key(value))
+        controller.work_once("shift-13")
+        self.store.resume_pre_provider(mission["id"], revision_binding())
+        refused = Controller(MissionStore(self.path), Silent(serves=False)).work_once("s14")
+        self.assertEqual(refused["state"], "refused")
+
+        replay = self.store.resume_pre_provider(mission["id"], revision_binding())
+
+        self.assertFalse(replay["changed"])
+        self.assertEqual(self.store.get(mission["id"])["state"], "refused")
+
+    def test_the_layers_refusal_is_still_a_host_fact_not_a_verdict(self):
+        """The classification used to be right by accident.
+
+        ``EXECUTION_MODE_UNPROVEN`` is an infrastructure reason, so while the
+        real code was being overwritten by it the supervisor and the shift
+        plane happened to treat the mission correctly.  Surfacing the true code
+        must not turn "this host cannot serve it" into "this work failed".
+        """
+
+        from factory_controller import store as ledger
+
+        for code in ("UNSUPPORTED_CAPABILITY", "ADAPTER_UNAVAILABLE",
+                     "PROJECT_NOT_REGISTERED", "BASELINE_SHA_UNKNOWN"):
+            with self.subTest(code=code):
+                self.assertTrue(
+                    any(code.startswith(prefix)
+                        for prefix in ledger.INFRASTRUCTURE_REASON_PREFIXES))
+        # A malformed request is the Controller's own defect, and stays one.
+        for code in ("INVALID_BASELINE_SHA", "IDEMPOTENCY_CONFLICT"):
+            with self.subTest(code=code):
+                self.assertFalse(
+                    any(code.startswith(prefix)
+                        for prefix in ledger.INFRASTRUCTURE_REASON_PREFIXES))
+        # None of them may unlock a reroute: only a proven side effect does.
+        self.assertEqual(ledger.SIDE_EFFECT_POSSIBLE_PREFIXES,
+                         ("PROVIDER_SWITCH_AFTER_",))
+
+    def test_start_sees_the_stopped_dispatch_as_recoverable(self):
+        """`factory start` must find this mission, and widen before it resumes.
+
+        `start` admits the *run* contract's capability.  The product's own is
+        admitted by `product` and `revise`, so before SF-164 a resume queued by
+        `start` alone ran against a posture that had never been widened for it:
+        the mission woke up and was refused UNSUPPORTED_CAPABILITY again.  The
+        selector is read-only precisely so `start` can ask this question before
+        it widens anything.
+        """
+
+        from factory_controller import factory as lifecycle
+
+        controller = Controller(self.store, RecoveryAdapter())
+        value = self.payload()
+        mission, _ = controller.submit(value, self.key(value))
+        controller.work_once("shift-13")
+        self.store.resume_pre_provider(mission["id"], revision_binding())
+        Controller(MissionStore(self.path), CapabilityAdapter(serves=False)
+                   ).work_once("shift-14")
+
+        factory = lifecycle.FactoryLifecycle(
+            Controller(MissionStore(self.path), RecoveryAdapter()),
+            owner=lifecycle.OwnerIdentity(username="owner", uid=501))
+        contract = SimpleNamespace(project_id="lodus-casino", package_id="lodus-casino")
+
+        found = factory._recoverable_revision_missions(contract)
+
+        self.assertEqual([row["id"] for row in found], [mission["id"]])
+        # And the product contract `start` now admits from names a capability
+        # request of its own -- the seam that was never reached from `start`.
+        product_contract = product.ProductContract.load(
+            lifecycle.FactoryConfig.default().product_contract_path)
+        self.assertEqual(product_contract.project_id, "lodus-casino")
+        self.assertTrue(product_contract.capability_request)
+
+    def test_a_completed_mission_is_never_recoverable(self):
+        """Recovery reopens stopped work, never work that had effects."""
+
+        from factory_controller import factory as lifecycle
+
+        controller = Controller(self.store, RecoveryAdapter())
+        value = self.payload()
+        mission, _ = controller.submit(value, self.key(value))
+        controller.work_once("shift-13")
+        self.store.resume_pre_provider(mission["id"], revision_binding())
+        done = Controller(MissionStore(self.path),
+                          CapabilityAdapter(serves=True)).work_once("shift-14")
+        self.assertEqual(done["state"], "completed")
+
+        factory = lifecycle.FactoryLifecycle(
+            Controller(MissionStore(self.path), RecoveryAdapter()),
+            owner=lifecycle.OwnerIdentity(username="owner", uid=501))
+        contract = SimpleNamespace(project_id="lodus-casino", package_id="lodus-casino")
+
+        self.assertEqual(factory._recoverable_revision_missions(contract), [])
+
+    def test_a_genuinely_unproven_execution_mode_still_refuses(self):
+        """The security invariant SF-164 was told not to weaken."""
+
+        controller = Controller(self.store, RecoveryAdapter())
+        value = self.payload()
+        mission, _ = controller.submit(value, self.key(value))
+        controller.work_once("shift-13")
+        self.store.resume_pre_provider(mission["id"], revision_binding())
+
+        # A layer that completes, hands back a candidate, and states no mode.
+        refused = Controller(MissionStore(self.path),
+                             RecoveryAdapter(mode="unstated")).work_once("shift-14")
+
+        self.assertEqual(refused["state"], "refused")
+        self.assertIn("EXECUTION_MODE_UNPROVEN", refused["terminal_reason"])
+        # And that refusal is *not* the reopenable class: something ran.
+        self.assertFalse(
+            self.store.resume_pre_provider(mission["id"], revision_binding())["changed"])
 
 
 class RevisionRecoveryTests(unittest.TestCase):

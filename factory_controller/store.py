@@ -10,7 +10,7 @@ import time
 import uuid
 from contextlib import contextmanager
 from pathlib import Path
-from typing import Any, Iterator
+from typing import Any, Iterator, Mapping
 
 from . import capacity as capacity_policy
 from . import context as context_contract
@@ -58,6 +58,26 @@ INFRASTRUCTURE_REASON_PREFIXES = (
     "EXECUTION_MODE_MISMATCH",
     "IDEMPOTENCY_KEY_UNPROVEN",
     "IDEMPOTENCY_KEY_DIVERGED",
+    # SF-164 added the execution layer's own pre-provider refusals.  They used
+    # to reach these two planes as ``EXECUTION_MODE_UNPROVEN``, because the
+    # served-leg guards ran on a leg that was never served and overwrote the
+    # layer's code with the mode symptom -- so they were classified correctly
+    # by accident, and stopped being once the real code surfaced.  Every one of
+    # them is ``factory-bridge`` saying this host could not serve the request:
+    # the posture it was admitted against, the checkout it holds, or the
+    # adapter it can reach.  The refusals about the *request* -- INVALID_*,
+    # ADMISSION_IDENTITY_MISMATCH, IDEMPOTENCY_CONFLICT -- are deliberately
+    # absent: those are defects in what the Controller built, not host facts.
+    "UNSUPPORTED_CAPABILITY",
+    "ADAPTER_UNAVAILABLE",
+    "CONTAINMENT_UNAVAILABLE",
+    "LEGACY_BRIDGE_ACTIVE",
+    "REGISTRY_DIGEST_MISMATCH",
+    "PROJECT_NOT_REGISTERED",
+    "PROJECT_IDENTITY_MISMATCH",
+    "PROJECT_REPOSITORY_UNRESOLVED",
+    "REPOSITORY_REMOTE_MISMATCH",
+    "BASELINE_SHA_UNKNOWN",
 )
 
 #: The subset of the above that leaves a provider effect possible.  ``engine``
@@ -68,6 +88,67 @@ INFRASTRUCTURE_REASON_PREFIXES = (
 SIDE_EFFECT_POSSIBLE_PREFIXES = ("PROVIDER_SWITCH_AFTER_",)
 REVISION_WORK_ITEM = re.compile(
     r"^[A-Za-z0-9][A-Za-z0-9._-]*:revision:[1-9][0-9]*$")
+
+#: The dispatch step's two durable identities.  A COMPLETED step is never
+#: rewritten, so a dispatch the layer refused would replay that refusal for
+#: ever; SF-163 met the same wall at the context step and answered it with a
+#: second identity rather than an overwrite, and this is that answer for
+#: dispatch.  The original row stays as the evidence of why the first attempt
+#: stopped, and the repaired attempt runs under the recovery name.
+DISPATCH_STEP = "dispatch"
+DISPATCH_RECOVERY_STEP = "dispatch-recovery"
+
+#: The terminal states a pre-provider recovery may reopen.  ``completed`` and
+#: ``cancelled`` are absent deliberately: one had effects and the other was an
+#: Owner decision, and neither is a stopped mission waiting for a repair.
+TERMINAL_RECOVERABLE = frozenset({"refused", "failed", "escalated"})
+
+
+def pre_provider_dispatch_refusal(record: Any) -> bool:
+    """True when a settled dispatch step proved no provider process began.
+
+    Four facts, and each one closes a way to call a run that happened
+    "unstarted": the step is settled, it did not complete, it produced no
+    candidate, and the layer *proved* ``process_started is False``.  ``None``
+    is the layer declining to say, which is not a proof -- the same rule
+    ``routing.Receipt.side_effect_possible`` applies one layer down -- so an
+    uncertain leg is never eligible for recovery.
+
+    This is a statement about a *refusal*, not about which refusal: the
+    eligible class is "the layer stopped before starting anything", which is
+    exactly the condition under which asking again cannot duplicate a leg.
+    """
+
+    if not isinstance(record, Mapping) or record.get("status") != "COMPLETED":
+        return False
+    output = record.get("output")
+    if not isinstance(output, Mapping) or output.get("status") == "completed" \
+            or output.get("candidate_sha"):
+        return False
+    receipt = output.get("receipt")
+    return isinstance(receipt, Mapping) and receipt.get("process_started") is False
+
+
+def effective_dispatch_step(steps: Any) -> tuple[str, Any]:
+    """The name and record of the dispatch step that describes this attempt.
+
+    Every reader of "the dispatch step" -- the Owner's stage line, the capacity
+    checkpoint, the engine's own memo -- has to agree about which of the two
+    identities is current, or a recovered mission reports the refusal it was
+    recovered from.  One resolver, so they cannot disagree.
+    """
+
+    by_name = {row["name"]: row for row in steps
+               if isinstance(row, Mapping) and row.get("name")}
+    recovery = by_name.get(DISPATCH_RECOVERY_STEP)
+    if recovery is not None:
+        return DISPATCH_RECOVERY_STEP, recovery
+    original = by_name.get(DISPATCH_STEP)
+    if pre_provider_dispatch_refusal(original):
+        # Settled as a proven pre-provider refusal and no recovery run yet:
+        # the next attempt belongs to the recovery identity, which has no row.
+        return DISPATCH_RECOVERY_STEP, None
+    return DISPATCH_STEP, original
 
 
 class ConflictError(ValueError):
@@ -666,7 +747,14 @@ class MissionStore:
         with self.connect() as db:
             steps = {row["name"]: row["status"] for row in db.execute(
                 "SELECT name,status FROM steps WHERE mission_id=?", (mission_id,))}
-        dispatch = self.step_output(mission_id, "dispatch") or {}
+        dispatch_name, dispatch_record = self.dispatch_step(mission_id)
+        # The recovery identity *is* the dispatch step for a mission that has
+        # one, so the checkpoint reports the attempt that is live rather than
+        # the settled refusal it was recovered from -- which would otherwise
+        # read as a completed dispatch that never ran.
+        steps[DISPATCH_STEP] = (dispatch_record or {}).get("status") \
+            if dispatch_name == DISPATCH_RECOVERY_STEP else steps.get(DISPATCH_STEP)
+        dispatch = (dispatch_record or {}).get("output") or {}
         evidence = self.step_output(mission_id, "evidence") or {}
         project = self.project(mission["project_id"]) if mission["project_id"] else None
         return capacity_policy.checkpoint_facts(
@@ -811,6 +899,46 @@ class MissionStore:
             raise ValueError("CONTEXT_BINDING_CORRUPT")
         return value
 
+    def _pre_provider_recovery_class(self, db, mission_id: str):
+        """Why an already-bound, stopped revision mission may run again.
+
+        Returns ``(class, preserved_refusal)``, or ``None`` when nothing
+        eligible has happened.  One class today: the layer refused at dispatch
+        and *proved* it started no provider process, which SF-164 met as
+        ``UNSUPPORTED_CAPABILITY`` after a reinstall silently dropped an
+        admitted capability.
+
+        The eligibility is the proof, not the code.  A refusal that began no
+        process cannot be duplicated by asking again, and one that cannot prove
+        that is never reopened here -- so widening this to a new refusal code is
+        not a decision anybody has to make again.
+        """
+
+        rows = [row for row in self.step_records(mission_id)
+                if row["name"] in (DISPATCH_STEP, DISPATCH_RECOVERY_STEP)]
+        _, record = effective_dispatch_step(rows)
+        if record is not None:
+            # A live recovery identity means the repaired attempt itself
+            # settled; it is eligible only on the same proof as the first.
+            if not pre_provider_dispatch_refusal(record):
+                return None
+        else:
+            record = next((row for row in rows if row["name"] == DISPATCH_STEP), None)
+            if not pre_provider_dispatch_refusal(record):
+                return None
+        legs = db.execute(
+            "SELECT 1 FROM runs WHERE mission_id=? AND (process_started IS NULL"
+            " OR process_started<>0) LIMIT 1", (mission_id,)).fetchone()
+        if legs is not None:
+            # One leg that did not prove it started nothing is enough: a second
+            # dispatch could then be a duplicate provider leg.
+            return None
+        output = record.get("output") or {}
+        receipt = output.get("receipt") if isinstance(output, Mapping) else {}
+        refusal = (isinstance(receipt, Mapping) and receipt.get("refusal_code")) \
+            or output.get("diagnostic") or "DISPATCH_REFUSED"
+        return "revision_dispatch", str(refusal)
+
     def resume_pre_provider(self, mission_id: str,
                             binding: dict[str, Any]) -> dict[str, Any]:
         """Reopen one refused context mission without changing its identity.
@@ -886,52 +1014,77 @@ class MissionStore:
                     raise ValueError("CONTEXT_BINDING_CORRUPT")
                 if existing_binding["binding_json"] != encoded:
                     raise ConflictError("CONTEXT_BINDING_CONFLICT")
-                return {"changed": False, "mission": self._row(row),
-                        "binding": binding}
-            if row["state"] not in {"refused", "failed", "escalated"}:
-                raise ValueError(
-                    "PRE_PROVIDER_RECOVERY_STATE: %s" % row["state"])
+                if row["state"] not in TERMINAL_RECOVERABLE:
+                    # Already reopened by an earlier call, or still running.
+                    # This is the idempotent no-op, and it is decided on the
+                    # mission's state rather than on the presence of a binding
+                    # -- a rebound mission that later stopped again at dispatch
+                    # still has its binding, and refusing it here would leave
+                    # the Owner's one lifecycle command with nothing to do.
+                    return {"changed": False, "mission": self._row(row),
+                            "binding": binding}
+                eligible = self._pre_provider_recovery_class(db, mission_id)
+                if eligible is None:
+                    # A binding is already recorded and nothing eligible has
+                    # happened since; write nothing rather than refuse, so a
+                    # repeated lifecycle command stays a no-op.
+                    return {"changed": False, "mission": self._row(row),
+                            "binding": binding}
+                recovery_class, preserved_refusal = eligible
+            else:
+                if row["state"] not in TERMINAL_RECOVERABLE:
+                    raise ValueError(
+                        "PRE_PROVIDER_RECOVERY_STATE: %s" % row["state"])
+                recovery_class = preserved_refusal = None
             if row["cancel_requested"] or row["lease_token"] is not None:
                 raise ValueError("PRE_PROVIDER_RECOVERY_NOT_IDLE")
 
-            context_step = db.execute(
-                "SELECT status,output_json FROM steps WHERE mission_id=?"
-                " AND name='context'", (mission_id,)).fetchone()
-            if context_step is None or context_step["status"] != "COMPLETED":
-                raise ValueError("PRE_PROVIDER_CONTEXT_NOT_SETTLED")
-            try:
-                context_output = json.loads(context_step["output_json"])
-            except (TypeError, ValueError) as exc:
-                raise ValueError("PRE_PROVIDER_CONTEXT_CORRUPT") from exc
-            if not isinstance(context_output, dict) \
-                    or context_output.get("refusal_code") != "STALE_HEAD":
-                raise ValueError("PRE_PROVIDER_RECOVERY_REFUSAL_UNSAFE")
+            if recovery_class is None:
+                context_step = db.execute(
+                    "SELECT status,output_json FROM steps WHERE mission_id=?"
+                    " AND name='context'", (mission_id,)).fetchone()
+                if context_step is None or context_step["status"] != "COMPLETED":
+                    raise ValueError("PRE_PROVIDER_CONTEXT_NOT_SETTLED")
+                try:
+                    context_output = json.loads(context_step["output_json"])
+                except (TypeError, ValueError) as exc:
+                    raise ValueError("PRE_PROVIDER_CONTEXT_CORRUPT") from exc
+                if not isinstance(context_output, dict) \
+                        or context_output.get("refusal_code") != "STALE_HEAD":
+                    raise ValueError("PRE_PROVIDER_RECOVERY_REFUSAL_UNSAFE")
 
-            dispatch = db.execute(
-                "SELECT 1 FROM steps WHERE mission_id=? AND name='dispatch'",
-                (mission_id,)).fetchone()
-            if dispatch is not None:
-                raise ValueError("PRE_PROVIDER_RECOVERY_AFTER_DISPATCH")
-            legs = db.execute(
-                "SELECT 1 FROM runs WHERE mission_id=? LIMIT 1",
-                (mission_id,)).fetchone()
-            if legs is not None:
-                raise ValueError("PRE_PROVIDER_RECOVERY_AFTER_PROVIDER")
+                dispatch = db.execute(
+                    "SELECT 1 FROM steps WHERE mission_id=? AND name=?",
+                    (mission_id, DISPATCH_STEP)).fetchone()
+                if dispatch is not None:
+                    raise ValueError("PRE_PROVIDER_RECOVERY_AFTER_DISPATCH")
+                legs = db.execute(
+                    "SELECT 1 FROM runs WHERE mission_id=? LIMIT 1",
+                    (mission_id,)).fetchone()
+                if legs is not None:
+                    raise ValueError("PRE_PROVIDER_RECOVERY_AFTER_PROVIDER")
+                recovery_class, preserved_refusal = "revision_context", "STALE_HEAD"
 
             now = self.clock()
             if existing_binding is None:
+                # The rebinding is what SF-163 recovery *is*, and it happens
+                # once.  A dispatch-class recovery reuses the binding already
+                # recorded, so it resumes without claiming to have rebound
+                # anything -- one REVISION_CONTEXT_REBOUND per mission stays
+                # true however many times the mission is resumed.
                 db.execute(
                     "INSERT INTO context_bindings(mission_id,binding_json,created_at)"
                     " VALUES(?,?,?)", (mission_id, encoded, now))
-            self._event(db, mission_id, "REVISION_CONTEXT_REBOUND",
-                        row["state"], row["state"], {
-                            "binding_schema": binding.get("schema_version"),
-                            "revision_sha": binding.get("revision_sha"),
-                            "checkout": binding.get("checkout"),
-                            "preserved_context_refusal": "STALE_HEAD",
-                            "preserved_terminal_reason": row["terminal_reason"],
-                            "provider_started": False,
-                        })
+                self._event(db, mission_id, "REVISION_CONTEXT_REBOUND",
+                            row["state"], row["state"], {
+                                "binding_schema": binding.get("schema_version"),
+                                "revision_sha": binding.get("revision_sha"),
+                                "checkout": binding.get("checkout"),
+                                "recovery_class": recovery_class,
+                                "preserved_context_refusal": "STALE_HEAD",
+                                "preserved_terminal_reason": row["terminal_reason"],
+                                "provider_started": False,
+                            })
             db.execute(
                 "UPDATE missions SET state='admitted',next_run_at=?,"
                 "lease_owner=NULL,lease_token=NULL,lease_expires_at=NULL,"
@@ -939,8 +1092,8 @@ class MissionStore:
                 (now, now, mission_id))
             self._event(db, mission_id, "PRE_PROVIDER_MISSION_RESUMED",
                         row["state"], "admitted", {
-                            "recovery_class": "revision_context",
-                            "preserved_context_refusal": "STALE_HEAD",
+                            "recovery_class": recovery_class,
+                            "preserved_refusal": preserved_refusal,
                             "preserved_terminal_reason": row["terminal_reason"],
                             "provider_started": False,
                         })
@@ -985,6 +1138,11 @@ class MissionStore:
 
         return next((row for row in self.step_records(mission_id)
                      if row["name"] == name), None)
+
+    def dispatch_step(self, mission_id: str) -> tuple[str, dict[str, Any] | None]:
+        """This mission's current dispatch identity and the row under it."""
+
+        return effective_dispatch_step(self.step_records(mission_id))
 
     def history(self, mission_id: str) -> list[dict[str, Any]]:
         with self.connect() as db:
