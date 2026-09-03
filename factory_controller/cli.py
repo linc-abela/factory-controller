@@ -206,6 +206,11 @@ def parser() -> argparse.ArgumentParser:
     rel.add_argument("--passed", type=int, default=0, dest="rel_passed")
     rel.add_argument("--failed", type=int, default=0, dest="rel_failed")
     rel.add_argument("--health-ref", dest="health_ref")
+    rel.add_argument("--adapter", dest="rel_adapter", default="deterministic",
+                     choices=("deterministic", "google", "firebase", "google-firebase-hosting"),
+                     help="the deployment adapter to use (default: deterministic)")
+    rel.add_argument("--probe", action="store_true",
+                     help="probe the review URL or deployment target with the real health verifier")
 
     imp_parser = sub.add_parser("improvement")
     imp_parser.add_argument("action", choices=(
@@ -535,9 +540,18 @@ def _release(args, store) -> int:
 
     lifecycle = release.ReleaseLifecycle(store)
     ledger = production.ProductionLedger(store)
-    port = production.DeterministicDeploymentAdapter()
+    adapter_choice = getattr(args, "rel_adapter", "deterministic")
+    if adapter_choice in ("google", "firebase", "google-firebase-hosting"):
+        from . import google_production
+        port = google_production.FirebaseHostingDeploymentAdapter({})
+    else:
+        port = production.DeterministicDeploymentAdapter()
     health = None
-    if args.rel_passed or args.rel_failed:
+    if getattr(args, "probe", False) and getattr(args, "review_url", None):
+        from . import google_production
+        verifier = google_production.StaticWebHealthVerifier()
+        health = verifier.verify(args.review_url)
+    elif args.rel_passed or args.rel_failed:
         health = production.HealthRecord(
             checks_passed=args.rel_passed, checks_failed=args.rel_failed,
             evidence_ref=args.health_ref or "unknown", observed_at=time.time())

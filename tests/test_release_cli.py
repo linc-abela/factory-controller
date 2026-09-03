@@ -204,6 +204,17 @@ class ReleaseCommandTests(unittest.TestCase):
         self.assertEqual(code, 1)
         self.assertEqual(result["refused"]["code"], "RELEASE_ARGUMENTS_INVALID")
 
+    def test_deploy_review_with_google_adapter(self):
+        self.seal(1)
+        code, deployed = self.run_cli(
+            "release", "deploy-review", "--rc", "CASINO-MVP-RC-001",
+            "--environment", "lodus-casino-review", "--actor", "factory",
+            "--review-url", "https://lodus-casino-review.web.app",
+            "--adapter", "google", "--passed", "3")
+        self.assertEqual(code, 0)
+        self.assertEqual(deployed["state"], "healthy")
+        self.assertIn("google-firebase", deployed["receipt"]["adapter"])
+
 
 class LedgerResolutionTests(unittest.TestCase):
     """SF-158: which Factory a command with no `--db` is talking about.
