@@ -13,6 +13,7 @@ import json
 from dataclasses import replace
 from pathlib import Path
 import tempfile
+import time
 import unittest
 
 from factory_controller import pcp, product, production, release
@@ -440,6 +441,38 @@ class ProductStatusTests(unittest.TestCase):
         self.assertIn("lodus-casino:build in lodus-casino is executing", rendered)
         self.assertIn("Stage: dispatch (in progress)", rendered)
         self.assertIn("Provider: Codex (codex-product)", rendered)
+
+    def test_a_freshly_updated_step_reads_as_healthy_not_stale(self):
+        """A step updated moments ago is a healthy in-progress leg."""
+
+        self.ready()
+        self.assertTrue(self.submit().ok)
+        claimed = self.lifecycle.store.claim(
+            "test-fresh", project_ids=("lodus-casino",))
+        self.lifecycle.store.begin_step(
+            claimed["id"], claimed["lease_token"], "dispatch", {"a": 1})
+
+        started_at = time.time()
+        self.lifecycle.clock = lambda: started_at + 5
+        rendered = self.status().render()
+        self.assertIn("Stage: dispatch (in progress) — updated 5s ago", rendered)
+        self.assertNotIn("stale", rendered)
+
+    def test_a_step_with_no_recent_update_reads_as_stale_attention(self):
+        """A step whose durable record has not moved in a while is stale."""
+
+        self.ready()
+        self.assertTrue(self.submit().ok)
+        claimed = self.lifecycle.store.claim(
+            "test-stale", project_ids=("lodus-casino",))
+        self.lifecycle.store.begin_step(
+            claimed["id"], claimed["lease_token"], "dispatch", {"a": 1})
+
+        started_at = time.time()
+        self.lifecycle.clock = lambda: started_at + 920
+        rendered = self.status().render()
+        self.assertIn(
+            "Stage: dispatch (in progress) — stale, no update in 15m", rendered)
 
     def test_a_stopped_product_mission_is_the_blocker_it_actually_is(self):
         self.ready()

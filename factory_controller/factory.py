@@ -96,6 +96,12 @@ REVIEW_PROBE_TIMEOUT_SECONDS = 10.0
 DEFAULT_WATCH_INTERVAL_SECONDS = 30.0
 AUTOPILOT_WORKER_ID = "factory-autopilot"
 
+#: Above this age, an in-progress step is named "stale" rather than
+#: "healthy" on the status surface.  A fixed threshold rather than a
+#: per-step budget: ponytail, revisit if a legitimately long step starts
+#: tripping it.
+STEP_STALE_AFTER_SECONDS = 900.0
+
 #: The supervisor service's own PATH, written into the job definition.
 #:
 #: launchd hands a LaunchAgent that names no PATH the bare
@@ -2151,8 +2157,22 @@ class FactoryLifecycle:
         except Exception:  # noqa: BLE001
             return None
 
+    @staticmethod
+    def _age_text(seconds: float) -> str:
+        seconds = max(0, int(seconds))
+        if seconds < 60:
+            return "%ds" % seconds
+        if seconds < 3600:
+            return "%dm" % (seconds // 60)
+        return "%dh" % (seconds // 3600)
+
     def _product_stage(self, mission_id: str) -> str | None:
-        """Which durable step the mission is on, when one has been recorded."""
+        """Which durable step the mission is on, when one has been recorded.
+
+        For a step still in progress, the age of its own last durable update
+        is appended so the Owner can tell a healthy long-running step from a
+        stuck one without reading logs or the database.
+        """
 
         try:
             records = self.store.step_records(mission_id)
@@ -2161,9 +2181,17 @@ class FactoryLifecycle:
         if not records:
             return None
         latest = records[-1]
-        return "%s (%s)" % (
-            latest["name"],
-            "complete" if latest["status"] == "COMPLETED" else "in progress")
+        complete = latest["status"] == "COMPLETED"
+        label = "%s (%s)" % (latest["name"], "complete" if complete else "in progress")
+        updated_at = latest.get("updated_at")
+        if not complete and isinstance(updated_at, (int, float)):
+            age_seconds = self.clock() - updated_at
+            if age_seconds >= 0:
+                if age_seconds >= STEP_STALE_AFTER_SECONDS:
+                    label += " — stale, no update in %s" % self._age_text(age_seconds)
+                else:
+                    label += " — updated %s ago" % self._age_text(age_seconds)
+        return label
 
     def _dogfood_history_note(self) -> str | None:
         """The internal portfolio's own blocker, demoted to what it is.
