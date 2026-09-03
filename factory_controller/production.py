@@ -617,6 +617,19 @@ class HealthRecord:
     evidence_ref: str
     observed_at: float
 
+    def __post_init__(self) -> None:
+        # `classify_health` reads these counts by truthiness, so -1 passed and
+        # 0 failed classified as healthy: a count nobody could have observed
+        # settling a deployment the Owner then validates. Refused where the
+        # record is made, which is every path that can reach the ledger.
+        for name in ("checks_passed", "checks_failed"):
+            value = getattr(self, name)
+            if not isinstance(value, int) or isinstance(value, bool) \
+                    or value < 0:
+                raise PolicyError(
+                    "%s is a count of observations, so it cannot be %r"
+                    % (name, value))
+
     def as_row(self) -> dict[str, Any]:
         return {"checks_passed": self.checks_passed,
                 "checks_failed": self.checks_failed,
@@ -1046,7 +1059,11 @@ class ProductionLedger:
             else:
                 target = db.execute(
                     "SELECT id, bundle_json FROM deployments WHERE environment_id=?"
-                    " AND state IN ('healthy','recovered') AND id!=?"
+                    # `recovered` means this deployment was itself rolled
+                    # back, so the bytes its record names are not the bytes the
+                    # environment went on serving. Offering it as a target
+                    # restored a release that had already failed.
+                    " AND state='healthy' AND id!=?"
                     " ORDER BY updated_at DESC LIMIT 1",
                     (row["environment_id"], deployment_id)).fetchone()
                 if target is None:

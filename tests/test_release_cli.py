@@ -426,3 +426,68 @@ class ReviewProbeTests(unittest.TestCase):
         self.assertEqual(code, 1)
         self.assertEqual(refused["refused"]["code"],
                          "REVIEW_ARTIFACT_UNAVAILABLE")
+
+
+class PromotionOrderingTests(unittest.TestCase):
+    """SF-180 B03: promotion read the stored decision, not the review's state.
+
+    An Owner Validation is a decision about a review that was healthy when
+    they made it.  Between that moment and the promotion the same review can
+    be observed failed, and `promote_validated` looked only at the stored
+    validation -- so a release the environment had already reported broken
+    was still admitted to Production.
+    """
+
+    setUp = ReleaseCommandTests.setUp
+    run_cli = ReleaseCommandTests.run_cli
+    bundle_path = ReleaseCommandTests.bundle_path
+    seal = ReleaseCommandTests.seal
+    review = ReleaseCommandTests.review
+    validate = ReleaseCommandTests.validate
+    promote = ReleaseCommandTests.promote
+
+    def validated(self):
+        self.assertEqual(self.seal(1)[0], 0)
+        code, deployed = self.review(1)
+        self.assertEqual(code, 0)
+        self.assertEqual(deployed["state"], "healthy")
+        code, validated = self.validate(deployed["deployment_ref"])
+        self.assertEqual(code, 0)
+        self.assertEqual(validated["decision"], "VALIDATED")
+        return deployed
+
+    def test_a_review_observed_failed_after_validation_stops_the_promotion(self):
+        deployed = self.validated()
+
+        code, health = self.run_cli(
+            "production", "health", "--deployment", deployed["deployment_id"],
+            "--failed", "1", "--ref", "probe://failed-after-validation")
+        self.assertEqual(code, 0)
+        self.assertEqual(health["state"], "failed")
+
+        code, refused = self.promote(1)
+
+        self.assertEqual(code, 1)
+        self.assertEqual(refused["refused"]["code"], "REVIEW_NOT_HEALTHY")
+
+    def test_a_review_still_healthy_promotes_exactly_as_before(self):
+        self.validated()
+
+        code, promoted = self.promote(1)
+
+        self.assertEqual(code, 0)
+        self.assertTrue(promoted["same_artifact"])
+
+    def test_a_fabricated_negative_observation_is_refused_at_the_command(self):
+        """SF-180 B02, reached the way an operator reaches it."""
+
+        self.assertEqual(self.seal(1)[0], 0)
+
+        code, refused = self.run_cli(
+            "release", "deploy-review", "--rc", "CASINO-MVP-RC-001",
+            "--environment", "lodus-casino-review", "--actor", "factory",
+            "--review-url", "https://review.example.invalid/casino",
+            "--passed", "-1")
+
+        self.assertEqual(code, 1)
+        self.assertEqual(refused["refused"]["code"], "HEALTH_OBSERVATION_INVALID")

@@ -667,3 +667,81 @@ class BoundaryTests(LedgerCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class HealthObservationTests(unittest.TestCase):
+    """SF-180 B02: a count nobody could have observed settled a deployment.
+
+    ``classify_health`` reads the two counts by truthiness, so
+    ``checks_passed=-1, checks_failed=0`` fell through to ``healthy`` -- and
+    the same value is what ``--passed -1`` on the release and production
+    health commands hands it.  A fabricated negative observation could carry a
+    verifying deployment to the state Owner Validation requires.
+    """
+
+    def record(self, passed, failed):
+        return production.HealthRecord(
+            checks_passed=passed, checks_failed=failed,
+            evidence_ref="health-probe://example.invalid", observed_at=1.0)
+
+    def test_a_negative_count_is_not_an_observation(self):
+        for passed, failed in ((-1, 0), (0, -1), (-1, -1)):
+            with self.subTest(passed=passed, failed=failed):
+                with self.assertRaises(production.PolicyError):
+                    self.record(passed, failed)
+
+    def test_a_boolean_is_not_a_count(self):
+        with self.assertRaises(production.PolicyError):
+            self.record(True, 0)
+
+    def test_a_real_observation_is_unchanged(self):
+        self.assertEqual(production.classify_health(self.record(3, 0)), "healthy")
+        self.assertEqual(production.classify_health(self.record(2, 1)), "degraded")
+        self.assertEqual(production.classify_health(self.record(0, 1)), "failed")
+        self.assertEqual(production.classify_health(self.record(0, 0)), "unknown")
+
+
+class RollbackTargetTests(LedgerCase):
+    """SF-180 B04: a rolled-back release is not a known-good rollback target.
+
+    ``recovered`` means *this* deployment was rolled back, so the bytes its
+    record names are not the bytes the environment went on serving.  Offering
+    it as a target made the second rollback restore the release that had
+    already failed, ordered only by a mutable ``updated_at``.
+    """
+
+    def failed_release(self, sha):
+        deployment = self.ledger.admit_release(
+            bundle(release_sha=sha), "shop-staging", "factory")
+        self.ledger.deploy(deployment, self.port)
+        self.assertEqual(self.ledger.record_health(deployment, unhealthy()),
+                         "failed")
+        return deployment
+
+    def test_a_second_rollback_never_restores_the_release_that_failed(self):
+        healthy_release = self.live()
+
+        second = self.failed_release(OTHER_SHA)
+        self.assertEqual(self.ledger.rollback(second, self.port), "recovered")
+        self.assertEqual(self.ledger.deployment(second)["rollback_of"],
+                         healthy_release)
+
+        third = self.failed_release("c" * 40)
+        self.ledger.rollback(third, self.port)
+
+        self.assertEqual(self.ledger.deployment(third)["rollback_of"],
+                         healthy_release)
+        self.assertEqual(self.ledger.deployment(second)["state"], "recovered")
+
+    def test_when_every_predecessor_failed_or_was_rolled_back_there_is_none(self):
+        """Fail closed rather than restore bytes nobody recorded as healthy."""
+
+        first = self.live()
+        second = self.failed_release(OTHER_SHA)
+        self.ledger.rollback(second, self.port)
+        self.assertEqual(self.ledger.record_health(first, unhealthy()), "failed")
+
+        third = self.failed_release("d" * 40)
+        with self.assertRaises(production.ProductionRefusal) as caught:
+            self.ledger.rollback(third, self.port)
+        self.assertEqual(caught.exception.code, "ROLLBACK_TARGET_UNKNOWN")

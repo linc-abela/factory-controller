@@ -593,9 +593,16 @@ def _release(args, store) -> int:
         health = verifier.verify(args.review_url,
                                  expected_entry_content=expected)
     elif args.rel_passed or args.rel_failed:
-        health = production.HealthRecord(
-            checks_passed=args.rel_passed, checks_failed=args.rel_failed,
-            evidence_ref=args.health_ref or "unknown", observed_at=time.time())
+        try:
+            health = production.HealthRecord(
+                checks_passed=args.rel_passed, checks_failed=args.rel_failed,
+                evidence_ref=args.health_ref or "unknown",
+                observed_at=time.time())
+        except production.PolicyError as error:
+            print(json.dumps({"refused": {"code": "HEALTH_OBSERVATION_INVALID",
+                                          "detail": str(error)}},
+                             sort_keys=True))
+            return 1
     try:
         if args.action == "seal":
             body = (sys.stdin.read() if str(args.rel_bundle) == "-"

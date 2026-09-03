@@ -407,6 +407,27 @@ class ReleaseLifecycle:
         if candidate_sha is not None and candidate_sha != rc.candidate_sha:
             raise ReleaseRefusal("CANDIDATE_IDENTITY_MISMATCH",
                                  "a different candidate cannot use prior Owner Validation")
+        # An Owner Validation is a decision about a review that was healthy
+        # when they made it. Between then and here that same review can be
+        # observed failed, and promotion read only the stored decision -- so a
+        # release the environment had already reported broken could still be
+        # admitted to Production. The ordering the chain claims is: healthy
+        # exact REVIEW *now*, then Owner Validation, then same-artifact
+        # Production.
+        with self._store.transaction() as db:
+            review = db.execute(
+                "SELECT deployment_id FROM release_deployments WHERE rc_id=?"
+                " AND environment_class='staging'", (rc_id,)).fetchone()
+            state = None if review is None else db.execute(
+                "SELECT state FROM deployments WHERE id=?",
+                (review["deployment_id"],)).fetchone()
+        if review is None:
+            raise ReleaseRefusal("REVIEW_DEPLOYMENT_NOT_FOUND", rc_id)
+        if state is None or state["state"] != "healthy":
+            raise ReleaseRefusal(
+                "REVIEW_NOT_HEALTHY",
+                "Production promotion requires the exact review deployment to "
+                "be healthy now, not only when it was validated")
         policy = ledger.environment(production_environment_id)
         if policy.environment_class != "production":
             raise ReleaseRefusal("PRODUCTION_ENVIRONMENT_REQUIRED",
