@@ -549,6 +549,7 @@ def _release(args, store) -> int:
     lifecycle = release.ReleaseLifecycle(store)
     ledger = production.ProductionLedger(store)
     adapter_choice = getattr(args, "rel_adapter", "deterministic")
+    artifact_dir = getattr(args, "artifact_dir", None)
     if adapter_choice in ("google", "firebase", "google-firebase-hosting", "google-simulated"):
         from . import google_production
         if adapter_choice == "google-simulated" or getattr(args, "simulate", False):
@@ -558,7 +559,6 @@ def _release(args, store) -> int:
             token_file = getattr(args, "deploy_token_file", None)
             transport = google_production.FirebaseHostingRestTransport(
                 token=token_file.read_text().strip() if token_file else None)
-        artifact_dir = getattr(args, "artifact_dir", None)
         resolver = (lambda d: google_production.file_system_artifact_resolver(d, base_dirs=[artifact_dir])) if artifact_dir else None
         port = google_production.FirebaseHostingDeploymentAdapter({}, transport=transport, artifact_resolver=resolver, store=store)
     else:
@@ -567,7 +567,31 @@ def _release(args, store) -> int:
     if getattr(args, "probe", False) and getattr(args, "review_url", None):
         from . import google_production
         verifier = google_production.StaticWebHealthVerifier()
-        health = verifier.verify(args.review_url)
+        # Without the sealed entry document to compare against, the probe asks
+        # only whether something answered -- and a `healthy` review is what
+        # Owner Validation requires. A surface serving anything at all would
+        # therefore have carried the exact-artifact chain. Refused rather than
+        # weakened: the RC names bytes this host either holds or does not.
+        expected = None
+        try:
+            sealed = lifecycle.candidate(args.rc_id)
+        except release.ReleaseRefusal:
+            sealed = None
+        if sealed is not None:
+            resolved = google_production.file_system_artifact_resolver(
+                sealed.artifact_digest,
+                base_dirs=[artifact_dir] if artifact_dir else None)
+            expected = resolved.get("index.html")
+            if expected is None:
+                print(json.dumps({"refused": {
+                    "code": "REVIEW_ARTIFACT_UNAVAILABLE",
+                    "detail": "the sealed artifact %s is not unpacked on this "
+                              "host, so a probe cannot prove what the surface "
+                              "serves" % sealed.artifact_digest}},
+                    sort_keys=True))
+                return 1
+        health = verifier.verify(args.review_url,
+                                 expected_entry_content=expected)
     elif args.rel_passed or args.rel_failed:
         health = production.HealthRecord(
             checks_passed=args.rel_passed, checks_failed=args.rel_failed,

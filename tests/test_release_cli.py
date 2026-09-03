@@ -319,3 +319,110 @@ class LedgerResolutionTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class ReviewProbeTests(unittest.TestCase):
+    """SF-179 C: a probe that proves nothing can still carry Owner Validation.
+
+    `--probe` ran the real health verifier without the one argument that makes
+    it a verification: `expected_entry_content`.  Checks 1, 2, 4 and 5 ask
+    whether *something* answered; a surface serving any 200 at `/` and at
+    `/health.json` produced `checks_failed=0`, which settles the review
+    deployment `healthy`, which is exactly what `record_owner_validation`
+    requires.  The exact-artifact chain would then have been anchored to a
+    review nobody proved was the release.
+    """
+
+    setUp = ReleaseCommandTests.setUp
+    run_cli = ReleaseCommandTests.run_cli
+    bundle_path = ReleaseCommandTests.bundle_path
+
+    SEALED = b"<!DOCTYPE html><title>the sealed release</title>\n"
+    OTHER = b"<!DOCTYPE html><title>something else entirely</title>\n"
+
+    def surface(self, entry: bytes):
+        """A loopback review surface serving whatever it is given."""
+
+        import http.server
+        import threading
+
+        class Handler(http.server.BaseHTTPRequestHandler):
+            def do_GET(self):
+                body = (b'{"status": "ok"}\n'
+                        if self.path == "/health.json" else entry)
+                self.send_response(200)
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+
+            def log_message(self, *arguments):
+                pass
+
+        server = http.server.HTTPServer(("127.0.0.1", 0), Handler)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        self.addCleanup(server.server_close)
+        self.addCleanup(server.shutdown)
+        return "http://127.0.0.1:%d" % server.server_address[1]
+
+    def sealed_rc(self, entry: bytes = SEALED):
+        """One sealed RC whose artifact is materialized where a probe finds it."""
+
+        art = self.root / "artifact"
+        art.mkdir(parents=True, exist_ok=True)
+        (art / "index.html").write_bytes(entry)
+        digest = production.deployable_digest({"index.html": entry})
+        body = bundle(1).as_row()
+        body["artifact"] = {"kind": "static-bundle", "identity": digest}
+        path = self.root / "bundle-probe.json"
+        path.write_text(json.dumps(body))
+        code, _ = self.run_cli("release", "seal", "--rc", "CASINO-MVP-RC-001",
+                               "--bundle", str(path), "--verification-ref", "v",
+                               "--qa-ref", "q")
+        self.assertEqual(code, 0)
+        return str(art)
+
+    def probe(self, url, art_dir=None):
+        arguments = ["release", "deploy-review", "--rc", "CASINO-MVP-RC-001",
+                     "--environment", "lodus-casino-review", "--actor",
+                     "factory", "--review-url", url, "--probe"]
+        if art_dir is not None:
+            arguments += ["--artifact-dir", art_dir]
+        return self.run_cli(*arguments)
+
+    def test_a_surface_serving_other_bytes_never_reaches_healthy(self):
+        art = self.sealed_rc()
+        url = self.surface(self.OTHER)
+
+        code, deployed = self.probe(url, art)
+
+        self.assertEqual(code, 0)
+        self.assertNotEqual(deployed["state"], "healthy")
+        code, refused = self.run_cli(
+            "release", "validate", "--rc", "CASINO-MVP-RC-001",
+            "--validation", "CASINO-MVP-VALIDATION-001",
+            "--deployment-ref", deployed["deployment_ref"],
+            "--decision", "VALIDATED", "--actor", "owner")
+        self.assertEqual(code, 1)
+        self.assertEqual(refused["refused"]["code"], "REVIEW_NOT_HEALTHY")
+
+    def test_a_surface_serving_the_sealed_bytes_is_healthy(self):
+        art = self.sealed_rc()
+        url = self.surface(self.SEALED)
+
+        code, deployed = self.probe(url, art)
+
+        self.assertEqual(code, 0)
+        self.assertEqual(deployed["state"], "healthy")
+
+    def test_a_probe_refuses_when_the_sealed_artifact_is_not_on_this_host(self):
+        """Fail closed: an absent artifact is not a weaker probe."""
+
+        self.sealed_rc()
+        url = self.surface(self.SEALED)
+
+        code, refused = self.probe(url, str(self.root / "nowhere"))
+
+        self.assertEqual(code, 1)
+        self.assertEqual(refused["refused"]["code"],
+                         "REVIEW_ARTIFACT_UNAVAILABLE")
