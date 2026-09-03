@@ -22,7 +22,8 @@ from dataclasses import replace
 from pathlib import Path
 import unittest
 
-from factory_controller import pcp, product, release
+from factory_controller import factory, pcp, product, release
+from factory_controller import store as store_mod
 
 from tests.test_factory_lifecycle import fake_context
 from tests.test_factory_product import CHECKOUT, CONTRACT, ProductReviewTests
@@ -302,6 +303,144 @@ class FactoryRevisionTests(unittest.TestCase):
             row["reason"] == "REVISION_SUCCESSOR_OPENED"
             and row["mission_id"] == second.details["mission_id"]
             for row in self.lifecycle.store.coordination(None)))
+
+    # -- SF-179 A: which conflicts are that mission's retry --------------- #
+    #
+    # SF-178 B1: terminal state plus `IDEMPOTENCY_KEY_UNPROVEN` says a mission
+    # died, not that the mission that died is the one being resubmitted.  The
+    # key binds only the identity fields and the manifest, so a conflict can
+    # still carry a different provider, gate command, class or budget.
+
+    def legacy_predecessor(self, stage1=None, **changes):
+        """Leave behind the durable shape SF-176 actually recovered.
+
+        The historical row was admitted before a revision had its own
+        checkout, so its stage-1 paths and Owner act counter differ from a
+        fresh admission while the work it describes is identical.  Keyword
+        arguments overlay whatever else a case needs to differ.
+        """
+
+        first = self.revise()
+        self.assertTrue(first.ok, first.render())
+        row = self.lifecycle.store.get(first.details["mission_id"])
+        payload = json.loads(json.dumps(row["payload"]))
+        payload["approval_ref"] = payload["approval_ref"] + "-shift-13"
+        product_checkout = "/Users/Shared/Projects/software-factory/lodus-casino"
+        payload["stage1"].update({
+            "revision_grounding": None,
+            "repository": product_checkout,
+            "gate_workdir": product_checkout,
+            "gate_commands": {gate: [product_checkout + "/dev",
+                                     gate.removeprefix("dev-")]
+                              for gate in payload["stage1"]["gate_commands"]},
+        })
+        payload["stage1"].update(stage1 or {})
+        payload.update(changes)
+        with self.lifecycle.store.transaction() as db:
+            db.execute("UPDATE missions SET payload_json=?, payload_hash=?, "
+                       "state=?, terminal_reason=? WHERE id=?",
+                       (store_mod.canonical_json(payload),
+                        store_mod.payload_hash(payload), "refused",
+                        "IDEMPOTENCY_KEY_UNPROVEN: layer echoed no key",
+                        first.details["mission_id"]))
+        return first, self.lifecycle.store.get(first.details["mission_id"])
+
+    def assert_fails_closed(self, first, legacy, code):
+        """No successor, and the historical row is left exactly as it was."""
+
+        second = self.revise()
+        self.assertFalse(second.ok, second.render())
+        self.assertEqual(second.details["code"], code)
+        self.assertEqual(len(self.missions()), 2)
+        after = self.lifecycle.store.get(first.details["mission_id"])
+        self.assertEqual(after["payload_hash"], legacy["payload_hash"])
+        self.assertEqual(after["state"], legacy["state"])
+        self.assertEqual(after["terminal_reason"], legacy["terminal_reason"])
+        self.assertEqual(
+            [], [row for row in self.lifecycle.store.coordination(None)
+                 if row["reason"] == "REVISION_SUCCESSOR_OPENED"])
+        return second
+
+    def test_the_real_legacy_admission_shape_still_opens_a_successor(self):
+        """Drifted Owner act counter and stage-1 paths, identical work."""
+
+        self.reviewed()
+        self.serve_the_reviewed_bytes()
+        first, legacy = self.legacy_predecessor()
+        second = self.revise()
+        self.assertTrue(second.ok, second.render())
+        self.assertEqual(second.details["attempt"], 2)
+        self.assertEqual(second.details["predecessor_mission_id"],
+                         first.details["mission_id"])
+        after = self.lifecycle.store.get(first.details["mission_id"])
+        self.assertEqual(after["payload_hash"], legacy["payload_hash"])
+        self.assertEqual(after["payload"], legacy["payload"])
+        self.assertEqual(after["state"], legacy["state"])
+
+    def test_a_changed_provider_never_inherits_the_legacy_retry(self):
+        """The exact SF-178 B1 reproduction: same key, different provider."""
+
+        self.reviewed()
+        self.serve_the_reviewed_bytes()
+        first, legacy = self.legacy_predecessor(provider_candidates=[
+            {"profile": "unrelated-product", "capabilities": ["development"]}])
+        self.assert_fails_closed(first, legacy, "REVISION_INPUT_CHANGED")
+
+    def test_a_changed_stage_one_command_never_inherits_the_retry(self):
+        """The paths may drift; what is executed in them may not."""
+
+        self.reviewed()
+        self.serve_the_reviewed_bytes()
+        first, legacy = self.legacy_predecessor(
+            stage1={"command": ["/usr/bin/env", "python3", "-m", "elsewhere"]})
+        self.assert_fails_closed(first, legacy, "REVISION_INPUT_CHANGED")
+
+    def test_other_payload_only_differences_stay_fail_closed(self):
+        """Every field outside the proven drift set is part of the request."""
+
+        for field_name, value in (("work_class", "hotfix"),
+                                  ("environment_class", "production"),
+                                  ("policy_version", "SF-999-other"),
+                                  ("context_budget", {"max_bytes": 1,
+                                                      "max_files": 1})):
+            with self.subTest(field=field_name):
+                self.setUp()
+                self.reviewed()
+                self.serve_the_reviewed_bytes()
+                first, legacy = self.legacy_predecessor(
+                    **{field_name: value})
+                self.assert_fails_closed(first, legacy,
+                                         "REVISION_INPUT_CHANGED")
+
+    def test_the_divergence_check_reads_every_field_it_was_not_told_to_skip(self):
+        """A payload field added later is fail-closed without being listed."""
+
+        base = {"work_item_id": "lodus-casino:revision:2", "attempt": 1,
+                "approval_ref": "a", "stage1": {"command": ["run"],
+                                                "gate_workdir": "/old"}}
+        same = {**base, "approval_ref": "b",
+                "stage1": {"command": ["run"], "gate_workdir": "/new"}}
+        self.assertIsNone(factory.legacy_conflict_divergence(base, same))
+        self.assertEqual(
+            "attempt",
+            factory.legacy_conflict_divergence(base, {**same, "attempt": 2}))
+        self.assertEqual(
+            "provider_candidates",
+            factory.legacy_conflict_divergence(base, {**same,
+                                                      "provider_candidates": []}))
+        self.assertEqual(
+            "future_field",
+            factory.legacy_conflict_divergence(base, {**same,
+                                                      "future_field": 1}))
+        self.assertEqual(
+            "stage1.mutates_repository",
+            factory.legacy_conflict_divergence(
+                base, {**same, "stage1": {**same["stage1"],
+                                          "mutates_repository": True}}))
+        self.assertEqual("stage1",
+                         factory.legacy_conflict_divergence(base,
+                                                            {**same,
+                                                             "stage1": None}))
 
     # -- SF-162: where the revision is grounded --------------------------- #
     #

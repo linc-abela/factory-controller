@@ -102,6 +102,47 @@ AUTOPILOT_WORKER_ID = "factory-autopilot"
 #: tripping it.
 STEP_STALE_AFTER_SECONDS = 900.0
 
+# SF-179 A: which payload differences prove nothing about the work.
+#
+# A revision's idempotency key binds only the mission identity fields and the
+# context manifest, so a same-key conflict can still carry a changed provider,
+# gate command, class or budget -- a request defect, never a retry.  Only two
+# things provably drifted between the legacy admission of this lifecycle and a
+# fresh one: the Owner act counter, and the stage-1 paths that moved when a
+# revision gained its own checkout.  Everything outside these sets must be
+# byte-identical, so a payload field added later is fail-closed by default.
+LEGACY_CONFLICT_DRIFT_FIELDS = frozenset({"approval_ref", "stage1"})
+LEGACY_CONFLICT_STAGE1_DRIFT_FIELDS = frozenset({
+    "admission", "output", "repository", "gate_workdir", "gate_commands",
+    "revision_grounding"})
+
+
+def legacy_conflict_divergence(existing: Mapping[str, Any],
+                               submitted: Mapping[str, Any]) -> str | None:
+    """Name the first field proving a key conflict is not the legacy shape.
+
+    ``None`` means the durable predecessor is the exact historical admission
+    of the same work.  Terminal state and reason say a mission died; only this
+    says the mission that died is the one being resubmitted.
+    """
+
+    for field_name in sorted(set(existing) | set(submitted)):
+        if field_name in LEGACY_CONFLICT_DRIFT_FIELDS:
+            continue
+        if existing.get(field_name) != submitted.get(field_name):
+            return field_name
+    old = existing.get("stage1")
+    new = submitted.get("stage1")
+    if not isinstance(old, Mapping) or not isinstance(new, Mapping):
+        return "stage1"
+    for field_name in sorted(set(old) | set(new)):
+        if field_name in LEGACY_CONFLICT_STAGE1_DRIFT_FIELDS:
+            continue
+        if old.get(field_name) != new.get(field_name):
+            return "stage1.%s" % field_name
+    return None
+
+
 #: The supervisor service's own PATH, written into the job definition.
 #:
 #: launchd hands a LaunchAgent that names no PATH the bare
@@ -838,6 +879,7 @@ class FactoryLifecycle:
                              and row.get("idempotency_key")
                              == intake.idempotency_key), None)
             reason = "" if existing is None else existing.get("terminal_reason") or ""
+            payload = {} if existing is None else (existing.get("payload") or {})
             if (attempt != 1 or existing is None
                     or existing.get("state") not in store_mod.TERMINAL
                     or not str(reason).startswith("IDEMPOTENCY_KEY_UNPROVEN")):
@@ -845,6 +887,18 @@ class FactoryLifecycle:
                     "REVISION_NOT_SUBMITTED",
                     "The revision mission could not be submitted. Retry the "
                     "command.") from None
+            # The predecessor died unproven, but that alone does not say it
+            # died doing *this* work.  A conflict whose payload differs
+            # anywhere that matters is a changed request, and a changed
+            # request never inherits a retry.
+            divergence = legacy_conflict_divergence(payload, intake.payload)
+            if divergence is not None:
+                raise FactoryRefusal(
+                    "REVISION_INPUT_CHANGED",
+                    "This revision asks for different work than the terminal "
+                    "mission holding its identity (%s differs), so it is not "
+                    "that mission's retry. Withdraw the change or revise from "
+                    "a new Owner decision." % divergence) from None
             successor_of = existing
             attempt = 2
             intake = self._materialize(
