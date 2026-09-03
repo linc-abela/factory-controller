@@ -11,6 +11,7 @@ a rebuilt artifact would be the one bug this chain exists to prevent.
 from __future__ import annotations
 
 import contextlib
+import hashlib
 import io
 import json
 import tempfile
@@ -205,6 +206,7 @@ class ReleaseCommandTests(unittest.TestCase):
         self.assertEqual(result["refused"]["code"], "RELEASE_ARGUMENTS_INVALID")
 
     def test_deploy_review_with_google_adapter(self):
+        # 1. Missing artifact bytes fails closed (never returns reached=True with zero bytes)
         self.seal(1)
         code, deployed = self.run_cli(
             "release", "deploy-review", "--rc", "CASINO-MVP-RC-001",
@@ -212,8 +214,36 @@ class ReleaseCommandTests(unittest.TestCase):
             "--review-url", "https://lodus-casino-review.web.app",
             "--adapter", "google", "--passed", "3")
         self.assertEqual(code, 0)
-        self.assertEqual(deployed["state"], "healthy")
-        self.assertIn("google-firebase", deployed["receipt"]["adapter"])
+        self.assertEqual(deployed["state"], "failed")
+        self.assertTrue(deployed["receipt"]["operation_ref"].endswith(":rejected"))
+
+        # 2. Real artifact files with explicitly selected simulation succeeds
+        art_dir = self.root / "art-002"
+        art_dir.mkdir(parents=True, exist_ok=True)
+        (art_dir / "index.html").write_text("<!DOCTYPE html><html><body>Test</body></html>")
+        files = {"index.html": (art_dir / "index.html").read_bytes()}
+        hasher = hashlib.sha256()
+        for name in sorted(files):
+            hasher.update(name.encode("utf-8"))
+            hasher.update(files[name])
+        art_digest = f"sha256:{hasher.hexdigest()}"
+
+        b2 = bundle(2).as_row()
+        b2["artifact"] = {"kind": "static-bundle", "identity": art_digest}
+        p2 = self.root / "bundle-002-art.json"
+        p2.write_text(json.dumps(b2))
+        self.run_cli("release", "seal", "--rc", "CASINO-MVP-RC-002", "--bundle", str(p2),
+                     "--verification-ref", "v", "--qa-ref", "q")
+
+        code, deployed2 = self.run_cli(
+            "release", "deploy-review", "--rc", "CASINO-MVP-RC-002",
+            "--environment", "lodus-casino-review", "--actor", "factory",
+            "--review-url", "https://lodus-casino-review.web.app",
+            "--adapter", "google", "--simulate", "--artifact-dir", str(art_dir),
+            "--passed", "3")
+        self.assertEqual(code, 0)
+        self.assertEqual(deployed2["state"], "healthy")
+        self.assertIn("google-firebase", deployed2["receipt"]["adapter"])
 
 
 class LedgerResolutionTests(unittest.TestCase):

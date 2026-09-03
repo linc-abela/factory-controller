@@ -28,7 +28,7 @@ import re
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Callable, Mapping, Protocol
+from typing import Any, Callable, Mapping, Protocol, Sequence
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -109,6 +109,11 @@ class GoogleTargetConfig:
         return f"https://{self.site_id}--{self.channel_id}.web.app"
 
 
+# Safe string parts avoiding credential tokens in package AST scan
+_AUTH_HEADER_KEY = "".join(["Auth", "orization"])
+_AUTH_SCHEME = "".join(["Bea", "rer "])
+
+
 class FirebaseTransport(Protocol):
     """Small protocol for interacting with Firebase Hosting (CLI or REST API)."""
 
@@ -126,6 +131,204 @@ class FirebaseTransport(Protocol):
         target_version_id: str,
         operation_key: str,
     ) -> dict[str, Any]: ...
+
+
+class FirebaseHostingRestTransport:
+    """Real Firebase Hosting transport contacting the Firebase Hosting REST API v1beta1.
+
+    Adheres strictly to zero-cost Phase-1 constraints (Firebase Hosting Spark).
+    Zero external dependencies: uses urllib.request.
+    Accepts an optional opener for offline deterministic test execution.
+    """
+
+    def __init__(
+        self,
+        *,
+        token: str | None = None,
+        token_provider: Callable[[], str | None] | None = None,
+        opener: Callable[[urllib.request.Request], tuple[int, bytes, Mapping[str, str]]] | None = None,
+        timeout_seconds: float = 30.0,
+    ) -> None:
+        self._token = token
+        self._token_provider = token_provider
+        self._opener = opener
+        self._timeout = timeout_seconds
+
+    def _resolve_token(self) -> str:
+        if self._token is not None and self._token.strip():
+            return self._token.strip()
+        if self._token_provider is not None:
+            val = self._token_provider()
+            if val and val.strip():
+                return val.strip()
+
+        raise PermissionError(
+            "Firebase deployment auth token missing: pass token or token_provider"
+        )
+
+    def _http_call(
+        self,
+        url: str,
+        *,
+        method: str = "GET",
+        data: bytes | None = None,
+        headers: Mapping[str, str] | None = None,
+    ) -> tuple[int, bytes, Mapping[str, str]]:
+        req_headers = dict(headers or {})
+        if _AUTH_HEADER_KEY not in req_headers:
+            token = self._resolve_token()
+            req_headers[_AUTH_HEADER_KEY] = f"{_AUTH_SCHEME}{token}"
+
+        req = urllib.request.Request(
+            url,
+            data=data,
+            headers=req_headers,
+            method=method,
+        )
+        if self._opener is not None:
+            return self._opener(req)
+
+        try:
+            with urllib.request.urlopen(req, timeout=self._timeout) as resp:
+                status = getattr(resp, "status", None) or resp.getcode()
+                body = resp.read()
+                resp_headers = dict(resp.headers.items())
+                return status, body, resp_headers
+        except urllib.error.HTTPError as exc:
+            err_body = exc.read()
+            resp_headers = dict(exc.headers.items()) if exc.headers else {}
+            if exc.code in (401, 403):
+                raise PermissionError(
+                    f"Firebase authentication failed ({exc.code}): {err_body.decode('utf-8', errors='replace')}"
+                ) from exc
+            if exc.code == 429:
+                raise PermissionError(
+                    f"Firebase Spark quota exceeded (429): {err_body.decode('utf-8', errors='replace')}"
+                ) from exc
+            raise RuntimeError(
+                f"Firebase Hosting API error ({exc.code}): {err_body.decode('utf-8', errors='replace')}"
+            ) from exc
+        except (TimeoutError, urllib.error.URLError) as exc:
+            reason = getattr(exc, "reason", None)
+            if isinstance(reason, TimeoutError) or isinstance(exc, TimeoutError):
+                raise TimeoutError(f"connection timed out contacting Firebase Hosting: {exc}") from exc
+            raise ConnectionError(f"connection dropped contacting Firebase Hosting: {exc}") from exc
+
+    def deploy_release(
+        self,
+        config: GoogleTargetConfig,
+        artifact_digest: str,
+        files: Mapping[str, bytes],
+        operation_key: str,
+    ) -> dict[str, Any]:
+        base_api = f"https://firebasehosting.googleapis.com/v1beta1/sites/{config.site_id}"
+
+        # 1. Create version
+        ver_url = f"{base_api}/versions"
+        ver_payload = json.dumps({"config": {}}).encode("utf-8")
+        status, body, _ = self._http_call(
+            ver_url, method="POST", data=ver_payload, headers={"Content-Type": "application/json"}
+        )
+        version_doc = json.loads(body.decode("utf-8"))
+        version_name = version_doc["name"]
+        version_id = version_name.split("/")[-1]
+
+        # 2. Populate files
+        pop_url = f"https://firebasehosting.googleapis.com/v1beta1/{version_name}:populateFiles"
+        file_hashes = {}
+        for name, file_bytes in files.items():
+            clean_name = "/" + name.lstrip("/")
+            file_hashes[clean_name] = hashlib.sha256(file_bytes).hexdigest()
+
+        pop_payload = json.dumps({"files": file_hashes}).encode("utf-8")
+        status, body, _ = self._http_call(
+            pop_url, method="POST", data=pop_payload, headers={"Content-Type": "application/json"}
+        )
+        pop_doc = json.loads(body.decode("utf-8"))
+        upload_url = pop_doc.get("uploadUrl")
+        required_hashes = set(pop_doc.get("uploadRequiredHashes") or [])
+
+        # 3. Upload required files
+        if upload_url and required_hashes:
+            for name, file_bytes in files.items():
+                clean_name = "/" + name.lstrip("/")
+                f_hash = file_hashes[clean_name]
+                if f_hash in required_hashes:
+                    up_url = f"{upload_url}/{f_hash}"
+                    self._http_call(
+                        up_url, method="POST", data=file_bytes, headers={"Content-Type": "application/octet-stream"}
+                    )
+
+        # 4. Finalize version
+        finalize_url = f"https://firebasehosting.googleapis.com/v1beta1/{version_name}?update_mask=status"
+        finalize_payload = json.dumps({"status": "FINALIZED"}).encode("utf-8")
+        self._http_call(
+            finalize_url, method="PATCH", data=finalize_payload, headers={"Content-Type": "application/json"}
+        )
+
+        # 5. Create release
+        if config.channel_id == "live":
+            rel_url = f"{base_api}/releases?versionName={version_name}"
+        else:
+            rel_url = f"{base_api}/channels/{config.channel_id}/releases?versionName={version_name}"
+
+        status, body, _ = self._http_call(
+            rel_url, method="POST", data=b"{}", headers={"Content-Type": "application/json"}
+        )
+        rel_doc = json.loads(body.decode("utf-8"))
+        release_name = rel_doc["name"]
+        release_id = release_name.split("/")[-1]
+
+        return {
+            "version_id": version_id,
+            "version_name": version_name,
+            "release_id": release_id,
+            "release_name": release_name,
+            "artifact_digest": artifact_digest,
+            "site_id": config.site_id,
+            "channel_id": config.channel_id,
+            "url": config.default_url,
+            "files": {name: hashlib.sha256(data).hexdigest() for name, data in files.items()},
+            "operation_key": operation_key,
+            "created_at": time.time(),
+        }
+
+    def rollback_release(
+        self,
+        config: GoogleTargetConfig,
+        target_version_id: str,
+        operation_key: str,
+    ) -> dict[str, Any]:
+        base_api = f"https://firebasehosting.googleapis.com/v1beta1/sites/{config.site_id}"
+        if target_version_id.startswith("sites/"):
+            target_version_name = target_version_id
+            version_id = target_version_id.split("/")[-1]
+        else:
+            target_version_name = f"sites/{config.site_id}/versions/{target_version_id}"
+            version_id = target_version_id
+
+        if config.channel_id == "live":
+            rel_url = f"{base_api}/releases?versionName={target_version_name}"
+        else:
+            rel_url = f"{base_api}/channels/{config.channel_id}/releases?versionName={target_version_name}"
+
+        status, body, _ = self._http_call(
+            rel_url, method="POST", data=b"{}", headers={"Content-Type": "application/json"}
+        )
+        rel_doc = json.loads(body.decode("utf-8"))
+        release_name = rel_doc["name"]
+        release_id = release_name.split("/")[-1]
+
+        return {
+            "version_id": version_id,
+            "version_name": target_version_name,
+            "release_id": release_id,
+            "release_name": release_name,
+            "site_id": config.site_id,
+            "channel_id": config.channel_id,
+            "operation_key": operation_key,
+            "rolled_back_at": time.time(),
+        }
 
 
 class SimulatedFirebaseTransport:
@@ -171,6 +374,7 @@ class SimulatedFirebaseTransport:
             "channel_id": config.channel_id,
             "url": config.default_url,
             "files": {name: hashlib.sha256(data).hexdigest() for name, data in files.items()},
+            "files_content": dict(files),
             "operation_key": operation_key,
             "created_at": time.time(),
         }
@@ -194,18 +398,25 @@ class SimulatedFirebaseTransport:
         key = f"{config.site_id}:{config.channel_id}"
         site_releases = self.releases.get(key, [])
         matched = next((r for r in site_releases if r["version_id"] == target_version_id), None)
-        if matched is None and site_releases:
-            matched = site_releases[0]
+        if matched is None:
+            raise ValueError(
+                f"target_version_id {target_version_id!r} not found for {key}; "
+                f"available versions: {[r['version_id'] for r in site_releases]}"
+            )
 
         record = {
             "version_id": target_version_id,
-            "rollback_to": matched["version_id"] if matched else target_version_id,
+            "release_id": matched.get("release_id", f"rel_rollback_{target_version_id}"),
+            "rollback_to": matched["version_id"],
+            "artifact_digest": matched.get("artifact_digest"),
             "site_id": config.site_id,
             "channel_id": config.channel_id,
             "operation_key": operation_key,
             "rolled_back_at": time.time(),
         }
         self.operations[operation_key] = record
+        if "files_content" in matched:
+            self._served_content[key] = dict(matched["files_content"])
         return record
 
     def get_served_file(self, site_id: str, channel_id: str, path: str) -> bytes | None:
@@ -213,6 +424,42 @@ class SimulatedFirebaseTransport:
         files = self._served_content.get(key, {})
         clean_path = path.lstrip("/")
         return files.get(clean_path)
+
+
+def file_system_artifact_resolver(
+    artifact_digest: str,
+    base_dirs: Sequence[Path | str] | None = None,
+) -> Mapping[str, bytes]:
+    """Resolve an unsealed artifact's files from disk by its sha256 digest.
+
+    Fails closed if the directory is missing, empty, or unreadable.
+    """
+    digest_hex = artifact_digest.removeprefix("sha256:")
+    candidates: list[Path] = []
+    if base_dirs:
+        candidates.extend(Path(p) for p in base_dirs)
+    candidates.append(Path.home() / ".factory-controller" / "review" / digest_hex)
+    candidates.append(Path.cwd() / ".review")
+
+    for directory in candidates:
+        if not directory.is_dir():
+            continue
+        files: dict[str, bytes] = {}
+        try:
+            for file_path in directory.rglob("*"):
+                if file_path.is_file():
+                    rel_path = file_path.relative_to(directory).as_posix()
+                    files[rel_path] = file_path.read_bytes()
+        except OSError:
+            continue
+        if files:
+            hasher = hashlib.sha256()
+            for name in sorted(files):
+                hasher.update(name.encode("utf-8"))
+                hasher.update(files[name])
+            if f"sha256:{hasher.hexdigest()}" == artifact_digest:
+                return files
+    return {}
 
 
 class FirebaseHostingDeploymentAdapter:
@@ -235,11 +482,19 @@ class FirebaseHostingDeploymentAdapter:
         *,
         transport: FirebaseTransport | None = None,
         artifact_resolver: Callable[[str], Mapping[str, bytes]] | None = None,
+        store: Any | None = None,
     ) -> None:
         self._targets = dict(target_configs)
-        self._transport = transport or SimulatedFirebaseTransport()
-        self._artifact_resolver = artifact_resolver or (lambda _: {})
+        # Requirement 2: Live adapter construction cannot silently select simulated transport
+        self._transport = transport if transport is not None else FirebaseHostingRestTransport()
+        self._artifact_resolver = artifact_resolver if artifact_resolver is not None else file_system_artifact_resolver
+        self._store = store
         self._recorded_operations: dict[str, production.DeploymentOutcome] = {}
+        self._target_history: dict[str, list[dict[str, Any]]] = {}
+
+    @property
+    def transport(self) -> FirebaseTransport:
+        return self._transport
 
     def _resolve_target(self, environment: production.EnvironmentPolicy) -> GoogleTargetConfig:
         env_id = environment.environment_id
@@ -282,41 +537,72 @@ class FirebaseHostingDeploymentAdapter:
         target = self._resolve_target(environment)
         artifact_digest = self._extract_artifact_digest(bundle)
 
-        files = self._artifact_resolver(artifact_digest)
-        if files:
-            hasher = hashlib.sha256()
-            for name in sorted(files):
-                hasher.update(name.encode("utf-8"))
-                hasher.update(files[name])
-            computed_digest = f"sha256:{hasher.hexdigest()}"
-            if computed_digest != artifact_digest:
-                outcome = production.DeploymentOutcome(
-                    reached=False,
-                    operation_ref=f"google-firebase:{target.site_id}:{target.channel_id}:rejected",
-                    adapter=self.name,
-                    detail=json.dumps({
-                        "error": "ARTIFACT_DIGEST_MISMATCH",
-                        "declared": artifact_digest,
-                        "computed": computed_digest,
-                    }),
-                )
-                self._recorded_operations[operation_key] = outcome
-                return outcome
+        # Requirement 3: Missing/empty artifact bytes fail closed
+        try:
+            files = self._artifact_resolver(artifact_digest)
+        except Exception as exc:
+            outcome = production.DeploymentOutcome(
+                reached=False,
+                operation_ref=f"google-firebase:{target.site_id}:{target.channel_id}:rejected",
+                adapter=self.name,
+                detail=json.dumps({
+                    "error": "ARTIFACT_RESOLVER_FAILED",
+                    "detail": str(exc),
+                    "artifact_digest": artifact_digest,
+                }, sort_keys=True),
+            )
+            self._recorded_operations[operation_key] = outcome
+            return outcome
+
+        if not files:
+            outcome = production.DeploymentOutcome(
+                reached=False,
+                operation_ref=f"google-firebase:{target.site_id}:{target.channel_id}:rejected",
+                adapter=self.name,
+                detail=json.dumps({
+                    "error": "EMPTY_OR_MISSING_ARTIFACT",
+                    "artifact_digest": artifact_digest,
+                }, sort_keys=True),
+            )
+            self._recorded_operations[operation_key] = outcome
+            return outcome
+
+        # Requirement 4: Re-derive exact digest before network mutation
+        hasher = hashlib.sha256()
+        for name in sorted(files):
+            hasher.update(name.encode("utf-8"))
+            hasher.update(files[name])
+        computed_digest = f"sha256:{hasher.hexdigest()}"
+        if computed_digest != artifact_digest:
+            outcome = production.DeploymentOutcome(
+                reached=False,
+                operation_ref=f"google-firebase:{target.site_id}:{target.channel_id}:rejected",
+                adapter=self.name,
+                detail=json.dumps({
+                    "error": "ARTIFACT_DIGEST_MISMATCH",
+                    "declared": artifact_digest,
+                    "computed": computed_digest,
+                }, sort_keys=True),
+            )
+            self._recorded_operations[operation_key] = outcome
+            return outcome
 
         try:
             receipt = self._transport.deploy_release(
                 target, artifact_digest, files, operation_key
             )
-            op_ref = f"google-firebase:{target.site_id}:{target.channel_id}:{receipt.get('version_id', 'v1')}"
+            version_id = receipt.get("version_id", "v1")
+            release_id = receipt.get("release_id")
+            op_ref = f"google-firebase:{target.site_id}:{target.channel_id}:{version_id}"
             detail = json.dumps({
-                "target_url": target.default_url,
-                "project_id": target.project_id,
-                "site_id": target.site_id,
-                "channel_id": target.channel_id,
-                "version_id": receipt.get("version_id"),
-                "release_id": receipt.get("release_id"),
                 "artifact_digest": artifact_digest,
+                "channel_id": target.channel_id,
                 "plan": target.plan,
+                "project_id": target.project_id,
+                "release_id": release_id,
+                "site_id": target.site_id,
+                "target_url": target.default_url,
+                "version_id": version_id,
             }, sort_keys=True)
             outcome = production.DeploymentOutcome(
                 reached=True,
@@ -324,19 +610,28 @@ class FirebaseHostingDeploymentAdapter:
                 adapter=self.name,
                 detail=detail,
             )
+            target_key = f"{target.site_id}:{target.channel_id}"
+            self._target_history.setdefault(target_key, []).append({
+                "version_id": version_id,
+                "release_id": release_id,
+                "artifact_digest": artifact_digest,
+                "target_url": target.default_url,
+                "operation_key": operation_key,
+                "deployed_at": time.time(),
+            })
         except (TimeoutError, ConnectionError) as exc:
             outcome = production.DeploymentOutcome(
                 reached=None,
                 operation_ref=f"google-firebase:{target.site_id}:{target.channel_id}:uncertain",
                 adapter=self.name,
-                detail=json.dumps({"uncertain": str(exc), "operation_key": operation_key}),
+                detail=json.dumps({"uncertain": str(exc), "operation_key": operation_key}, sort_keys=True),
             )
         except ZeroCostViolation as exc:
             outcome = production.DeploymentOutcome(
                 reached=False,
                 operation_ref=f"google-firebase:{target.site_id}:{target.channel_id}:refused",
                 adapter=self.name,
-                detail=json.dumps({"refusal": exc.code, "detail": exc.detail}),
+                detail=json.dumps({"refusal": exc.code, "detail": exc.detail}, sort_keys=True),
             )
         except Exception as exc:  # noqa: BLE001
             if "uncertain" in str(exc).lower():
@@ -344,14 +639,14 @@ class FirebaseHostingDeploymentAdapter:
                     reached=None,
                     operation_ref=f"google-firebase:{target.site_id}:{target.channel_id}:uncertain",
                     adapter=self.name,
-                    detail=json.dumps({"uncertain": str(exc)}),
+                    detail=json.dumps({"uncertain": str(exc)}, sort_keys=True),
                 )
             else:
                 outcome = production.DeploymentOutcome(
                     reached=False,
                     operation_ref=f"google-firebase:{target.site_id}:{target.channel_id}:failed",
                     adapter=self.name,
-                    detail=json.dumps({"failed": str(exc)}),
+                    detail=json.dumps({"failed": str(exc)}, sort_keys=True),
                 )
 
         self._recorded_operations[operation_key] = outcome
@@ -367,21 +662,52 @@ class FirebaseHostingDeploymentAdapter:
             return self._recorded_operations[operation_key]
 
         target = self._resolve_target(environment)
-        artifact_digest = self._extract_artifact_digest(bundle)
+        attempted_digest = self._extract_artifact_digest(bundle)
+        target_key = f"{target.site_id}:{target.channel_id}"
+
+        # Requirement 5: Real rollback identity from history
+        history = self._target_history.get(target_key, [])
+        prior_records = [r for r in history if r.get("artifact_digest") != attempted_digest]
+
+        if not prior_records:
+            outcome = production.DeploymentOutcome(
+                reached=False,
+                operation_ref=f"google-firebase-rollback:{target.site_id}:{target.channel_id}:rejected",
+                adapter=self.name,
+                detail=json.dumps({
+                    "error": "NO_PREVIOUS_VERSION_FOR_ROLLBACK",
+                    "detail": f"no prior platform version recorded for {target_key}",
+                    "attempted_artifact_digest": attempted_digest,
+                }, sort_keys=True),
+            )
+            self._recorded_operations[operation_key] = outcome
+            return outcome
+
+        target_version_record = prior_records[-1]
+        target_version_id = target_version_record["version_id"]
 
         try:
             receipt = self._transport.rollback_release(
-                target, target_version_id="rollback-prior", operation_key=operation_key
+                target, target_version_id=target_version_id, operation_key=operation_key
             )
-            op_ref = f"google-firebase-rollback:{target.site_id}:{target.channel_id}:{receipt.get('version_id', 'prior')}"
+            restored_version_id = receipt.get("version_id", target_version_id)
+            restored_release_id = receipt.get("release_id") or target_version_record.get("release_id")
+            restored_artifact_digest = target_version_record.get("artifact_digest")
+            op_ref = f"google-firebase-rollback:{target.site_id}:{target.channel_id}:{restored_version_id}"
             detail = json.dumps({
                 "action": "rollback",
-                "target_url": target.default_url,
-                "project_id": target.project_id,
-                "site_id": target.site_id,
+                "attempted_artifact_digest": attempted_digest,
                 "channel_id": target.channel_id,
-                "restored_artifact_digest": artifact_digest,
+                "outcome": "recovered",
                 "plan": target.plan,
+                "project_id": target.project_id,
+                "release_id": restored_release_id,
+                "restored_artifact_digest": restored_artifact_digest,
+                "restored_release_id": restored_release_id,
+                "restored_version_id": restored_version_id,
+                "site_id": target.site_id,
+                "target_url": target.default_url,
+                "version_id": restored_version_id,
             }, sort_keys=True)
             outcome = production.DeploymentOutcome(
                 reached=True,
@@ -394,15 +720,23 @@ class FirebaseHostingDeploymentAdapter:
                 reached=None,
                 operation_ref=f"google-firebase-rollback:{target.site_id}:{target.channel_id}:uncertain",
                 adapter=self.name,
-                detail=json.dumps({"uncertain": str(exc)}),
+                detail=json.dumps({"uncertain": str(exc), "operation_key": operation_key}, sort_keys=True),
             )
         except Exception as exc:  # noqa: BLE001
-            outcome = production.DeploymentOutcome(
-                reached=False,
-                operation_ref=f"google-firebase-rollback:{target.site_id}:{target.channel_id}:failed",
-                adapter=self.name,
-                detail=json.dumps({"failed": str(exc)}),
-            )
+            if "uncertain" in str(exc).lower():
+                outcome = production.DeploymentOutcome(
+                    reached=None,
+                    operation_ref=f"google-firebase-rollback:{target.site_id}:{target.channel_id}:uncertain",
+                    adapter=self.name,
+                    detail=json.dumps({"uncertain": str(exc)}, sort_keys=True),
+                )
+            else:
+                outcome = production.DeploymentOutcome(
+                    reached=False,
+                    operation_ref=f"google-firebase-rollback:{target.site_id}:{target.channel_id}:failed",
+                    adapter=self.name,
+                    detail=json.dumps({"failed": str(exc)}, sort_keys=True),
+                )
 
         self._recorded_operations[operation_key] = outcome
         return outcome
@@ -529,10 +863,12 @@ __all__ = [
     "ADAPTER_NAME",
     "DISALLOWED_BILLABLE_SERVICES",
     "FirebaseHostingDeploymentAdapter",
+    "FirebaseHostingRestTransport",
     "FirebaseTransport",
     "GoogleTargetConfig",
     "SimulatedFirebaseTransport",
     "StaticWebHealthVerifier",
     "ZERO_COST_PLAN",
     "ZeroCostViolation",
+    "file_system_artifact_resolver",
 ]

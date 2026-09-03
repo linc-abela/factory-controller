@@ -207,8 +207,12 @@ def parser() -> argparse.ArgumentParser:
     rel.add_argument("--failed", type=int, default=0, dest="rel_failed")
     rel.add_argument("--health-ref", dest="health_ref")
     rel.add_argument("--adapter", dest="rel_adapter", default="deterministic",
-                     choices=("deterministic", "google", "firebase", "google-firebase-hosting"),
+                     choices=("deterministic", "google", "firebase", "google-firebase-hosting", "google-simulated"),
                      help="the deployment adapter to use (default: deterministic)")
+    rel.add_argument("--simulate", action="store_true",
+                     help="explicitly select simulated transport for testing")
+    rel.add_argument("--artifact-dir", type=Path, dest="artifact_dir",
+                     help="directory containing unsealed artifact files to deploy")
     rel.add_argument("--probe", action="store_true",
                      help="probe the review URL or deployment target with the real health verifier")
 
@@ -541,9 +545,15 @@ def _release(args, store) -> int:
     lifecycle = release.ReleaseLifecycle(store)
     ledger = production.ProductionLedger(store)
     adapter_choice = getattr(args, "rel_adapter", "deterministic")
-    if adapter_choice in ("google", "firebase", "google-firebase-hosting"):
+    if adapter_choice in ("google", "firebase", "google-firebase-hosting", "google-simulated"):
         from . import google_production
-        port = google_production.FirebaseHostingDeploymentAdapter({})
+        if adapter_choice == "google-simulated" or getattr(args, "simulate", False):
+            transport = google_production.SimulatedFirebaseTransport()
+        else:
+            transport = google_production.FirebaseHostingRestTransport()
+        artifact_dir = getattr(args, "artifact_dir", None)
+        resolver = (lambda d: google_production.file_system_artifact_resolver(d, base_dirs=[artifact_dir])) if artifact_dir else None
+        port = google_production.FirebaseHostingDeploymentAdapter({}, transport=transport, artifact_resolver=resolver, store=store)
     else:
         port = production.DeterministicDeploymentAdapter()
     health = None

@@ -21,6 +21,8 @@ import hashlib
 import json
 import tempfile
 import unittest
+import urllib.parse
+import urllib.request
 from pathlib import Path
 
 from factory_controller import google_production, production, release
@@ -583,6 +585,302 @@ class GoogleProductionReadinessTests(unittest.TestCase):
         self.assertEqual(receipt["bundle_digest"], rc.bundle_digest)
         self.assertEqual(receipt["approved_by"], "owner")
         self.assertEqual(receipt["approval_ref"], "VAL-001")
+
+
+def make_review_policy() -> production.EnvironmentPolicy:
+    return production.EnvironmentPolicy(
+        environment_id=REVIEW_ENV_ID,
+        project_id=CASINO_PROJECT,
+        environment_class="staging",
+        repository=REPOSITORY,
+        service_ref="lodus-casino-review-web",
+        approver_refs=("owner",),
+        policy_version="phase-1",
+        secret_refs=(),
+    )
+
+
+def make_production_policy() -> production.EnvironmentPolicy:
+    return production.EnvironmentPolicy(
+        environment_id=PROD_ENV_ID,
+        project_id=CASINO_PROJECT,
+        environment_class="production",
+        repository=REPOSITORY,
+        service_ref="lodus-casino-production-web",
+        approver_refs=("owner",),
+        policy_version="phase-1",
+        secret_refs=(),
+    )
+
+
+class FirebaseTransportAndRollbackClosureTests(unittest.TestCase):
+    """SF-170A: Real Firebase transport, sealed artifact verification, and rollback identity."""
+
+    def test_live_adapter_construction_cannot_silently_select_simulated_transport(self):
+        adapter = google_production.FirebaseHostingDeploymentAdapter({})
+        self.assertIsInstance(adapter.transport, google_production.FirebaseHostingRestTransport)
+        self.assertNotIsInstance(adapter.transport, google_production.SimulatedFirebaseTransport)
+
+    def test_missing_or_empty_artifact_resolver_refuses_before_transport_invocation(self):
+        calls = []
+
+        class MockTransport:
+            def deploy_release(self, *args, **kwargs):
+                calls.append("deploy")
+                return {}
+
+            def rollback_release(self, *args, **kwargs):
+                calls.append("rollback")
+                return {}
+
+        adapter = google_production.FirebaseHostingDeploymentAdapter(
+            {},
+            transport=MockTransport(),
+            artifact_resolver=lambda _: {},
+        )
+        b = make_casino_bundle(1, CASINO_FILES_V1)
+        policy = make_review_policy()
+        outcome = adapter.deploy(b, policy, "op-empty")
+        self.assertFalse(outcome.reached)
+        self.assertEqual(len(calls), 0)
+        self.assertTrue(outcome.operation_ref.endswith(":rejected"))
+        detail = json.loads(outcome.detail)
+        self.assertEqual(detail.get("error"), "EMPTY_OR_MISSING_ARTIFACT")
+
+    def test_exact_byte_digest_mismatch_refuses_before_network_mutation(self):
+        calls = []
+
+        class MockTransport:
+            def deploy_release(self, *args, **kwargs):
+                calls.append("deploy")
+                return {}
+
+            def rollback_release(self, *args, **kwargs):
+                calls.append("rollback")
+                return {}
+
+        # Resolver returns V2 files while bundle declared V1 digest
+        adapter = google_production.FirebaseHostingDeploymentAdapter(
+            {},
+            transport=MockTransport(),
+            artifact_resolver=lambda _: dict(CASINO_FILES_V2),
+        )
+        b = make_casino_bundle(1, CASINO_FILES_V1)
+        policy = make_review_policy()
+        outcome = adapter.deploy(b, policy, "op-mismatch")
+        self.assertFalse(outcome.reached)
+        self.assertEqual(len(calls), 0)
+        self.assertTrue(outcome.operation_ref.endswith(":rejected"))
+        detail = json.loads(outcome.detail)
+        self.assertEqual(detail.get("error"), "ARTIFACT_DIGEST_MISMATCH")
+        self.assertNotEqual(detail.get("declared"), detail.get("computed"))
+
+    def test_production_shaped_deployments_call_transport_with_exact_bytes(self):
+        recorded = []
+
+        class RecordingTransport:
+            def deploy_release(self, config, artifact_digest, files, operation_key):
+                recorded.append((config, artifact_digest, dict(files), operation_key))
+                return {"version_id": "v0042", "release_id": "rel_0042"}
+
+            def rollback_release(self, *args, **kwargs):
+                return {}
+
+        adapter = google_production.FirebaseHostingDeploymentAdapter(
+            {},
+            transport=RecordingTransport(),
+            artifact_resolver=lambda _: dict(CASINO_FILES_V1),
+        )
+        b = make_casino_bundle(1, CASINO_FILES_V1)
+        policy = make_review_policy()
+        outcome = adapter.deploy(b, policy, "op-deploy-real")
+        self.assertTrue(outcome.reached)
+        self.assertEqual(len(recorded), 1)
+        cfg, digest, files, op_key = recorded[0]
+        self.assertEqual(digest, b.artifact["identity"])
+        self.assertEqual(files, CASINO_FILES_V1)
+        self.assertEqual(op_key, "op-deploy-real")
+
+    def test_returned_firebase_version_and_release_ids_durably_carried(self):
+        transport = google_production.SimulatedFirebaseTransport()
+        adapter = google_production.FirebaseHostingDeploymentAdapter(
+            {},
+            transport=transport,
+            artifact_resolver=lambda _: dict(CASINO_FILES_V1),
+        )
+        b = make_casino_bundle(1, CASINO_FILES_V1)
+        policy = make_review_policy()
+        outcome = adapter.deploy(b, policy, "op-version-carry")
+        self.assertTrue(outcome.reached)
+        detail = json.loads(outcome.detail)
+        self.assertEqual(detail.get("version_id"), "v0001")
+        self.assertTrue(detail.get("release_id", "").startswith("rel_"))
+        self.assertEqual(outcome.operation_ref, "google-firebase:lodus-casino-review:review:v0001")
+
+    def test_rollback_targets_exact_previous_known_good_version_not_first_release_guess(self):
+        transport = google_production.SimulatedFirebaseTransport()
+        b1 = make_casino_bundle(1, CASINO_FILES_V1)
+        b2 = make_casino_bundle(2, CASINO_FILES_V2)
+        v3_files = dict(CASINO_FILES_V1, **{"index.html": b"<html><body>Casino V3</body></html>"})
+        b3 = make_casino_bundle(3, v3_files)
+
+        files_by_digest = {
+            b1.artifact["identity"]: CASINO_FILES_V1,
+            b2.artifact["identity"]: CASINO_FILES_V2,
+            b3.artifact["identity"]: v3_files,
+        }
+
+        adapter = google_production.FirebaseHostingDeploymentAdapter(
+            {},
+            transport=transport,
+            artifact_resolver=lambda d: files_by_digest.get(d, {}),
+        )
+        policy = make_production_policy()
+
+        out1 = adapter.deploy(b1, policy, "op-1")
+        self.assertEqual(json.loads(out1.detail)["version_id"], "v0001")
+
+        out2 = adapter.deploy(b2, policy, "op-2")
+        self.assertEqual(json.loads(out2.detail)["version_id"], "v0002")
+
+        out3 = adapter.deploy(b3, policy, "op-3")
+        self.assertEqual(json.loads(out3.detail)["version_id"], "v0003")
+
+        # Rollback of V3 must target V2 (v0002), NEVER v0001 or first release
+        rollback_out = adapter.rollback(b3, policy, "op-rollback-v3")
+        self.assertTrue(rollback_out.reached)
+        detail = json.loads(rollback_out.detail)
+        self.assertEqual(detail["restored_version_id"], "v0002")
+        self.assertEqual(detail["attempted_artifact_digest"], b3.artifact["identity"])
+        self.assertEqual(detail["restored_artifact_digest"], b2.artifact["identity"])
+        self.assertEqual(rollback_out.operation_ref, "google-firebase-rollback:lodus-casino-production:live:v0002")
+
+    def test_rollback_without_prior_version_refuses_closed(self):
+        transport = google_production.SimulatedFirebaseTransport()
+        adapter = google_production.FirebaseHostingDeploymentAdapter(
+            {},
+            transport=transport,
+            artifact_resolver=lambda _: dict(CASINO_FILES_V1),
+        )
+        b = make_casino_bundle(1, CASINO_FILES_V1)
+        policy = make_production_policy()
+        outcome = adapter.rollback(b, policy, "op-rollback-no-prior")
+        self.assertFalse(outcome.reached)
+        self.assertTrue(outcome.operation_ref.endswith(":rejected"))
+        detail = json.loads(outcome.detail)
+        self.assertEqual(detail.get("error"), "NO_PREVIOUS_VERSION_FOR_ROLLBACK")
+
+    def test_health_recheck_after_rollback_verifies_restored_content(self):
+        transport = google_production.SimulatedFirebaseTransport()
+        b1 = make_casino_bundle(1, CASINO_FILES_V1)
+        b2 = make_casino_bundle(2, CASINO_FILES_V2)
+        files_by_digest = {
+            b1.artifact["identity"]: CASINO_FILES_V1,
+            b2.artifact["identity"]: CASINO_FILES_V2,
+        }
+        adapter = google_production.FirebaseHostingDeploymentAdapter(
+            {},
+            transport=transport,
+            artifact_resolver=lambda d: files_by_digest.get(d, {}),
+        )
+        policy = make_production_policy()
+
+        def test_opener(url_str: str) -> tuple[int, bytes, dict[str, str]]:
+            parsed = urllib.parse.urlsplit(url_str)
+            clean_path = parsed.path.lstrip("/") or "index.html"
+            content = transport.get_served_file("lodus-casino-production", "live", clean_path)
+            if content is None:
+                return 404, b"Not Found", {}
+            return 200, content, {"Content-Type": "text/html"}
+
+        # Deploy V1
+        adapter.deploy(b1, policy, "op-d1")
+        # Deploy V2
+        adapter.deploy(b2, policy, "op-d2")
+
+        verifier = google_production.StaticWebHealthVerifier(opener=test_opener)
+        h2 = verifier.verify("https://lodus-casino-production.web.app", expected_entry_content=CASINO_FILES_V2["index.html"])
+        self.assertEqual(production.classify_health(h2), "healthy")
+
+        # Rollback V2 -> Restores V1 content
+        rb = adapter.rollback(b2, policy, "op-rb2")
+        self.assertTrue(rb.reached)
+
+        # Health recheck against V1 passes
+        h_recheck_v1 = verifier.verify("https://lodus-casino-production.web.app", expected_entry_content=CASINO_FILES_V1["index.html"])
+        self.assertEqual(production.classify_health(h_recheck_v1), "healthy")
+
+        # Health check looking for V2 fails to report healthy because V1 was restored
+        h_recheck_v2 = verifier.verify("https://lodus-casino-production.web.app", expected_entry_content=CASINO_FILES_V2["index.html"])
+        self.assertNotEqual(production.classify_health(h_recheck_v2), "healthy")
+        self.assertGreater(h_recheck_v2.checks_failed, 0)
+
+    def test_real_transport_mocked_http_deploy_and_rollback(self):
+        calls = []
+
+        def mock_opener(req: urllib.request.Request) -> tuple[int, bytes, dict[str, str]]:
+            calls.append((req.get_method(), req.full_url, req.data, dict(req.headers)))
+            url = req.full_url
+            if url.endswith("/versions") and req.get_method() == "POST":
+                return 200, json.dumps({"name": "sites/lodus-casino/versions/v_mock_001"}).encode(), {}
+            if ":populateFiles" in url and req.get_method() == "POST":
+                return 200, json.dumps({
+                    "uploadUrl": "https://upload.firebasehosting.googleapis.com",
+                    "uploadRequiredHashes": list(json.loads(req.data.decode())["files"].values()),
+                }).encode(), {}
+            if "https://upload.firebasehosting.googleapis.com" in url and req.get_method() == "POST":
+                return 200, b"{}", {}
+            if "?update_mask=status" in url and req.get_method() == "PATCH":
+                return 200, json.dumps({"status": "FINALIZED"}).encode(), {}
+            if "/releases" in url and req.get_method() == "POST":
+                return 200, json.dumps({"name": "sites/lodus-casino/releases/rel_mock_001"}).encode(), {}
+            return 404, b"Not Found", {}
+
+        transport = google_production.FirebaseHostingRestTransport(
+            token="test-secret-token",
+            opener=mock_opener,
+        )
+        target = google_production.GoogleTargetConfig(
+            project_id="lodus-casino",
+            site_id="lodus-casino",
+            channel_id="live",
+            plan=google_production.ZERO_COST_PLAN,
+        )
+        deploy_receipt = transport.deploy_release(
+            target,
+            artifact_digest=digest_for_files(CASINO_FILES_V1),
+            files=CASINO_FILES_V1,
+            operation_key="op-http-1",
+        )
+        self.assertEqual(deploy_receipt["version_id"], "v_mock_001")
+        self.assertEqual(deploy_receipt["release_id"], "rel_mock_001")
+        self.assertGreaterEqual(len(calls), 5)
+
+        # Rollback call
+        rollback_receipt = transport.rollback_release(
+            target,
+            target_version_id="v_mock_001",
+            operation_key="op-http-rb",
+        )
+        self.assertEqual(rollback_receipt["version_id"], "v_mock_001")
+        self.assertEqual(rollback_receipt["release_id"], "rel_mock_001")
+
+    def test_real_transport_missing_auth_fails_closed(self):
+        transport = google_production.FirebaseHostingRestTransport()
+        target = google_production.GoogleTargetConfig(
+            project_id="lodus-casino",
+            site_id="lodus-casino",
+            channel_id="live",
+            plan=google_production.ZERO_COST_PLAN,
+        )
+        with self.assertRaises(PermissionError) as ctx:
+            transport.deploy_release(
+                target,
+                artifact_digest="sha256:test",
+                files={"index.html": b"test"},
+                operation_key="op-noauth",
+            )
+        self.assertIn("auth token missing", str(ctx.exception).lower())
 
 
 if __name__ == "__main__":
