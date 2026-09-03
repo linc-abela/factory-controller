@@ -827,9 +827,11 @@ class MissionStore:
         """Whether a started dispatch has no durable proof it was harmless."""
 
         step = db.execute(
-            "SELECT status FROM steps WHERE mission_id=? AND name='dispatch'",
+            "SELECT status FROM steps WHERE mission_id=?"
+            " AND name IN ('dispatch','dispatch-recovery')"
+            " AND status='STARTED' LIMIT 1",
             (mission_id,)).fetchone()
-        if step is None or step["status"] != "STARTED":
+        if step is None:
             return False
         legs = db.execute(
             "SELECT process_started FROM runs WHERE mission_id=? ORDER BY id",
@@ -1758,7 +1760,8 @@ class MissionStore:
             " WHERE (state IN ('admitted','dispatched','candidate_verified','evaluated','evidence_sealed')"
             " OR (state='dispatching' AND EXISTS ("
             "   SELECT 1 FROM steps s WHERE s.mission_id=missions.id"
-            "   AND s.name='dispatch' AND s.status='STARTED'"
+            "   AND s.name IN ('dispatch','dispatch-recovery')"
+            "   AND s.status='STARTED'"
             " ) AND (NOT EXISTS (SELECT 1 FROM runs r0 WHERE r0.mission_id=missions.id)"
             "   OR EXISTS (SELECT 1 FROM runs r1 WHERE r1.mission_id=missions.id"
             "      AND (r1.process_started IS NULL OR r1.process_started=1)))))"

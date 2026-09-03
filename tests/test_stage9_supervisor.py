@@ -32,6 +32,8 @@ import ast
 import hashlib
 import json
 import tempfile
+import threading
+import time
 import unittest
 from pathlib import Path
 
@@ -663,6 +665,30 @@ class WorkSelectionTests(SupervisorCase):
 
 class ExactlyOnceTests(SupervisorCase):
 
+    def test_dispatch_recovery_is_uncertain_and_reconciled_before_new_work(self):
+        """The recovery step has the same no-duplicate boundary as dispatch."""
+
+        self.project()
+        self.policy()
+        self.running()
+        mission_id = self.backlog("W-recovery")
+        claimed = self.store.claim("dead-worker", lease_seconds=0)
+        route = {"provider_profile": ALPHA,
+                 "idempotency_key": claimed["idempotency_key"]}
+        self.store.begin_step(
+            mission_id, claimed["lease_token"], "dispatch-recovery",
+            {"mission": claimed["payload"]},
+            recorded_input={"mission": claimed["payload"], "route": route},
+        )
+        self.store.recover_stale()
+        self.assertEqual(self.store.get(mission_id)["state"], "dispatching")
+
+        report = self.plane.cycle("reconciler")
+
+        self.assertEqual(report["uncertain_missions"], [mission_id])
+        self.assertEqual(self.store.get(mission_id)["state"], "completed")
+        self.assertEqual(len(self.adapter.dispatches), 1)
+
     def test_an_overlapping_invocation_is_refused_rather_than_queued(self):
         self.project()
         self.policy()
@@ -675,6 +701,53 @@ class ExactlyOnceTests(SupervisorCase):
         with self.assertRaises(supervisor.SupervisorRefusal) as raised:
             self.plane.cycle("w1")
         self.assertEqual(raised.exception.code, "SUPERVISOR_CYCLE_IN_FLIGHT")
+
+    def test_a_live_cycle_lease_is_renewed_while_provider_work_is_running(self):
+        """A healthy long call cannot be recovered as an abandoned cycle."""
+
+        self.project()
+        self.policy()
+        self.running()
+        self.backlog("W-long")
+        started = threading.Event()
+        release = threading.Event()
+
+        class BlockingAdapter(LayerAdapter):
+            def _dispatch(self, operation_key, value):
+                started.set()
+                if not release.wait(1):
+                    raise AssertionError("test provider was not released")
+                return super()._dispatch(operation_key, value)
+
+        adapter = BlockingAdapter()
+        controller = Controller(
+            self.store, adapter,
+            retry_policy=RetryPolicy(max_attempts=1, base_delay_seconds=0),
+            lease_seconds=5,
+        )
+        plane = supervisor.OperationsSupervisor(controller, clock=time.time)
+        result = []
+        errors = []
+
+        def run_cycle():
+            try:
+                result.append(plane.cycle("long-worker", lease_seconds=0.05))
+            except BaseException as exc:  # pragma: no cover - diagnostic path
+                errors.append(exc)
+
+        worker = threading.Thread(target=run_cycle)
+        worker.start()
+        self.assertTrue(started.wait(1))
+        time.sleep(0.12)
+        with self.assertRaises(supervisor.SupervisorRefusal) as raised:
+            plane.cycle("overlap-worker", lease_seconds=0.05)
+        self.assertEqual(raised.exception.code, "SUPERVISOR_CYCLE_IN_FLIGHT")
+        release.set()
+        worker.join(2)
+        self.assertFalse(worker.is_alive())
+        self.assertEqual(errors, [])
+        self.assertEqual(result[0]["outcome"], "completed")
+        self.assertEqual(len(plane.cycles()), 1)
 
     def test_an_abandoned_cycle_with_no_in_flight_work_is_replayable(self):
         self.project()

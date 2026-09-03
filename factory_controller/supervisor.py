@@ -51,6 +51,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import threading
 import time
 from dataclasses import dataclass, field
 from typing import Any, Mapping
@@ -610,11 +611,26 @@ class OperationsSupervisor:
                              started_at=claim["started_at"],
                              ended_at=claim["started_at"],
                              recovered=claim["recovered"])
+        heartbeat_stop = threading.Event()
+        heartbeat_error: list[BaseException] = []
+
+        def heartbeat() -> None:
+            interval = max(0.01, min(5.0, lease_seconds / 3))
+            while not heartbeat_stop.wait(interval):
+                try:
+                    self._renew_cycle(cycle_id, worker_id, lease_seconds)
+                except BaseException as exc:  # pragma: no cover - lease-loss path
+                    heartbeat_error.append(exc)
+                    return
+
+        heartbeat_thread = threading.Thread(
+            target=heartbeat, name="supervisor-cycle-heartbeat", daemon=True)
+        heartbeat_thread.start()
         try:
             if state not in OPERATING:
                 report.outcome = "idle"
                 report.reason = "SUPERVISOR_%s" % state.upper()
-                return self._close_cycle(report)
+                return self._close_cycle(report, worker_id=worker_id)
             self._store.recover_stale()
             uncertain = self._uncertain_missions()
             report.uncertain_missions = uncertain
@@ -627,11 +643,18 @@ class OperationsSupervisor:
                     "reason": "SUPERVISOR_UNCERTAIN_WORK_IN_FLIGHT",
                     "detail": {"missions": list(uncertain)}})
             self._advance(report, eligible, drain=state == "draining")
-            return self._close_cycle(report)
+            if heartbeat_error:
+                raise heartbeat_error[0]
+            return self._close_cycle(report, worker_id=worker_id)
         except BaseException:
             self._close_cycle(report, outcome="refused",
-                              reason="SUPERVISOR_CYCLE_ABANDONED")
+                              reason="SUPERVISOR_CYCLE_ABANDONED",
+                              worker_id=worker_id)
             raise
+        finally:
+            heartbeat_stop.set()
+            if heartbeat_thread.is_alive():
+                heartbeat_thread.join(timeout=min(1.0, lease_seconds))
 
     def cycles(self, limit: int = 50) -> tuple[dict[str, Any], ...]:
         with self._store.transaction() as db:
@@ -840,6 +863,7 @@ class OperationsSupervisor:
             "guarantees": {
                 "reentrant": "an overlapping invocation is refused, not queued",
                 "restart_safe": "an abandoned cycle is settled on the next claim",
+                "lease": "the cycle owner renews its lease while bounded work runs",
                 # Worded to avoid the token the termination test scans for.
                 # The check is the load-bearing half here, not the phrasing:
                 # SF-137 moved a name to keep a check, SF-138 narrowed a check
@@ -905,6 +929,22 @@ class OperationsSupervisor:
         return {"cycle_id": cycle_id, "sequence": sequence, "control_state": state,
                 "started_at": now, "recovered": recovered}
 
+    def _renew_cycle(self, cycle_id: str, worker_id: str,
+                     lease_seconds: float) -> None:
+        """Keep a healthy finite cycle distinguishable from an abandoned one."""
+
+        now = self.clock()
+        with self._store.transaction() as db:
+            changed = db.execute(
+                "UPDATE supervisor_cycles SET lease_expires_at=?"
+                " WHERE cycle_id=? AND worker_id=? AND ended_at IS NULL",
+                (now + lease_seconds, cycle_id, worker_id)).rowcount
+        if changed != 1:
+            raise SupervisorRefusal(
+                "SUPERVISOR_CYCLE_LEASE_LOST",
+                "cycle %s is no longer owned by %s" % (cycle_id, worker_id),
+                cycle_id=cycle_id)
+
     def _recovery_outcome_locked(self, db, cycle_id: str) -> str:
         """Whether an abandoned cycle can simply be run again.
 
@@ -921,7 +961,8 @@ class OperationsSupervisor:
             " WHERE state IN ('dispatched','candidate_verified','evaluated',"
             "'evidence_sealed') OR (state='dispatching' AND EXISTS ("
             "SELECT 1 FROM steps s WHERE s.mission_id=missions.id"
-            " AND s.name='dispatch' AND s.status='STARTED'"
+            " AND s.name IN ('dispatch','dispatch-recovery')"
+            " AND s.status='STARTED'"
             ") AND (NOT EXISTS (SELECT 1 FROM runs r0"
             " WHERE r0.mission_id=missions.id) OR EXISTS ("
             "SELECT 1 FROM runs r1 WHERE r1.mission_id=missions.id"
@@ -929,18 +970,26 @@ class OperationsSupervisor:
         return RECOVERY_OUTCOMES[1] if row["n"] else RECOVERY_OUTCOMES[0]
 
     def _close_cycle(self, report: CycleReport, *, outcome: str | None = None,
-                     reason: str | None = None) -> dict[str, Any]:
+                     reason: str | None = None,
+                     worker_id: str | None = None) -> dict[str, Any]:
         report.ended_at = self.clock()
         if outcome is not None:
             report.outcome = outcome
         if reason is not None:
             report.reason = reason
         with self._store.transaction() as db:
-            db.execute(
-                "UPDATE supervisor_cycles SET ended_at=?,outcome=?,detail_json=?"
-                " WHERE cycle_id=? AND ended_at IS NULL",
-                (report.ended_at, report.outcome, canonical_json(report.as_row()),
-                 report.cycle_id))
+            if worker_id is None:
+                db.execute(
+                    "UPDATE supervisor_cycles SET ended_at=?,outcome=?,detail_json=?"
+                    " WHERE cycle_id=? AND ended_at IS NULL",
+                    (report.ended_at, report.outcome, canonical_json(report.as_row()),
+                     report.cycle_id))
+            else:
+                db.execute(
+                    "UPDATE supervisor_cycles SET ended_at=?,outcome=?,detail_json=?"
+                    " WHERE cycle_id=? AND worker_id=? AND ended_at IS NULL",
+                    (report.ended_at, report.outcome, canonical_json(report.as_row()),
+                     report.cycle_id, worker_id))
         return report.as_row()
 
     def _uncertain_missions(self) -> tuple[str, ...]:
@@ -950,7 +999,8 @@ class OperationsSupervisor:
                 " ('dispatched','candidate_verified','evaluated','evidence_sealed')"
                 " OR (lease_token IS NULL AND state='dispatching' AND EXISTS ("
                 "SELECT 1 FROM steps s WHERE s.mission_id=missions.id"
-                " AND s.name='dispatch' AND s.status='STARTED'"
+                " AND s.name IN ('dispatch','dispatch-recovery')"
+                " AND s.status='STARTED'"
                 ") AND (NOT EXISTS (SELECT 1 FROM runs r0"
                 " WHERE r0.mission_id=missions.id) OR EXISTS ("
                 "SELECT 1 FROM runs r1 WHERE r1.mission_id=missions.id"

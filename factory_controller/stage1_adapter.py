@@ -9,8 +9,9 @@ which the Controller turns into a refusal rather than a guess:
 
 * **execution mode** -- a `--dry-run` result is reported as ``fixture``.  It used
   to be mapped to ``completed`` and became a real mission's result.
-* **the idempotency key that reached the bridge** -- re-derived from the binding
-  Evidence Core verified, not from anything this process chose.  See
+* **the idempotency key that reached the bridge** -- consumed from the matching
+  execution envelope and binding Evidence Core verified, not re-derived by this
+  process.  See
   ``_bound_idempotency_key``.
 * **acceptance gate outcomes** -- produced by running the target repository's own
   declared evaluator commands.  A declared gate with no command is ``not_run``,
@@ -91,21 +92,25 @@ def _context(request: dict[str, Any]) -> dict[str, Any]:
 
 
 def _bound_idempotency_key(result: dict[str, Any]) -> str | None:
-    """Re-derive the key the bridge was actually asked to bind.
+    """Return the key both execution proof records explicitly echoed.
 
-    ``verify_and_bind_execution_envelope`` refuses ``IDEMPOTENCY_BINDING_MISMATCH``
-    unless the admitted request's key is exactly
-    ``work_item_id:context_manifest_hash``.  The binding it returns therefore
-    determines that key, so reading the binding is a proof rather than a
-    restatement of what this process would have liked the key to be.
+    ``verify_and_bind_execution_envelope`` binds the request to the canonical
+    key, but that is not proof that the execution layer returned the same key.
+    Missing or conflicting echoes stay unknown and are refused by the real
+    mission's Controller guard.
     """
 
-    binding = result.get("execution_binding") or {}
-    work_item_id = binding.get("work_item_id")
-    manifest = binding.get("context_manifest_hash")
-    if not work_item_id or not manifest:
+    keys = []
+    for source_name in ("execution_envelope", "execution_binding"):
+        source = result.get(source_name)
+        if isinstance(source, dict) and "idempotency_key" in source:
+            key = source["idempotency_key"]
+            if not isinstance(key, str) or not key:
+                return None
+            keys.append(key)
+    if len(keys) != 2 or len(set(keys)) != 1:
         return None
-    return "%s:%s" % (work_item_id, manifest)
+    return keys[0]
 
 
 def _execution_mode(result: dict[str, Any]) -> str:

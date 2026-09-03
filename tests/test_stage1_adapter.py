@@ -11,7 +11,11 @@ from pathlib import Path
 from unittest.mock import patch
 
 from factory_controller import context
-from factory_controller.stage1_adapter import _execution_mode, execute
+from factory_controller.stage1_adapter import (
+    _bound_idempotency_key,
+    _execution_mode,
+    execute,
+)
 
 
 FAKE_STAGE1 = (
@@ -19,8 +23,9 @@ FAKE_STAGE1 = (
     "p=sys.argv[sys.argv.index('--output')+1]\n"
     "json.dump({'status':'completed','fixture_only':True,"
     "'execution_envelope':{'candidate_sha':'a'*40,'execution_id':'e1',"
-    "'execution_mode':'fixture'},"
-    "'execution_binding':{'work_item_id':'SF-135-T','context_manifest_hash':'c'*64},"
+    "'execution_mode':'fixture','idempotency_key':'SF-135-T:'+'c'*64},"
+    "'execution_binding':{'work_item_id':'SF-135-T','context_manifest_hash':'c'*64,"
+    "'idempotency_key':'SF-135-T:'+'c'*64},"
     "'candidate_commit_verification':{'verified':True},"
     "'gate_outcomes':[{'gate_id':'G1','passed':True}],"
     "'evidence_result':{'status':'complete','artifact_hash':'b'*64}},open(p,'w'))\n"
@@ -178,11 +183,19 @@ class Stage1AdapterTest(unittest.TestCase):
             "unknown",
         )
 
-    def test_bound_idempotency_key_is_rederived_from_the_binding(self):
-        """Evidence Core's own rule, re-derived rather than restated."""
+    def test_bound_idempotency_key_is_taken_from_both_execution_proofs(self):
+        """The Controller consumes the key echoed by the execution layer."""
 
         dispatch = self._run("dispatch", {"mission": self._mission()})
         self.assertEqual(dispatch["receipt"]["idempotency_key"], "SF-135-T:" + "c" * 64)
+
+    def test_missing_or_conflicting_execution_keys_remain_unproven(self):
+        binding = {"work_item_id": "SF-135-T", "context_manifest_hash": "c" * 64}
+        self.assertIsNone(_bound_idempotency_key({"execution_binding": binding}))
+        self.assertIsNone(_bound_idempotency_key({
+            "execution_envelope": {"idempotency_key": "one"},
+            "execution_binding": {"idempotency_key": "two"},
+        }))
 
     def test_undeclared_gates_never_pass(self):
         mission = self._mission()

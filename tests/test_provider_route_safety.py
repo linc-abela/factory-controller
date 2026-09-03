@@ -330,6 +330,15 @@ class ExecutionModeTests(RouteTestCase, unittest.TestCase):
         result = controller.work_once("w1")
         self.assertIn("EXECUTION_MODE_UNPROVEN", result["terminal_reason"])
 
+    def test_a_missing_idempotency_echo_refuses_a_real_result(self):
+        adapter = LayerAdapter(mode="real", echo_key=False)
+        controller, _, _ = self.build(adapter)
+        payload = mission_payload(execution_mode="real", context_manifest_hash="g" * 64)
+        controller.submit(payload, "SF-135-ROUTE:" + "g" * 64)
+        result = controller.work_once("w1")
+        self.assertEqual(result["state"], "refused")
+        self.assertIn("IDEMPOTENCY_KEY_UNPROVEN", result["terminal_reason"])
+
     def test_a_real_mission_must_carry_the_key_evidence_core_will_accept(self):
         controller, _, _ = self.build(LayerAdapter(mode="real"))
         payload = mission_payload(execution_mode="real", context_manifest_hash="e" * 64)

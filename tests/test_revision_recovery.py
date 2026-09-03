@@ -11,7 +11,7 @@ from factory_controller import context, portfolio, product
 from factory_controller.engine import Controller
 from factory_controller.store import MissionStore
 from tests.test_context_binding import BrokerAdapter, manifest_hash_for
-from tests.support import ALPHA, mission_payload
+from tests.support import ALPHA, ProcessDeath, mission_payload
 
 
 REMOTE = "https://example.invalid/lodus-casino.git"
@@ -231,6 +231,29 @@ class RevisionLifecycleTests(unittest.TestCase):
         self.assertEqual(again["terminal_reason"], "UNSUPPORTED_CAPABILITY")
         self.assertEqual([leg["process_started"]
                           for leg in self.store.runs(mission["id"])], [False, False])
+
+    def test_recovered_dispatch_reuses_the_runtime_overlay_input_identity(self):
+        """A recovery must hash the same revision payload the first leg used."""
+
+        value = self.payload()
+        mission, _ = Controller(
+            self.store, RecoveryAdapter(mode="real"), lease_seconds=0
+        ).submit(value, self.key(value))
+        Controller(self.store, RecoveryAdapter(mode="real"), lease_seconds=0).work_once("s1")
+        self.store.resume_pre_provider(mission["id"], revision_binding())
+
+        crashing = RecoveryAdapter(mode="real", crash_on="verify")
+        with self.assertRaises(ProcessDeath):
+            Controller(self.store, crashing, lease_seconds=0).work_once("s2")
+        self.assertEqual(self.store.get(mission["id"])["state"], "dispatched")
+
+        replacement = Controller(
+            MissionStore(self.path), RecoveryAdapter(mode="real"), lease_seconds=0
+        )
+        recovered = replacement.work_once("s3")
+        self.assertEqual(recovered["id"], mission["id"])
+        self.assertEqual(recovered["state"], "completed")
+        self.assertEqual(len(crashing.dispatches), 1)
 
     def test_a_layer_that_cannot_prove_it_started_nothing_is_never_reopened(self):
         """The eligible class is the proof, and an absence is not a proof."""

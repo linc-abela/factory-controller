@@ -604,12 +604,14 @@ class Controller:
         return the result bound to this idempotency key, on the same profile.
         """
 
+        payload = self._runtime_payload(mission)
         profile = committed[-1]["provider_profile"] if committed else None
         selection = Selection(profile, "recover_existing_result", ())
         response = self._step(
             mission, step,
-            {"mission": mission["payload"], "route": _route(selection, (), mission, True)},
-            memo_value={"mission": mission["payload"]}, adapter_step=DISPATCH_STEP)
+            {"mission": payload, "route": _route(selection, (), mission, True)},
+            memo_value={"mission": payload},
+            adapter_step=DISPATCH_STEP)
         receipt = _with_gateway(routing.receipt_from_response(response, selection, ()),
                                 response, None)
         served_model = (receipt.gateway or {}).get("actual_model")
