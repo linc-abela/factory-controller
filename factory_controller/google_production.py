@@ -717,13 +717,27 @@ class FirebaseHostingDeploymentAdapter:
         attempted_digest = self._extract_artifact_digest(bundle)
         target_key = f"{target.site_id}:{target.channel_id}"
 
-        # Requirement 5: Real rollback identity from history
-        history = self._target_history.get(target_key, [])
-        prior_records = [r for r in history if r.get("artifact_digest") != attempted_digest]
-        if not prior_records:
-            recorded = self._ledger_prior_version(target, operation_key, attempted_digest)
-            if recorded is not None:
-                prior_records = [recorded]
+        # Requirement 5: Real rollback identity, chosen by the ledger.
+        #
+        # The ledger already selected the target and recorded it in
+        # `deployments.rollback_of`, restricted to a release it observed
+        # healthy. This adapter's own `_target_history` knows only which
+        # versions it deployed in this process and nothing about how any of
+        # them turned out, so consulting it first meant a reused adapter rolled
+        # back to the last version it happened to deploy -- including one the
+        # ledger had already recorded failed. In-process history is a fallback
+        # for an adapter with no ledger to read, never a competing authority.
+        recorded = self._ledger_prior_version(target, operation_key, attempted_digest)
+        if recorded is not None:
+            prior_records = [recorded]
+        elif self._store is not None:
+            # A ledger is present and names no target. That is an answer, not a
+            # gap to fill from somewhere weaker.
+            prior_records = []
+        else:
+            history = self._target_history.get(target_key, [])
+            prior_records = [r for r in history
+                             if r.get("artifact_digest") != attempted_digest]
 
         if not prior_records:
             outcome = production.DeploymentOutcome(
@@ -798,6 +812,59 @@ class FirebaseHostingDeploymentAdapter:
         return outcome
 
 
+#: What a static surface's own ``/health.json`` has to say before the surface
+#: counts as healthy.  The Casino artifact ships
+#: ``{"app": "lodus-casino", "status": "ok"}``; the accepted words are listed
+#: rather than inferred, because "any value that is not literally 'down'" is
+#: how a typo becomes a pass.
+HEALTHY_STATUS_VALUES = frozenset({"ok", "healthy", "pass", "passing", "up",
+                                   "green", "serving"})
+
+#: Boolean fields that carry the same claim under a different name.
+HEALTHY_FLAG_KEYS = ("ok", "healthy", "up")
+
+
+def health_body_ok(body: bytes,
+                   expected: Mapping[str, Any] | None = None) -> bool:
+    """Whether a ``/health.json`` document reports the surface healthy.
+
+    A document that cannot be read, or that carries no health claim at all, is
+    not a healthy document: the endpoint exists to make an assertion, and an
+    absent assertion is ``unknown``, which is not a pass.  When the caller
+    declares the exact body it expects, that comparison is the answer.
+    """
+
+    try:
+        parsed = json.loads(body.decode("utf-8"))
+    except (UnicodeDecodeError, ValueError):
+        return False
+    if not isinstance(parsed, Mapping):
+        return False
+    if expected is not None:
+        return all(parsed.get(key) == value for key, value in expected.items())
+    status = parsed.get("status")
+    if isinstance(status, str):
+        return status.strip().lower() in HEALTHY_STATUS_VALUES
+    for key in HEALTHY_FLAG_KEYS:
+        flag = parsed.get(key)
+        if isinstance(flag, bool):
+            return flag
+    return False
+
+
+def _entry_proof(expected_entry_content: bytes | None) -> str:
+    """What the probe compared the served entry document against.
+
+    A digest names bytes that exist; the absence word names the fact that
+    nothing was compared.  The two are different observations and the release
+    lifecycle refuses the second where a healthy REVIEW is required.
+    """
+
+    if expected_entry_content is None:
+        return "not_applicable"
+    return "sha256:" + hashlib.sha256(expected_entry_content).hexdigest()
+
+
 class StaticWebHealthVerifier:
     """Deterministic health verification for a static web application.
 
@@ -846,11 +913,13 @@ class StaticWebHealthVerifier:
         is_loopback = parsed.hostname in {"localhost", "127.0.0.1", "::1"}
         if parsed.scheme != "https":
             if not (allow_loopback and is_loopback and parsed.scheme == "http"):
-                return production.HealthRecord(
+                return production.ProbedHealthRecord(
                     checks_passed=0,
                     checks_failed=1,
                     evidence_ref=f"health-probe://insecure-scheme/{parsed.scheme}",
                     observed_at=observed_at,
+                    probe_target=base_url,
+                    entry_proof=_entry_proof(expected_entry_content),
                 )
 
         passed = 0
@@ -866,11 +935,13 @@ class StaticWebHealthVerifier:
             else:
                 failed += 1
         except Exception:  # noqa: BLE001
-            return production.HealthRecord(
+            return production.ProbedHealthRecord(
                 checks_passed=0,
                 checks_failed=1,
                 evidence_ref=f"health-probe://unreachable/{parsed.netloc}",
                 observed_at=observed_at,
+                probe_target=base_url,
+                entry_proof=_entry_proof(expected_entry_content),
             )
 
         # 3. Content integrity
@@ -880,29 +951,30 @@ class StaticWebHealthVerifier:
             else:
                 failed += 1
 
-        # 4. App health endpoint
+        # 4. App health endpoint -- what the document says, not merely that a
+        #    document was served. A surface can answer 200 with a body that
+        #    reports itself down; counting the status alone made "the app says
+        #    it is broken" indistinguishable from "the app says it is fine",
+        #    and settled the REVIEW healthy on the first one.
         health_url = f"{normalized_base}/health.json"
         try:
             h_status, h_body, _ = self._opener(health_url)
-            if h_status == 200:
-                passed += 1
-                if expected_health_json is not None:
-                    parsed_json = json.loads(h_body.decode("utf-8"))
-                    if all(parsed_json.get(k) == v for k, v in expected_health_json.items()):
-                        passed += 1
-                    else:
-                        failed += 1
-            else:
-                failed += 1
         except Exception:  # noqa: BLE001
             failed += 1
+        else:
+            if h_status == 200 and health_body_ok(h_body, expected_health_json):
+                passed += 1
+            else:
+                failed += 1
 
         ref = f"health-probe://{parsed.netloc}/p{passed}-f{failed}@{int(observed_at)}"
-        return production.HealthRecord(
+        return production.ProbedHealthRecord(
             checks_passed=passed,
             checks_failed=failed,
             evidence_ref=ref,
             observed_at=observed_at,
+            probe_target=base_url,
+            entry_proof=_entry_proof(expected_entry_content),
         )
 
 
@@ -913,9 +985,11 @@ __all__ = [
     "FirebaseHostingRestTransport",
     "FirebaseTransport",
     "GoogleTargetConfig",
+    "HEALTHY_STATUS_VALUES",
     "SimulatedFirebaseTransport",
     "StaticWebHealthVerifier",
     "ZERO_COST_PLAN",
     "ZeroCostViolation",
     "file_system_artifact_resolver",
+    "health_body_ok",
 ]

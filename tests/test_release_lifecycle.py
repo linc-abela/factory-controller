@@ -41,17 +41,40 @@ def bundle(number: int, *, artifact_char: str | None = None) -> production.Relea
     })
 
 
-def healthy() -> production.HealthRecord:
-    return production.HealthRecord(
+ENTRY_PROOF = "sha256:" + "0" * 64
+
+
+def healthy(surface: str | None = None) -> production.ProbedHealthRecord:
+    """What a probe that reached `surface` and matched the sealed bytes returns.
+
+    A plain ``HealthRecord`` no longer settles a release deployment: two counts
+    carry no evidence that anything was served, which is how a REVIEW became
+    healthy -- and an Owner Validation and a Production promotion followed it
+    -- with no surface contacted at all.  A probed record names the surface it
+    observed and the entry document it compared.
+    """
+
+    return production.ProbedHealthRecord(
         checks_passed=3, checks_failed=0, evidence_ref="probe/lodus-casino/healthy",
         observed_at=1.0,
+        probe_target=surface or "https://review.example.invalid/lodus-casino",
+        entry_proof=ENTRY_PROOF,
     )
 
 
-def failed() -> production.HealthRecord:
-    return production.HealthRecord(
+def failed(surface: str | None = None) -> production.ProbedHealthRecord:
+    """A probe that reached the surface and found it broken.
+
+    No entry proof: the observation is not ``healthy``, so there is nothing for
+    a proof to authorise.  Requiring one here would discard a real failure
+    instead of recording it.
+    """
+
+    return production.ProbedHealthRecord(
         checks_passed=0, checks_failed=2, evidence_ref="probe/lodus-casino/failed",
         observed_at=2.0,
+        probe_target=surface or "https://review.example.invalid/lodus-casino",
+        entry_proof="not_applicable",
     )
 
 
@@ -99,7 +122,7 @@ class ReleaseLifecycleTests(unittest.TestCase):
             review_environment_id="lodus-casino-review",
             requested_by="factory",
             review_url="https://review.example.invalid/lodus-casino/%03d" % number,
-            health=healthy(),
+            health=healthy("https://review.example.invalid/lodus-casino/%03d" % number),
         )
         validation = self.lifecycle.record_owner_validation(
             validation_id or "CASINO-MVP-VALIDATION-%03d" % number,
@@ -161,7 +184,7 @@ class ReleaseLifecycleTests(unittest.TestCase):
             review_environment_id="lodus-casino-review",
             requested_by="factory",
             review_url="https://review.example.invalid/lodus-casino/003",
-            health=healthy(),
+            health=healthy("https://review.example.invalid/lodus-casino/003"),
         )
         validation = self.lifecycle.record_owner_validation(
             "CASINO-MVP-VALIDATION-003",

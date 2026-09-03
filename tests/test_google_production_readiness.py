@@ -33,6 +33,7 @@ from tests.test_release_lifecycle import REPOSITORY, bundle
 
 CASINO_PROJECT = "lodus-casino"
 REVIEW_ENV_ID = "lodus-casino-review"
+REVIEW_URL = "https://lodus-casino-review.web.app"
 PROD_ENV_ID = "lodus-casino-production"
 
 CASINO_FILES_V1 = {
@@ -56,12 +57,30 @@ CASINO_FILES_V2 = {
 }
 
 
-def digest_for_files(files: dict[str, bytes]) -> str:
-    hasher = hashlib.sha256()
-    for name in sorted(files):
-        hasher.update(name.encode("utf-8"))
-        hasher.update(files[name])
-    return f"sha256:{hasher.hexdigest()}"
+#: The identity of a file set is whatever the Controller says it is. This used
+#: to re-spell the construction, which meant the tests could keep passing
+#: against a digest the production code no longer computed -- and did, through
+#: the whole life of the non-injective v1 framing.
+digest_for_files = production.deployable_digest
+
+
+def probed(passed: int, failed: int, ref: str, observed_at: float,
+           *, surface: str = REVIEW_URL,
+           entry_proof: str | None = None) -> production.ProbedHealthRecord:
+    """A health observation with the provenance a release deployment requires.
+
+    Counts alone no longer settle a REVIEW or a Production deployment: they
+    say what was observed without saying that anything was observed at all.
+    An observation that is not healthy needs no entry proof -- there is nothing
+    for a proof to authorise -- so the default follows the outcome.
+    """
+
+    if entry_proof is None:
+        entry_proof = "sha256:" + "0" * 64 if passed and not failed \
+            else "not_applicable"
+    return production.ProbedHealthRecord(
+        checks_passed=passed, checks_failed=failed, evidence_ref=ref,
+        observed_at=observed_at, probe_target=surface, entry_proof=entry_proof)
 
 
 def make_casino_bundle(number: int, files: dict[str, bytes], *, sha: str | None = None) -> production.ReleaseBundle:
@@ -252,12 +271,12 @@ class GoogleProductionReadinessTests(unittest.TestCase):
         rc_id = "RC-LODUS-CASINO-001"
         rc = self.lifecycle.seal(rc_id, b, verification_refs=("v/1",), qa_refs=("qa/1",))
 
-        health = production.HealthRecord(checks_passed=3, checks_failed=0, evidence_ref="p/1", observed_at=100.0)
+        health = probed(3, 0, "p/1", 100.0)
         deployed_rev = self.lifecycle.deploy_review(
             rc_id, self.ledger, self.adapter,
             review_environment_id=REVIEW_ENV_ID,
             requested_by="factory",
-            review_url="https://lodus-casino-review.web.app",
+            review_url=REVIEW_URL,
             health=health,
         )
         self.assertEqual(deployed_rev["state"], "healthy")
@@ -296,11 +315,11 @@ class GoogleProductionReadinessTests(unittest.TestCase):
         b = make_casino_bundle(1, CASINO_FILES_V1)
         rc_id = "RC-LODUS-CASINO-001"
         rc = self.lifecycle.seal(rc_id, b, verification_refs=("v/1",), qa_refs=("qa/1",))
-        health = production.HealthRecord(checks_passed=2, checks_failed=0, evidence_ref="p/1", observed_at=100.0)
+        health = probed(2, 0, "p/1", 100.0)
         rev = self.lifecycle.deploy_review(
             rc_id, self.ledger, self.adapter,
             review_environment_id=REVIEW_ENV_ID, requested_by="factory",
-            review_url="https://lodus-casino-review.web.app", health=health,
+            review_url=REVIEW_URL, health=health,
         )
         self.lifecycle.record_owner_validation(
             "VAL-CASINO-001", rc_id,
@@ -333,11 +352,11 @@ class GoogleProductionReadinessTests(unittest.TestCase):
         b = make_casino_bundle(1, CASINO_FILES_V1)
         rc_id = "RC-LODUS-CASINO-001"
         self.lifecycle.seal(rc_id, b, verification_refs=("v/1",), qa_refs=("qa/1",))
-        health = production.HealthRecord(checks_passed=2, checks_failed=0, evidence_ref="p/1", observed_at=100.0)
+        health = probed(2, 0, "p/1", 100.0)
         rev = self.lifecycle.deploy_review(
             rc_id, self.ledger, self.adapter,
             review_environment_id=REVIEW_ENV_ID, requested_by="factory",
-            review_url="https://lodus-casino-review.web.app", health=health,
+            review_url=REVIEW_URL, health=health,
         )
 
         # Record RETURN_FOR_CHANGES
@@ -411,15 +430,15 @@ class GoogleProductionReadinessTests(unittest.TestCase):
     # Test 8: Rollback to previous known-good artifact
     # ----------------------------------------------------------------------- #
     def test_rollback_to_previous_known_good_artifact(self):
-        health_good = production.HealthRecord(checks_passed=3, checks_failed=0, evidence_ref="p/good", observed_at=10.0)
-        health_bad = production.HealthRecord(checks_passed=0, checks_failed=2, evidence_ref="p/bad", observed_at=20.0)
+        health_good = probed(3, 0, "p/good", 10.0)
+        health_bad = probed(0, 2, "p/bad", 20.0)
 
         # 1. Release 1 promoted and healthy
         b1 = make_casino_bundle(1, CASINO_FILES_V1)
         self.lifecycle.seal("RC-001", b1, verification_refs=("v/1",), qa_refs=("qa/1",))
         rev1 = self.lifecycle.deploy_review("RC-001", self.ledger, self.adapter,
                                             review_environment_id=REVIEW_ENV_ID, requested_by="factory",
-                                            review_url="https://lodus-casino-review.web.app", health=health_good)
+                                            review_url=REVIEW_URL, health=health_good)
         self.lifecycle.record_owner_validation("VAL-001", "RC-001", deployment_ref=rev1["deployment_ref"],
                                                decision="VALIDATED", decided_by="owner", decided_at=50.0)
         promoted1 = self.lifecycle.promote_validated("RC-001", "VAL-001", self.ledger, self.adapter,
@@ -432,7 +451,7 @@ class GoogleProductionReadinessTests(unittest.TestCase):
         self.lifecycle.seal("RC-002", b2, verification_refs=("v/2",), qa_refs=("qa/2",))
         rev2 = self.lifecycle.deploy_review("RC-002", self.ledger, self.adapter,
                                             review_environment_id=REVIEW_ENV_ID, requested_by="factory",
-                                            review_url="https://lodus-casino-review.web.app", health=health_good)
+                                            review_url=REVIEW_URL, health=health_good)
         self.lifecycle.record_owner_validation("VAL-002", "RC-002", deployment_ref=rev2["deployment_ref"],
                                                decision="VALIDATED", decided_by="owner", decided_at=60.0)
         promoted2 = self.lifecycle.promote_validated("RC-002", "VAL-002", self.ledger, self.adapter,
@@ -471,10 +490,10 @@ class GoogleProductionReadinessTests(unittest.TestCase):
     def test_no_secrets_in_persisted_evidence(self):
         b = make_casino_bundle(1, CASINO_FILES_V1)
         self.lifecycle.seal("RC-001", b, verification_refs=("v/1",), qa_refs=("qa/1",))
-        health = production.HealthRecord(checks_passed=2, checks_failed=0, evidence_ref="p/1", observed_at=100.0)
+        health = probed(2, 0, "p/1", 100.0)
         rev = self.lifecycle.deploy_review("RC-001", self.ledger, self.adapter,
                                            review_environment_id=REVIEW_ENV_ID, requested_by="factory",
-                                           review_url="https://lodus-casino-review.web.app", health=health)
+                                           review_url=REVIEW_URL, health=health)
         self.lifecycle.record_owner_validation("VAL-001", "RC-001", deployment_ref=rev["deployment_ref"],
                                                decision="VALIDATED", decided_by="owner", decided_at=200.0)
         self.lifecycle.promote_validated("RC-001", "VAL-001", self.ledger, self.adapter,
@@ -550,7 +569,7 @@ class GoogleProductionReadinessTests(unittest.TestCase):
         rev = self.lifecycle.deploy_review(
             rc_id, self.ledger, self.adapter,
             review_environment_id=REVIEW_ENV_ID, requested_by="factory",
-            review_url="https://lodus-casino-review.web.app",
+            review_url=REVIEW_URL,
         )
         self.assertEqual(rev["state"], "health_pending")
 
@@ -951,10 +970,8 @@ class DurableRollbackIdentityTests(unittest.TestCase):
                 return json.loads(detail)
         raise AssertionError("no adapter detail recorded for %s" % deployment_id)
 
-    def health(self, passed: int, failed: int) -> production.HealthRecord:
-        return production.HealthRecord(
-            checks_passed=passed, checks_failed=failed,
-            evidence_ref="probe/lodus-casino", observed_at=1.0)
+    def health(self, passed: int, failed: int) -> production.ProbedHealthRecord:
+        return probed(passed, failed, "probe/lodus-casino", 1.0)
 
     def promote(self, number: int, *, health: production.HealthRecord) -> dict:
         rc_id = "CASINO-MVP-RC-%03d" % number
@@ -965,7 +982,7 @@ class DurableRollbackIdentityTests(unittest.TestCase):
         review = self.lifecycle.deploy_review(
             rc_id, self.ledger, self.deploy_adapter,
             review_environment_id=REVIEW_ENV_ID, requested_by="factory",
-            review_url="https://lodus-casino-review.web.app",
+            review_url=REVIEW_URL,
             health=self.health(3, 0))
         validation = self.lifecycle.record_owner_validation(
             "CASINO-MVP-VALIDATION-%03d" % number, rc_id,

@@ -9,6 +9,7 @@ step leaves the durable records needed for the next invocation to continue.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import pwd
@@ -1635,6 +1636,31 @@ class FactoryLifecycle:
                 "ARTIFACT_NOT_BUILT",
                 "The execution layer could not build a publishable artifact "
                 "from the verified candidate.")
+        # The path and the identity are two separate fields of one report, and
+        # only the identity is derived from bytes. Reading the file the path
+        # names without re-deriving that identity would let a swapped path seal
+        # a different archive's file set under the identity the report still
+        # claims -- so the archive is what it says it is, or it is not read.
+        declared = artifact.get("identity")
+        if not isinstance(declared, str) or not declared.startswith("sha256:"):
+            raise FactoryRefusal(
+                "ARTIFACT_NOT_BUILT",
+                "The execution layer named no sha256 archive identity.")
+        observed = hashlib.sha256()
+        try:
+            with open(str(report["archive_path"]), "rb") as source:
+                for block in iter(lambda: source.read(1024 * 1024), b""):
+                    observed.update(block)
+        except OSError:
+            raise FactoryRefusal(
+                "ARTIFACT_NOT_BUILT",
+                "The archive the execution layer named could not be read.") \
+                from None
+        if "sha256:" + observed.hexdigest() != declared:
+            raise FactoryRefusal(
+                "ARTIFACT_PROVENANCE_MISMATCH",
+                "The archive on disk is not the archive the execution layer "
+                "reported building for this candidate.")
         return report
 
     @staticmethod
@@ -1797,10 +1823,17 @@ class FactoryLifecycle:
                 "REVIEW_SURFACE_MISMATCH",
                 "The review surface is not serving the release being decided. "
                 "Run './dev factory review' and './dev review up' again.")
-        return production.HealthRecord(
+        # Recorded as what it is. This function contacts the surface and
+        # compares the sealed entry document byte for byte, which is exactly
+        # the evidence Owner Validation requires -- but a plain HealthRecord
+        # cannot say so, and a record that cannot say so is indistinguishable
+        # from two counts somebody typed.
+        return production.ProbedHealthRecord(
             checks_passed=2, checks_failed=0,
             evidence_ref="review-probe://%s@%s" % (rc.rc_id, rc.artifact_digest),
-            observed_at=self.clock())
+            observed_at=self.clock(),
+            probe_target=surface,
+            entry_proof="sha256:" + hashlib.sha256(expected).hexdigest())
 
     def _provision_product_store(self, contract, doctor) -> None:
         """Give the product project the same durable policy a lab project has.

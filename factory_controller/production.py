@@ -57,8 +57,14 @@ COMPAT_SCHEMA = "controller-release-bundle-compat-v1"
 
 #: The only rollback this contract performs: return to a release this ledger
 #: already recorded healthy.  Stated once, and carried into the host view so
-#: the host is not left to infer a strategy.
+#: the host is not left to infer a strategy.  ``previous`` is temporal and not
+#: a synonym for ``latest``: the target has to be a release that was already
+#: admitted when the failing one was, or restoring it is a promotion.
 ROLLBACK_STRATEGY = "previous-recorded-healthy"
+
+#: The framing of a deployable file-set identity.  Named because the identity
+#: is a function of the framing, so a change to one is a change to the other.
+DEPLOYABLE_SET_SCHEMA = "factory.controller.deployable_file_set.v2"
 
 #: What an environment *is*.  The class is not a label: it selects the
 #: authority rule, and it is fixed at registration.
@@ -102,7 +108,14 @@ ALLOWED_TRANSITIONS: dict[str, frozenset[str]] = {
     "rollback_failed": frozenset({"escalated"}),
     "uncertain": frozenset({"verifying", "healthy", "degraded", "failed",
                             "rolling_back", "escalated"}),
-    "healthy": frozenset({"degraded", "failed"}),
+    # A release that is serving can still be the wrong release, so withdrawing
+    # it is a real operation and the ledger has always performed it. It was
+    # missing here only because `rollback` wrote the transition directly
+    # instead of asking this table -- which is also how `awaiting_approval`
+    # reached `rolling_back`. One table now answers both, so the states a
+    # rollback may start from are exactly the states that reached the
+    # environment: healthy, degraded, failed, uncertain.
+    "healthy": frozenset({"degraded", "failed", "rolling_back"}),
 }
 
 #: How a health observation is read.  ``unknown`` is one of the four absence
@@ -594,17 +607,34 @@ class EnvironmentPolicy:
 def deployable_digest(files: Mapping[str, bytes]) -> str:
     """The identity of a deployable file set: its names and its bytes.
 
-    Each sorted name as UTF-8, then that file's exact bytes.  A packaging
-    container's own hash is a different fact about a different object: two
-    archives of identical bytes differ by their headers, and the digest an
-    adapter re-derives immediately before serving has to be derived from what
-    it is about to serve.
+    A packaging container's own hash is a different fact about a different
+    object: two archives of identical bytes differ by their headers, and the
+    digest an adapter re-derives immediately before serving has to be derived
+    from what it is about to serve.
+
+    The framing is the identity.  v1 concatenated each sorted name and then its
+    bytes with no separator, which is not injective: ``{"a": b"b"}`` and
+    ``{"ab": b""}`` produce the same input and therefore the same digest, so a
+    *different* file set could satisfy the same-artifact check and be served as
+    the sealed artifact.  Every field is now length-prefixed, and the count and
+    a schema tag are hashed first, so the input is uniquely decodable back to
+    the file set and no two sets can reach one digest.
+
+    The tag also keeps the two constructions apart: a v1 digest and a v2 digest
+    of the same files differ, which is what makes an artifact identity minted
+    under v1 visibly a different identity rather than a silent alias.
     """
 
     hasher = hashlib.sha256()
+    hasher.update(DEPLOYABLE_SET_SCHEMA.encode("utf-8"))
+    hasher.update(b"\n%d\n" % len(files))
     for name in sorted(files):
-        hasher.update(name.encode("utf-8"))
-        hasher.update(files[name])
+        raw = name.encode("utf-8")
+        body = files[name]
+        hasher.update(b"%d\n" % len(raw))
+        hasher.update(raw)
+        hasher.update(b"%d\n" % len(body))
+        hasher.update(body)
     return "sha256:" + hasher.hexdigest()
 
 
@@ -635,6 +665,35 @@ class HealthRecord:
                 "checks_failed": self.checks_failed,
                 "evidence_ref": self.evidence_ref,
                 "observed_at": self.observed_at}
+
+
+@dataclass(frozen=True)
+class ProbedHealthRecord(HealthRecord):
+    """A health observation something actually made against a named surface.
+
+    ``HealthRecord`` says what was observed; it cannot say that anything was
+    observed at all, and two counts typed on a command line are indis-
+    tinguishable from two counts a probe returned.  That is the whole of the
+    REVIEW health bypass: an Owner Validation, and the Production promotion
+    behind it, rested on numbers no surface produced.
+
+    Only a probe constructs this.  ``probe_target`` is the URL that was
+    contacted and ``entry_proof`` names what the probe compared the served
+    entry document against -- a ``sha256:`` digest of the sealed bytes, or one
+    of the absence words when nothing was compared.  A record that proves
+    nothing is refused where the review is settled, not silently downgraded.
+    """
+
+    probe_target: str = "unknown"
+    entry_proof: str = "unknown"
+
+    @property
+    def entry_proven(self) -> bool:
+        return self.entry_proof.startswith("sha256:")
+
+    def as_row(self) -> dict[str, Any]:
+        return {**super().as_row(), "probe_target": self.probe_target,
+                "entry_proof": self.entry_proof}
 
 
 def classify_health(record: HealthRecord | None) -> str:
@@ -865,23 +924,38 @@ class ProductionLedger:
     # -- admission --------------------------------------------------------- #
 
     def admit_release(self, bundle: ReleaseBundle, environment_id: str,
-                      requested_by: str, attempt: int = 1) -> str:
-        """Take custody of a bundle for one environment, or refuse and say why."""
+                      requested_by: str, attempt: int = 1,
+                      precondition: Any | None = None) -> str:
+        """Take custody of a bundle for one environment, or refuse and say why.
+
+        ``precondition`` is a callable given this transaction's own connection.
+        It returns a ``ProductionRefusal`` to refuse, or ``None`` to proceed,
+        and it is evaluated inside the ``BEGIN IMMEDIATE`` that writes the
+        deployment row.  That is the whole point of it: a caller that reads a
+        fact in one transaction and admits in another has a window between the
+        two, and a concurrent writer can settle that fact in the window.  The
+        promotion gate is exactly that shape -- the exact validated REVIEW
+        deployment can be recorded failed after promotion reads it healthy and
+        before Production is admitted -- so the read and the write commit
+        together or neither happens.
+        """
         refusal = None
         deployment_id = None
         with self._store.transaction() as db:
             row = self._environment_row(db, environment_id)
             policy = _policy_from_row(row)
+            refusal = None if precondition is None else precondition(db)
             key = deployment_key(policy.project_id, environment_id,
                                  bundle.bundle_digest, attempt)
-            existing = db.execute(
+            existing = None if refusal is not None else db.execute(
                 "SELECT id, bundle_digest, state FROM deployments WHERE deployment_key=?",
                 (key,)).fetchone()
             if existing is not None:
                 # The same bundle, the same environment, the same attempt: this
                 # is the same deployment, not a second one.
                 return existing["id"]
-            refusal = self._admission_refusal(db, policy, bundle, environment_id)
+            if refusal is None:
+                refusal = self._admission_refusal(db, policy, bundle, environment_id)
             if refusal is None:
                 deployment_id = "dep_%s" % uuid.uuid4().hex[:16]
                 state = "awaiting_approval" if policy.gated else "approved"
@@ -1049,7 +1123,22 @@ class ProductionLedger:
         with self._store.transaction() as db:
             row = self._deployment_row(db, deployment_id)
             policy = _policy_from_row(self._environment_row(db, row["environment_id"]))
-            if row["rollback_attempts"] >= policy.max_rollback_attempts:
+            if "rolling_back" not in ALLOWED_TRANSITIONS.get(row["state"],
+                                                             frozenset()):
+                # This transition is written straight to the row rather than
+                # through `_settle`, so it was the one state change in the
+                # ledger that never consulted the state machine. An
+                # `awaiting_approval` deployment -- a release no one approved
+                # and nothing deployed -- could therefore be moved to
+                # `rolling_back` and sent to the adapter, mutating the live
+                # environment on the authority of a release that never had any.
+                refusal = ProductionRefusal(
+                    "ROLLBACK_STATE_INVALID",
+                    "a rollback starts from a deployment that reached the "
+                    "environment; this one is %r" % row["state"],
+                    environment_id=policy.environment_id,
+                    deployment_id=deployment_id)
+            elif row["rollback_attempts"] >= policy.max_rollback_attempts:
                 refusal = ProductionRefusal(
                     "ROLLBACK_ATTEMPTS_EXHAUSTED",
                     "environment %s permits %d rollback attempt(s)"
@@ -1058,14 +1147,31 @@ class ProductionLedger:
                     deployment_id=deployment_id)
             else:
                 target = db.execute(
-                    "SELECT id, bundle_json FROM deployments WHERE environment_id=?"
+                    # The target is the newest healthy release that was already
+                    # admitted when this one was. Ordering by `updated_at`
+                    # alone answered a different question -- "which healthy
+                    # deployment was touched last" -- and a release deployed
+                    # *after* the failure satisfies that, so rolling back moved
+                    # the environment forward onto bytes it had never run
+                    # before. Admission order is read from the append-only
+                    # event log, which no later state change can rewrite.
+                    " SELECT d.id, d.bundle_json FROM deployments d"
+                    " JOIN (SELECT deployment_id, MIN(sequence) AS seq"
+                    "         FROM production_events"
+                    "        WHERE kind='release_admitted'"
+                    "     GROUP BY deployment_id) admitted"
+                    "   ON admitted.deployment_id = d.id"
                     # `recovered` means this deployment was itself rolled
                     # back, so the bytes its record names are not the bytes the
                     # environment went on serving. Offering it as a target
                     # restored a release that had already failed.
-                    " AND state='healthy' AND id!=?"
-                    " ORDER BY updated_at DESC LIMIT 1",
-                    (row["environment_id"], deployment_id)).fetchone()
+                    " WHERE d.environment_id=? AND d.state='healthy' AND d.id!=?"
+                    "   AND admitted.seq < (SELECT MIN(sequence)"
+                    "                         FROM production_events"
+                    "                        WHERE deployment_id=?"
+                    "                          AND kind='release_admitted')"
+                    " ORDER BY admitted.seq DESC LIMIT 1",
+                    (row["environment_id"], deployment_id, deployment_id)).fetchone()
                 if target is None:
                     refusal = ProductionRefusal(
                         "ROLLBACK_TARGET_UNKNOWN",
@@ -1406,6 +1512,17 @@ class ProductionLedger:
                     else "DEPLOYMENT_STATE_INVALID",
                     "a deployment starts from 'approved'; this one is %r"
                     % row["state"],
+                    environment_id=row["environment_id"],
+                    deployment_id=deployment_id)
+            elif verb == "rollback" and row["state"] != "rolling_back":
+                # `rollback` claims a slot on a row its caller has already
+                # moved to `rolling_back` under the state machine. Reaching
+                # here from anything else means the claim, and the adapter
+                # call behind it, arrived without that transition.
+                refusal = ProductionRefusal(
+                    "ROLLBACK_STATE_INVALID",
+                    "a rollback operation is claimed on a deployment already "
+                    "in 'rolling_back'; this one is %r" % row["state"],
                     environment_id=row["environment_id"],
                     deployment_id=deployment_id)
             elif db.execute("SELECT emergency_stop FROM environments"

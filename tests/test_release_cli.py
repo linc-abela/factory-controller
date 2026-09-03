@@ -11,10 +11,13 @@ a rebuilt artifact would be the one bug this chain exists to prevent.
 from __future__ import annotations
 
 import contextlib
+import functools
 import hashlib
+import http.server
 import io
 import json
 import tempfile
+import threading
 from pathlib import Path
 import unittest
 
@@ -23,6 +26,28 @@ from factory_controller import factory as factory_lifecycle
 from factory_controller.store import MissionStore
 
 from tests.test_release_lifecycle import REPOSITORY, bundle
+
+
+#: The document a static surface serves at ``/health.json``. The Casino
+#: artifact's own file, so the probe's semantics are tested against the shape
+#: the product actually ships rather than an invented one.
+HEALTH_OK = b'{"app": "lodus-casino", "status": "ok"}'
+
+
+def serve(directory: Path) -> tuple[str, http.server.ThreadingHTTPServer]:
+    """A real loopback surface serving exactly `directory`.
+
+    A REVIEW is now settled only by a probe of the declared surface, so these
+    tests serve one. That is not ceremony: the command being exercised is the
+    one an Owner types, and before this the whole chain could be driven with
+    counts and no server at all -- which is the defect, not the setup cost.
+    """
+
+    handler = functools.partial(http.server.SimpleHTTPRequestHandler,
+                                directory=str(directory))
+    server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), handler)
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    return "http://127.0.0.1:%d" % server.server_address[1], server
 
 
 class ReleaseCommandTests(unittest.TestCase):
@@ -50,10 +75,35 @@ class ReleaseCommandTests(unittest.TestCase):
         text = stream.getvalue().strip()
         return code, (json.loads(text) if text else None)
 
+    def artifact_dir(self, number: int, *, artifact_char: str | None = None) -> Path:
+        """One release's real bytes on disk, named by their real identity.
+
+        The bundle carries the digest of these files rather than a made-up
+        one, so the resolver, the probe's entry comparison and the deployment
+        adapter are all looking at the same file set -- which is what the
+        exact-artifact chain claims and what a synthetic identity cannot test.
+        """
+
+        marker = artifact_char or "abcdef"[(number - 1) % 6]
+        directory = self.root / ("artifact-%03d-%s" % (number, marker))
+        directory.mkdir(parents=True, exist_ok=True)
+        (directory / "index.html").write_bytes(
+            b"<!doctype html><title>casino %s</title>" % marker.encode())
+        (directory / "health.json").write_bytes(HEALTH_OK)
+        return directory
+
+    def files(self, number: int, *, artifact_char: str | None = None):
+        directory = self.artifact_dir(number, artifact_char=artifact_char)
+        return directory, {path.name: path.read_bytes()
+                           for path in sorted(directory.iterdir())}
+
     def bundle_path(self, number: int, *, artifact_char: str | None = None) -> str:
         path = self.root / ("bundle-%03d.json" % number)
-        path.write_text(json.dumps(
-            bundle(number, artifact_char=artifact_char).as_row()))
+        _, files = self.files(number, artifact_char=artifact_char)
+        body = bundle(number, artifact_char=artifact_char).as_row()
+        body["artifact"] = {"kind": "static-bundle",
+                            "identity": production.deployable_digest(files)}
+        path.write_text(json.dumps(body))
         return str(path)
 
     def seal(self, number: int = 1, *, artifact_char: str | None = None):
@@ -63,12 +113,21 @@ class ReleaseCommandTests(unittest.TestCase):
             "--verification-ref", "verification/casino/%03d" % number,
             "--qa-ref", "qa/casino/%03d" % number)
 
-    def review(self, number: int = 1):
+    def surface(self, number: int = 1, *, artifact_char: str | None = None) -> str:
+        directory = self.artifact_dir(number, artifact_char=artifact_char)
+        url, server = serve(directory)
+        self.addCleanup(server.shutdown)
+        return url
+
+    def review(self, number: int = 1, *, artifact_char: str | None = None,
+               url: str | None = None):
+        directory = self.artifact_dir(number, artifact_char=artifact_char)
         return self.run_cli(
             "release", "deploy-review", "--rc", "CASINO-MVP-RC-%03d" % number,
             "--environment", "lodus-casino-review", "--actor", "factory",
-            "--review-url", "https://review.example.invalid/casino",
-            "--passed", "3")
+            "--review-url",
+            url or self.surface(number, artifact_char=artifact_char),
+            "--probe", "--artifact-dir", str(directory))
 
     def validate(self, deployment_ref: str, *, decision="VALIDATED", number=1):
         return self.run_cli(
@@ -80,11 +139,13 @@ class ReleaseCommandTests(unittest.TestCase):
     # -- the chain ------------------------------------------------------- #
 
     def promote(self, number: int = 1):
+        directory = self.artifact_dir(number)
         return self.run_cli(
             "release", "promote", "--rc", "CASINO-MVP-RC-%03d" % number,
             "--validation", "CASINO-MVP-VALIDATION-%03d" % number,
             "--environment", "lodus-casino-production", "--actor", "factory",
-            "--passed", "3")
+            "--review-url", self.surface(number), "--probe",
+            "--artifact-dir", str(directory))
 
     def release_through(self, number: int):
         """Seal, review, validate and promote one release from the command line."""
@@ -235,8 +296,7 @@ class ReleaseCommandTests(unittest.TestCase):
                 "release", "deploy-review", "--rc", "CASINO-MVP-RC-001",
                 "--environment", "lodus-casino-review", "--actor", "factory",
                 "--review-url", "https://lodus-casino-review.web.app",
-                "--adapter", "google", "--deploy-token-file", str(token_file),
-                "--passed", "3")
+                "--adapter", "google", "--deploy-token-file", str(token_file))
 
         self.assertEqual(seen.get("token"), "owner-issued-value")
         self.assertEqual(code, 0)
@@ -252,35 +312,26 @@ class ReleaseCommandTests(unittest.TestCase):
             "release", "deploy-review", "--rc", "CASINO-MVP-RC-001",
             "--environment", "lodus-casino-review", "--actor", "factory",
             "--review-url", "https://lodus-casino-review.web.app",
-            "--adapter", "google", "--passed", "3")
+            "--adapter", "google")
         self.assertEqual(code, 0)
         self.assertEqual(deployed["state"], "failed")
         self.assertTrue(deployed["receipt"]["operation_ref"].endswith(":rejected"))
 
         # 2. Real artifact files with explicitly selected simulation succeeds
-        art_dir = self.root / "art-002"
-        art_dir.mkdir(parents=True, exist_ok=True)
-        (art_dir / "index.html").write_text("<!DOCTYPE html><html><body>Test</body></html>")
-        files = {"index.html": (art_dir / "index.html").read_bytes()}
-        hasher = hashlib.sha256()
-        for name in sorted(files):
-            hasher.update(name.encode("utf-8"))
-            hasher.update(files[name])
-        art_digest = f"sha256:{hasher.hexdigest()}"
+        art_dir, files = self.files(2)
+        art_digest = production.deployable_digest(files)
+        self.assertEqual(art_digest,
+                         json.loads(Path(self.bundle_path(2)).read_text())
+                         ["artifact"]["identity"])
 
-        b2 = bundle(2).as_row()
-        b2["artifact"] = {"kind": "static-bundle", "identity": art_digest}
-        p2 = self.root / "bundle-002-art.json"
-        p2.write_text(json.dumps(b2))
-        self.run_cli("release", "seal", "--rc", "CASINO-MVP-RC-002", "--bundle", str(p2),
-                     "--verification-ref", "v", "--qa-ref", "q")
+        self.assertEqual(self.seal(2)[0], 0)
 
         code, deployed2 = self.run_cli(
             "release", "deploy-review", "--rc", "CASINO-MVP-RC-002",
             "--environment", "lodus-casino-review", "--actor", "factory",
-            "--review-url", "https://lodus-casino-review.web.app",
+            "--review-url", self.surface(2),
             "--adapter", "google", "--simulate", "--artifact-dir", str(art_dir),
-            "--passed", "3")
+            "--probe")
         self.assertEqual(code, 0)
         self.assertEqual(deployed2["state"], "healthy")
         self.assertIn("google-firebase", deployed2["receipt"]["adapter"])
@@ -440,8 +491,11 @@ class PromotionOrderingTests(unittest.TestCase):
 
     setUp = ReleaseCommandTests.setUp
     run_cli = ReleaseCommandTests.run_cli
+    artifact_dir = ReleaseCommandTests.artifact_dir
+    files = ReleaseCommandTests.files
     bundle_path = ReleaseCommandTests.bundle_path
     seal = ReleaseCommandTests.seal
+    surface = ReleaseCommandTests.surface
     review = ReleaseCommandTests.review
     validate = ReleaseCommandTests.validate
     promote = ReleaseCommandTests.promote

@@ -201,6 +201,73 @@ def _artifact_digest(bundle: production.ReleaseBundle) -> str:
     return artifact["identity"]
 
 
+def _proven_health(health: production.HealthRecord | None,
+                   surface: str | None, stage: str) -> None:
+    """A release deployment is settled by a probe, or it is not settled healthy.
+
+    Everything downstream of a REVIEW -- Owner Validation, and the
+    same-artifact Production promotion behind it -- consumes only the resulting
+    ledger state, so two counts typed on a command line were enough to make a
+    review healthy without anything ever being served.  Two facts are required
+    and each is something only a probe can hold: that a probe made the
+    observation against *this* deployment's declared surface, and that it
+    compared the served entry document with the sealed artifact's own bytes.
+
+    The entry proof is required only of an observation that would settle the
+    deployment ``healthy``.  A probe that found the surface unreachable, or
+    serving the wrong document, has nothing to prove and everything to record:
+    refusing it would throw away the failure rather than fail closed on it.
+
+    Absence is refused rather than downgraded.  A deployment whose health
+    cannot be proven stays in ``health_pending``, which Owner Validation and
+    promotion both already refuse -- the fail-closed path needs no new
+    authority, only this gate.
+    """
+
+    if health is None:
+        return
+    if not isinstance(health, production.ProbedHealthRecord):
+        raise ReleaseRefusal(
+            "%s_HEALTH_UNPROVEN" % stage,
+            "a %s deployment is settled by an observation of the served "
+            "surface; operator-supplied counts carry no provenance"
+            % stage.lower())
+    if surface is not None \
+            and health.probe_target.rstrip("/") != surface.rstrip("/"):
+        raise ReleaseRefusal(
+            "%s_HEALTH_SURFACE_MISMATCH" % stage,
+            "the probe observed %r and this deployment declares %r"
+            % (health.probe_target, surface))
+    if production.classify_health(health) == "healthy" \
+            and not health.entry_proven:
+        raise ReleaseRefusal(
+            "%s_HEALTH_ENTRY_UNPROVEN" % stage,
+            "the probe did not compare the served entry document against the "
+            "sealed artifact bytes (entry_proof=%r)" % health.entry_proof)
+
+
+def _last_health_observation(db, deployment_id: str) -> Mapping[str, Any] | None:
+    """The health record that settled this deployment's current state.
+
+    The ledger keeps the outcome on the row and the observation itself in its
+    append-only event log, which is the only place the provenance survives.
+    """
+
+    rows = db.execute(
+        "SELECT detail_json FROM production_events WHERE deployment_id=?"
+        " AND kind='deployment_state' ORDER BY sequence DESC", (deployment_id,)
+    ).fetchall()
+    for row in rows:
+        try:
+            detail = json.loads(row["detail_json"])
+        except (TypeError, ValueError):
+            continue
+        if isinstance(detail, Mapping) and "health_outcome" in detail:
+            observed = detail.get("health")
+            return observed if isinstance(observed, Mapping) else None
+    return None
+
+
 def _candidate(row: Mapping[str, Any]) -> ReleaseCandidate:
     return ReleaseCandidate(
         rc_id=row["rc_id"], project_id=row["project_id"],
@@ -300,6 +367,7 @@ class ReleaseLifecycle:
         if policy.environment_class != "staging":
             raise ReleaseRefusal("REVIEW_ENVIRONMENT_REQUIRED",
                                  "the Owner surface must be a staging environment")
+        _proven_health(health, surface, "REVIEW")
         deployment_id = ledger.admit_release(bundle, review_environment_id, requested_by)
         state = ledger.deployment(deployment_id)["state"]
         if state == "approved":
@@ -347,8 +415,13 @@ class ReleaseLifecycle:
             deployment_id = deployment["deployment_id"]
             prod_row = db.execute("SELECT state, bundle_digest, release_sha FROM deployments WHERE id=?",
                                   (deployment_id,)).fetchone()
-            if prod_row is None or prod_row["state"] != "healthy":
-                raise ReleaseRefusal("REVIEW_NOT_HEALTHY", "Owner Validation requires a healthy exact review deployment")
+            observed = self._review_state(db, rc_id, deployment_ref)
+            if prod_row is None or observed != "healthy":
+                raise ReleaseRefusal(
+                    "REVIEW_NOT_HEALTHY",
+                    "Owner Validation requires a healthy exact review "
+                    "deployment, proven by a probe of its declared surface; "
+                    "this one is %r" % (observed or "unknown"))
             if (prod_row["bundle_digest"] != rc.bundle_digest
                     or prod_row["release_sha"] != rc.candidate_sha):
                 raise ReleaseRefusal("REVIEW_ARTIFACT_MISMATCH", "review deployment is not the sealed RC")
@@ -414,27 +487,51 @@ class ReleaseLifecycle:
         # admitted to Production. The ordering the chain claims is: healthy
         # exact REVIEW *now*, then Owner Validation, then same-artifact
         # Production.
+        #
+        # "The exact review" is the one named by `validation.deployment_ref`
+        # and no other. One RC may be deployed to several staging environments,
+        # and selecting any staging row for the RC meant the Owner could
+        # validate `review-b` and be promoted on the strength of `review-a`
+        # still being healthy after `review-b` had failed.
         with self._store.transaction() as db:
-            review = db.execute(
-                "SELECT deployment_id FROM release_deployments WHERE rc_id=?"
-                " AND environment_class='staging'", (rc_id,)).fetchone()
-            state = None if review is None else db.execute(
-                "SELECT state FROM deployments WHERE id=?",
-                (review["deployment_id"],)).fetchone()
-        if review is None:
-            raise ReleaseRefusal("REVIEW_DEPLOYMENT_NOT_FOUND", rc_id)
-        if state is None or state["state"] != "healthy":
+            state = self._review_state(db, rc_id, validation.deployment_ref)
+        if state is None:
+            raise ReleaseRefusal("REVIEW_DEPLOYMENT_NOT_FOUND",
+                                 validation.deployment_ref)
+        if state != "healthy":
             raise ReleaseRefusal(
                 "REVIEW_NOT_HEALTHY",
-                "Production promotion requires the exact review deployment to "
-                "be healthy now, not only when it was validated")
+                "Production promotion requires the exact validated review "
+                "deployment %s to be healthy now, not only when it was "
+                "validated; it is %r" % (validation.deployment_ref, state))
         policy = ledger.environment(production_environment_id)
         if policy.environment_class != "production":
             raise ReleaseRefusal("PRODUCTION_ENVIRONMENT_REQUIRED",
                                  "promotion target must be a production environment")
         if policy.project_id != rc.project_id:
             raise ReleaseRefusal("PRODUCTION_PROJECT_MISMATCH", "production target belongs to another project")
-        deployment_id = ledger.admit_release(bundle, production_environment_id, requested_by)
+        # The check above closes a stale decision; on its own it does not close
+        # the window after it. A concurrent health writer can settle that exact
+        # review failed between the read and the admission, and Production
+        # would be admitted on a fact that had already stopped being true. The
+        # same read is therefore repeated inside the admission's own
+        # transaction, so the promotion is bound to a healthy exact REVIEW at
+        # the moment the deployment row is written, or nothing is written.
+        def still_healthy(db) -> production.ProductionRefusal | None:
+            current = self._review_state(db, rc_id, validation.deployment_ref)
+            if current == "healthy":
+                return None
+            return production.ProductionRefusal(
+                "REVIEW_NOT_HEALTHY",
+                "the validated review deployment %s is %r at the moment of "
+                "Production admission"
+                % (validation.deployment_ref, current or "unknown"),
+                environment_id=production_environment_id)
+
+        _proven_health(health, None, "PRODUCTION")
+        deployment_id = ledger.admit_release(bundle, production_environment_id,
+                                             requested_by,
+                                             precondition=still_healthy)
         deployment = ledger.deployment(deployment_id)
         if deployment["state"] == "awaiting_approval":
             ledger.approve(deployment_id, validation.decided_by, validation_id,
@@ -502,6 +599,46 @@ class ReleaseLifecycle:
             rows = db.execute("SELECT * FROM release_events WHERE rc_id=? ORDER BY sequence",
                              (rc_id,)).fetchall()
         return tuple(dict(row) for row in rows)
+
+    @staticmethod
+    def _review_state(db, rc_id: str, deployment_ref: str) -> str | None:
+        """The current ledger state of one exact staging deployment.
+
+        ``healthy`` is returned only when the observation that settled it was
+        a probe of this deployment's own declared surface that compared the
+        served entry document with the sealed bytes.  Checking the *state*
+        alone trusted whichever producer wrote it, and there is more than one:
+        besides ``deploy_review``, the generic ``production health`` command
+        reaches the same row with operator-supplied counts.  Refusing the
+        health record where it is written stops one producer; reading the
+        evidence here answers for all of them, including any added later.
+
+        Anything else comes back as ``unproven_health``, which is not a state
+        the ledger uses and therefore satisfies no caller.  Read on the
+        caller's connection, so it can be evaluated inside another operation's
+        transaction as easily as on its own.
+        """
+
+        review = db.execute(
+            "SELECT deployment_id, validation_surface FROM release_deployments"
+            " WHERE deployment_ref=? AND rc_id=? AND environment_class='staging'",
+            (deployment_ref, rc_id)).fetchone()
+        if review is None:
+            return None
+        row = db.execute("SELECT state FROM deployments WHERE id=?",
+                         (review["deployment_id"],)).fetchone()
+        if row is None:
+            return None
+        if row["state"] != "healthy":
+            return row["state"]
+        observation = _last_health_observation(db, review["deployment_id"])
+        surface = review["validation_surface"] or ""
+        if not isinstance(observation, Mapping) \
+                or not str(observation.get("entry_proof", "")).startswith("sha256:") \
+                or str(observation.get("probe_target", "")).rstrip("/") \
+                != surface.rstrip("/"):
+            return "unproven_health"
+        return "healthy"
 
     def _record_deployment(self, row: Mapping[str, Any]) -> None:
         with self._store.transaction() as db:
