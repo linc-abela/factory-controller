@@ -410,7 +410,12 @@ def parser() -> argparse.ArgumentParser:
     factory_parser.add_argument(
         "factory_action",
         choices=("install", "start", "run", "product", "revise", "review",
-                 "cycle", "stop", "status"))
+                 "cycle", "stop", "status", "attention"))
+    factory_parser.add_argument(
+        "--attention-action",
+        choices=("status", "test", "check-liveness", "clear"),
+        default="status",
+        help="action for 'factory attention': status, test, check-liveness, or clear")
     factory_parser.add_argument(
         "--package", type=Path,
         help="the Product Candidate Package to submit; required by 'product' "
@@ -1446,7 +1451,11 @@ def main(argv: list[str] | None = None) -> int:
             except factory_lifecycle.FactoryRefusal as refusal:
                 print("BLOCKED: " + refusal.detail)
                 return 1
-        result = lifecycle.dispatch(args.factory_action, package=args.package)
+        result = lifecycle.dispatch(
+            args.factory_action,
+            package=args.package,
+            attention_action=getattr(args, "attention_action", None),
+        )
         print(result.render())
         return 0 if result.ok else 1
     controller = _controller(args)

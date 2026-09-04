@@ -27,6 +27,7 @@ from pathlib import Path
 from typing import Any, Callable, Mapping, Sequence
 
 from . import activation
+from . import attention
 from . import capacity
 from . import context
 from . import context_adapter
@@ -311,7 +312,8 @@ class FactoryLifecycle:
                  clock: Callable[[], float] = time.time,
                  reports: Mapping[str, Mapping[str, Any]] | None = None,
                  remote_reachability: Mapping[str, Sequence[str]] | None = None,
-                 context_builder: Callable[[dict[str, Any]], Mapping[str, Any]] | None = None
+                 context_builder: Callable[[dict[str, Any]], Mapping[str, Any]] | None = None,
+                 attention_sink: attention.AttentionSink | None = None,
                  ) -> None:
         self.controller = controller
         self.store = controller.store
@@ -335,6 +337,19 @@ class FactoryLifecycle:
         self.production = production.ProductionLedger(self.store)
         self.improvement = improvement.ImprovementPlane(self.store, self.production)
         self._improvement_contract: Any = False
+        self.attention_sink = attention_sink
+        if self.attention_sink is None:
+            self.attention_sink = attention.CompositeAttentionSink([
+                attention.MacOSNotificationSink(runner=self.runner),
+                attention.FileAttentionSink(self.config.state_dir / "attention.json"),
+            ])
+        self.attention_ledger = attention.AttentionLedger(
+            self.config.state_dir / "attention-state.json")
+        self.attention_router = attention.AttentionRouter(
+            self.attention_sink,
+            ledger=self.attention_ledger,
+            clock=self.clock,
+        )
 
     # -- the frozen improvement objective ------------------------------- #
 
@@ -387,6 +402,8 @@ class FactoryLifecycle:
                 return self.status()
             if action == "review":
                 return self.review()
+            if action == "attention":
+                return self.attention(options.get("attention_action"))
             raise FactoryRefusal("ACTION_UNKNOWN", "That Factory action is not supported.")
         except FactoryRefusal as refusal:
             return FactoryResult(
@@ -2127,13 +2144,102 @@ class FactoryLifecycle:
                 return portfolio_mission, reading, attention
         return None
 
-    @staticmethod
-    def _attention_result(code: str, detail: str, **extra: Any) -> FactoryResult:
+    def _attention_result(self, code: str, detail: str, **extra: Any) -> FactoryResult:
+        target_ref = str(extra.get("mission_ref") or "factory")
+        self.attention_router.emit(
+            code=code,
+            detail=detail,
+            target_ref=target_ref,
+            metadata=extra,
+        )
         return FactoryResult(
             action="cycle", ok=False, state="attention",
             lines=("FACTORY ATTENTION", detail,
                    "Run './dev factory status' to review the current state."),
             details={"code": code, **extra})
+
+    def attention(self, subaction: str | None = None) -> FactoryResult:
+        """Inspect, test, or verify Owner attention state and liveness."""
+        sub = subaction or "status"
+        if sub == "test":
+            receipt = self.attention_router.emit(
+                code="AUTOPILOT_ATTENTION",
+                detail="Test Owner attention delivery fixture from ./dev factory attention test",
+                target_ref="test_fixture",
+                headline="FACTORY ATTENTION: Test Fixture",
+                action_required="./dev factory status",
+            )
+            return FactoryResult(
+                action="attention",
+                ok=True,
+                state="delivered" if receipt.delivered else "suppressed",
+                lines=(
+                    "ATTENTION TEST EVENT PROCESSED",
+                    f"Channel: {receipt.channel}",
+                    f"Delivered: {receipt.delivered}",
+                    f"State: {receipt.delivery_state}",
+                    f"Detail: {receipt.detail}",
+                ),
+                details=receipt.as_dict(),
+            )
+        if sub == "check-liveness":
+            healthy, detail, age = attention.check_supervisor_liveness(
+                self.config.runtime_receipt_path, clock=self.clock
+            )
+            if not healthy:
+                receipt = self.attention_router.emit(
+                    code="SUPERVISOR_DEAD",
+                    detail=detail,
+                    target_ref="supervisor",
+                    headline="FACTORY ATTENTION: Supervisor Stalled",
+                    action_required="./dev factory start",
+                )
+                return FactoryResult(
+                    action="attention", ok=False, state="attention",
+                    lines=(
+                        "FACTORY ATTENTION",
+                        detail,
+                        f"Notification: {receipt.delivery_state}",
+                        "Run './dev factory start' to restart the supervisor.",
+                    ),
+                    details={"code": "SUPERVISOR_DEAD", "receipt": receipt.as_dict()},
+                )
+            return FactoryResult(
+                action="attention", ok=True, state="healthy",
+                lines=("SUPERVISOR LIVENESS HEALTHY", detail),
+                details={"age_seconds": age},
+            )
+        if sub == "clear":
+            active = self.attention_ledger.active_entries()
+            for fp in list(active.keys()):
+                self.attention_router.resolve(fp)
+            return FactoryResult(
+                action="attention", ok=True, state="cleared",
+                lines=(f"Cleared {len(active)} active attention blocker(s).",),
+                details={"cleared": len(active)},
+            )
+        # default: status
+        active = self.attention_ledger.active_entries()
+        lines: list[str] = []
+        if not active:
+            lines.append("No active Owner attention blockers.")
+            state = "clean"
+            ok = True
+        else:
+            lines.append(f"Active Owner attention blockers ({len(active)}):")
+            for fp, entry in active.items():
+                lines.append(f"- [{entry.get('fingerprint')}] {entry.get('last_message')}")
+                lines.append(
+                    f"  notified: {entry.get('notify_count', 0)} time(s), "
+                    f"suppressed: {entry.get('suppress_count', 0)} time(s)"
+                )
+            state = "attention"
+            ok = False
+        return FactoryResult(
+            action="attention", ok=ok, state=state,
+            lines=tuple(lines),
+            details={"active": active},
+        )
 
     # -- the improvement slot ------------------------------------------- #
 
@@ -2724,6 +2830,12 @@ class FactoryLifecycle:
             lines.append(
                 "Attention: The supervisor stopped unexpectedly; "
                 "automatic validation is paused.")
+        healthy, detail, age = attention.check_supervisor_liveness(
+            self.config.runtime_receipt_path, clock=self.clock
+        )
+        if not healthy and age > 0:
+            lines.append(
+                f"Attention: {detail}; automatic validation is paused.")
         return tuple(lines)
 
     def status(self) -> FactoryResult:
