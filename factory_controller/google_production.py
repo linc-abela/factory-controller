@@ -22,6 +22,7 @@ Boundaries:
 
 from __future__ import annotations
 
+import gzip
 import hashlib
 import json
 import re
@@ -239,9 +240,12 @@ class FirebaseHostingRestTransport:
         # 2. Populate files
         pop_url = f"https://firebasehosting.googleapis.com/v1beta1/{version_name}:populateFiles"
         file_hashes = {}
+        gzipped_files = {}
         for name, file_bytes in files.items():
             clean_name = "/" + name.lstrip("/")
-            file_hashes[clean_name] = hashlib.sha256(file_bytes).hexdigest()
+            gz_bytes = gzip.compress(file_bytes, mtime=0)
+            gzipped_files[clean_name] = gz_bytes
+            file_hashes[clean_name] = hashlib.sha256(gz_bytes).hexdigest()
 
         pop_payload = json.dumps({"files": file_hashes}).encode("utf-8")
         status, body, _ = self._http_call(
@@ -253,13 +257,12 @@ class FirebaseHostingRestTransport:
 
         # 3. Upload required files
         if upload_url and required_hashes:
-            for name, file_bytes in files.items():
-                clean_name = "/" + name.lstrip("/")
+            for clean_name, gz_bytes in gzipped_files.items():
                 f_hash = file_hashes[clean_name]
                 if f_hash in required_hashes:
                     up_url = f"{upload_url}/{f_hash}"
                     self._http_call(
-                        up_url, method="POST", data=file_bytes, headers={"Content-Type": "application/octet-stream"}
+                        up_url, method="POST", data=gz_bytes, headers={"Content-Type": "application/octet-stream"}
                     )
 
         # 4. Finalize version
@@ -461,6 +464,28 @@ def file_system_artifact_resolver(
     return {}
 
 
+DEFAULT_TARGET_CONFIGS: Mapping[str, GoogleTargetConfig] = {
+    "lodus-casino-review": GoogleTargetConfig(
+        project_id="astral-dogfood",
+        site_id="lodus-casino-review",
+        channel_id="live",
+        plan=ZERO_COST_PLAN,
+    ),
+    "lodus-casino-cloud-review": GoogleTargetConfig(
+        project_id="astral-dogfood",
+        site_id="lodus-casino-review",
+        channel_id="live",
+        plan=ZERO_COST_PLAN,
+    ),
+    "lodus-casino-production": GoogleTargetConfig(
+        project_id="astral-dogfood",
+        site_id="lodus-casino",
+        channel_id="live",
+        plan=ZERO_COST_PLAN,
+    ),
+}
+
+
 class FirebaseHostingDeploymentAdapter:
     """DeploymentPort implementation for Firebase Hosting on the Spark plan.
 
@@ -501,6 +526,10 @@ class FirebaseHostingDeploymentAdapter:
             return self._targets[env_id]
         if environment.service_ref in self._targets:
             return self._targets[environment.service_ref]
+        if env_id in DEFAULT_TARGET_CONFIGS:
+            return DEFAULT_TARGET_CONFIGS[env_id]
+        if environment.service_ref in DEFAULT_TARGET_CONFIGS:
+            return DEFAULT_TARGET_CONFIGS[environment.service_ref]
         channel = "live" if environment.environment_class == "production" else "review"
         return GoogleTargetConfig(
             project_id=environment.project_id,
@@ -980,6 +1009,7 @@ class StaticWebHealthVerifier:
 
 __all__ = [
     "ADAPTER_NAME",
+    "DEFAULT_TARGET_CONFIGS",
     "DISALLOWED_BILLABLE_SERVICES",
     "FirebaseHostingDeploymentAdapter",
     "FirebaseHostingRestTransport",

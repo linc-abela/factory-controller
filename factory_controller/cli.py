@@ -580,10 +580,13 @@ def _release(args, store) -> int:
                     return 1
             transport = google_production.FirebaseHostingRestTransport(token=token)
         resolver = (lambda d: google_production.file_system_artifact_resolver(d, base_dirs=[artifact_dir])) if artifact_dir else None
-        port = google_production.FirebaseHostingDeploymentAdapter({}, transport=transport, artifact_resolver=resolver, store=store)
+        targets = dict(google_production.DEFAULT_TARGET_CONFIGS)
+        port = google_production.FirebaseHostingDeploymentAdapter(targets, transport=transport, artifact_resolver=resolver, store=store)
     else:
         port = production.DeterministicDeploymentAdapter()
     health = None
+    verifier = None
+    expected = None
     if getattr(args, "probe", False) and getattr(args, "review_url", None):
         from . import google_production
         verifier = google_production.StaticWebHealthVerifier()
@@ -610,8 +613,9 @@ def _release(args, store) -> int:
                               "serves" % sealed.artifact_digest}},
                     sort_keys=True))
                 return 1
-        health = verifier.verify(args.review_url,
-                                 expected_entry_content=expected)
+        if args.action not in ("deploy-review", "promote"):
+            health = verifier.verify(args.review_url,
+                                     expected_entry_content=expected)
     elif args.rel_passed or args.rel_failed:
         try:
             health = production.HealthRecord(
@@ -645,11 +649,31 @@ def _release(args, store) -> int:
                 verification_refs=args.verification_refs,
                 qa_refs=args.qa_refs).as_row()
         elif args.action == "deploy-review":
-            result = lifecycle.deploy_review(
-                args.rc_id, ledger, port,
-                review_environment_id=args.rel_environment,
-                requested_by=args.rel_actor, review_url=args.review_url,
-                health=health)
+            requested_by = args.rel_actor or "factory"
+            if getattr(args, "probe", False) and getattr(args, "review_url", None) and verifier is not None:
+                result = lifecycle.deploy_review(
+                    args.rc_id, ledger, port,
+                    review_environment_id=args.rel_environment,
+                    requested_by=requested_by, review_url=args.review_url,
+                    health=None)
+                if result.get("state") in ("verifying", "health_pending"):
+                    probe_health = verifier.verify(args.review_url,
+                                                  expected_entry_content=expected)
+                    if probe_health.checks_failed > 0:
+                        for _ in range(5):
+                            time.sleep(1.0)
+                            probe_health = verifier.verify(args.review_url,
+                                                           expected_entry_content=expected)
+                            if probe_health.checks_failed == 0:
+                                break
+                    new_state = ledger.record_health(result["deployment_id"], probe_health)
+                    result["state"] = new_state
+            else:
+                result = lifecycle.deploy_review(
+                    args.rc_id, ledger, port,
+                    review_environment_id=args.rel_environment,
+                    requested_by=requested_by, review_url=args.review_url,
+                    health=health)
         elif args.action == "validate":
             result = lifecycle.record_owner_validation(
                 args.validation_id, args.rc_id,
@@ -657,10 +681,29 @@ def _release(args, store) -> int:
                 decided_by=args.rel_actor, decided_at=time.time(),
                 notes=args.notes).as_row()
         elif args.action == "promote":
-            result = lifecycle.promote_validated(
-                args.rc_id, args.validation_id, ledger, port,
-                production_environment_id=args.rel_environment,
-                requested_by=args.rel_actor, health=health)
+            requested_by = args.rel_actor or "factory"
+            if getattr(args, "probe", False) and getattr(args, "review_url", None) and verifier is not None:
+                result = lifecycle.promote_validated(
+                    args.rc_id, args.validation_id, ledger, port,
+                    production_environment_id=args.rel_environment,
+                    requested_by=requested_by, health=None)
+                if result.get("state") in ("verifying", "health_pending"):
+                    probe_health = verifier.verify(args.review_url,
+                                                  expected_entry_content=expected)
+                    if probe_health.checks_failed > 0:
+                        for _ in range(5):
+                            time.sleep(1.0)
+                            probe_health = verifier.verify(args.review_url,
+                                                           expected_entry_content=expected)
+                            if probe_health.checks_failed == 0:
+                                break
+                    new_state = ledger.record_health(result["deployment_id"], probe_health)
+                    result["state"] = new_state
+            else:
+                result = lifecycle.promote_validated(
+                    args.rc_id, args.validation_id, ledger, port,
+                    production_environment_id=args.rel_environment,
+                    requested_by=requested_by, health=health)
         elif args.action == "rollback":
             result = lifecycle.rollback_production(
                 args.rc_id, ledger, port,
