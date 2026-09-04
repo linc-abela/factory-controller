@@ -1,0 +1,19 @@
+{
+  "schema_version": "factory.controller.work_packet.v1",
+  "work_item_id": "factory-maintenance:SF-196",
+  "lineage_id": "factory-maintenance:SF-196",
+  "sequence": 196,
+  "owner_only": false,
+  "owner_reason": "not_applicable",
+  "blocked": false,
+  "payload": {
+    "work_item_id": "factory-maintenance:SF-196",
+    "project_id": "factory",
+    "execution_mode": "fixture",
+    "acceptance_gate_ids": ["G-BUILD"],
+    "provider_candidates": [
+      {"profile": "provider-alpha", "capabilities": ["implement"]},
+      {"profile": "provider-beta", "capabilities": ["implement"]}
+    ]
+  }
+}

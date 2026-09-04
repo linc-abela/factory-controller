@@ -2,7 +2,10 @@
 
 Pure-standard-library, single-host Controller runtime, executed through the
 repository container. SQLite is authoritative
-for live mission state; Notion is not read by runtime code.
+for live mission state; Notion is not read by runtime code. Factory-maintenance
+work is admitted from a directory of JSON packets
+(`factory.controller.work_packet.v1`) through `work-intake`; the directory is
+one adapter behind that seam.
 
 ```sh
 ./dev --db controller.db submit --key mission:1 --file mission.json
@@ -24,6 +27,8 @@ for live mission state; Notion is not read by runtime code.
 ./dev --db controller.db advise --probe | --proposals FILE [--policy FILE]
 ./dev --db harness --missions 10
 ./dev --db controller.db supervisor status | brief | cycle --worker host
+./dev --db controller.db work-intake observe --source-dir tests/fixtures/work_exchange
+./dev --db controller.db work-intake cycle --worker host --source-dir tests/fixtures/work_exchange
 ./dev --db controller.db shift-runtime status
 ./dev --db controller.db shift-runtime resume-preview
 ./dev test

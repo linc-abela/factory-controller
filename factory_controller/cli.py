@@ -24,6 +24,8 @@ from . import release
 from . import shift as shift_plane
 from . import shift_runtime
 from . import supervisor as sup
+from . import work_intake as intake
+from . import work_source as wsrc
 from .adapter import JsonProcessAdapter
 from .engine import Controller, RetryPolicy
 from .store import MissionStore
@@ -279,6 +281,20 @@ def parser() -> argparse.ArgumentParser:
     mnt_parser.add_argument("--reason", dest="mnt_reason", default="operator")
     mnt_parser.add_argument("--policy-version", dest="mnt_policy_version",
                             default="unset")
+
+    wi = sub.add_parser(
+        "work-intake",
+        help="admit Factory-maintenance packets into Controller-legal work")
+    wi.add_argument("action", choices=("observe", "cycle", "items", "status"))
+    wi.add_argument("work_item_id", nargs="?")
+    wi.add_argument("--source-dir", dest="wi_source_dir",
+                    help="a directory of work_packet.v1 JSON files")
+    wi.add_argument("--worker", dest="wi_worker", default="work-intake")
+    wi.add_argument("--lease-seconds", type=float, dest="wi_lease",
+                    default=intake.DEFAULT_CYCLE_LEASE_SECONDS)
+    wi.add_argument("--state", dest="wi_state", choices=intake.ITEM_STATES)
+    wi.add_argument("--no-execute", dest="wi_execute", action="store_false",
+                    help="admit only; leave execution to supervisor cycle")
 
     dog = sub.add_parser("dogfood")
     dog.add_argument("action", choices=("contract", "preflight", "gate",
@@ -735,6 +751,46 @@ def _release(args, store) -> int:
                                       "detail": str(error)}}, sort_keys=True))
         return 1
     print(json.dumps(result, sort_keys=True, default=list))
+    return 0
+
+
+def _work_intake(args, controller) -> int:
+    """Observe, claim and admit Factory-maintenance packets, then return.
+
+    One invocation is one finite cycle.  There is no verb here that approves
+    a release or invents a second execution path: admission is
+    ``Controller.submit`` and execution is ``Controller.work_once``.
+    """
+
+    plane = intake.WorkIntakePlane(controller.store)
+    try:
+        source = None
+        if args.wi_source_dir:
+            source = wsrc.DirectoryWorkSource(args.wi_source_dir)
+        if args.action == "observe":
+            if source is None:
+                raise intake.PolicyError("observe requires --source-dir")
+            result = list(plane.observe(source))
+        elif args.action == "cycle":
+            result = plane.cycle(
+                args.wi_worker, source=source, controller=controller,
+                lease_seconds=args.wi_lease, execute=args.wi_execute)
+        elif args.action == "status":
+            if not args.work_item_id:
+                raise intake.PolicyError("status requires a work_item_id")
+            result = plane.item(args.work_item_id)
+        else:
+            result = list(plane.items(args.wi_state))
+    except intake.WorkIntakeRefusal as refusal:
+        print(json.dumps({"refused": refusal.as_row()}, sort_keys=True))
+        return 2
+    except (intake.PolicyError, wsrc.PacketError) as exc:
+        code = getattr(exc, "code", "WORK_INTAKE_POLICY_INVALID")
+        detail = getattr(exc, "detail", str(exc))
+        print(json.dumps({"refused": {"code": code, "detail": detail}},
+                         sort_keys=True))
+        return 2
+    print(json.dumps(result, sort_keys=True, default=str))
     return 0
 
 
@@ -1545,6 +1601,8 @@ def main(argv: list[str] | None = None) -> int:
         return _production(args, store)
     elif args.command == "release":
         return _release(args, store)
+    elif args.command == "work-intake":
+        return _work_intake(args, controller)
     elif args.command == "maintenance":
         return _maintenance(args, controller)
     elif args.command == "improvement":
