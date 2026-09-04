@@ -305,6 +305,83 @@ class ReleaseCommandTests(unittest.TestCase):
         receipt_text = json.dumps(deployed, sort_keys=True)
         self.assertNotIn("owner-issued-value", receipt_text)
 
+    def test_a_deploy_token_file_that_is_not_there_refuses_rather_than_traces(self):
+        """The operator's own input, refused by name before anything is tried.
+
+        This read sits outside the refusal handler the rest of the command
+        runs under, so an absent file raised ``FileNotFoundError`` straight
+        through the one command the Phase-1 release path is driven by: the
+        Owner got a traceback instead of a code, and the ledger got no record
+        of why nothing happened.  The transport must not even be constructed.
+        """
+
+        from unittest import mock
+        from factory_controller import google_production
+
+        built = []
+
+        class CountingTransport(google_production.FirebaseHostingRestTransport):
+            def __init__(self, **keywords):
+                built.append(keywords)
+                super().__init__(**keywords)
+
+        self.seal(1)
+        with mock.patch.object(google_production, "FirebaseHostingRestTransport",
+                               CountingTransport):
+            code, result = self.run_cli(
+                "release", "deploy-review", "--rc", "CASINO-MVP-RC-001",
+                "--environment", "lodus-casino-review", "--actor", "factory",
+                "--review-url", "https://lodus-casino-review.web.app",
+                "--adapter", "google",
+                "--deploy-token-file", str(self.root / "absent-token"))
+
+        self.assertEqual(code, 1)
+        self.assertEqual(result["refused"]["code"], "DEPLOY_TOKEN_UNAVAILABLE")
+        self.assertEqual(built, [])
+        code, events = self.run_cli("release", "events", "--rc",
+                                    "CASINO-MVP-RC-001")
+        self.assertEqual(code, 0)
+        self.assertEqual([event for event in events
+                          if event.get("kind") == "review_deployed"], [])
+
+    def test_an_empty_deploy_token_file_is_refused_as_no_token_at_all(self):
+        """A file that exists and holds nothing is not a credential.
+
+        Stripped to the empty string it is falsy, so the transport would have
+        been built with ``token=""`` and the refusal would have come back from
+        Google as an auth failure -- a network round trip to learn something
+        this host already knows.
+        """
+
+        token_file = self.root / "empty-token"
+        token_file.write_text("   \n")
+        self.seal(1)
+        code, result = self.run_cli(
+            "release", "deploy-review", "--rc", "CASINO-MVP-RC-001",
+            "--environment", "lodus-casino-review", "--actor", "factory",
+            "--review-url", "https://lodus-casino-review.web.app",
+            "--adapter", "google", "--deploy-token-file", str(token_file))
+        self.assertEqual(code, 1)
+        self.assertEqual(result["refused"]["code"], "DEPLOY_TOKEN_UNAVAILABLE")
+        self.assertIn("is empty", result["refused"]["detail"])
+
+    def test_a_release_bundle_that_cannot_be_read_refuses_rather_than_traces(self):
+        """The sibling of the token read, in the same command.
+
+        Named separately rather than by widening the handler that already
+        wraps this block: an ``OSError`` from the adapter or the store reaches
+        the same place, and calling that a bad argument would be a false
+        refusal -- worse, in a fail-closed ledger, than an unhandled one.
+        """
+
+        code, result = self.run_cli(
+            "release", "seal", "--rc", "CASINO-MVP-RC-001",
+            "--bundle", str(self.root / "absent-bundle.json"),
+            "--verification-ref", "verification/casino/001",
+            "--qa-ref", "qa/casino/001")
+        self.assertEqual(code, 1)
+        self.assertEqual(result["refused"]["code"], "RELEASE_BUNDLE_UNREADABLE")
+
     def test_deploy_review_with_google_adapter(self):
         # 1. Missing artifact bytes fails closed (never returns reached=True with zero bytes)
         self.seal(1)

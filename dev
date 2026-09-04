@@ -11,10 +11,22 @@ case "${1:-}" in
     # Release Candidate and unpacks its bytes; this only serves them.
     shift || true
     FACTORY_REVIEW_ROOT="${FACTORY_REVIEW_ROOT:-$HOME/.factory-controller/review/current}"
+    # `current` is a symlink that `./dev factory review` re-points at each
+    # newly sealed artifact, and a bind mount resolves it once, when the
+    # container is created.  A surface started before a re-seal therefore went
+    # on serving the artifact that was current then -- on this host, the
+    # candidate the Owner had already RETURNED_FOR_CHANGES -- while the
+    # Factory told the Owner this URL was where to review the new one.  Four
+    # of the seven files are identical across those candidates, so the surface
+    # looked right.  Resolve the link here, and recreate the container, so the
+    # bytes served are the sealed artifact's own.
+    if [ -d "$FACTORY_REVIEW_ROOT" ]; then
+      FACTORY_REVIEW_ROOT="$(cd "$FACTORY_REVIEW_ROOT" && pwd -P)"
+    fi
     export FACTORY_REVIEW_ROOT
     case "${1:-up}" in
-      up) docker compose up -d review
-         echo "review surface: http://127.0.0.1:8787" ;;
+      up) docker compose up -d --force-recreate review
+         echo "review surface: http://127.0.0.1:8787 ($FACTORY_REVIEW_ROOT)" ;;
       down) exec docker compose down review ;;
       *) echo "usage: ./dev review {up|down}" >&2; exit 2 ;;
     esac

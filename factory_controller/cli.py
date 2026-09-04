@@ -556,9 +556,29 @@ def _release(args, store) -> int:
             transport = google_production.SimulatedFirebaseTransport()
         else:
             # The operator hands the token in; nothing here sources or keeps one.
+            # An absent or empty file is refused by name rather than raised:
+            # this read is outside the refusal handler below, so an unguarded
+            # OSError left the one command on the Phase-1 release path
+            # answering an operator with a traceback instead of a code, and
+            # wrote nothing to the ledger about why nothing happened.
             token_file = getattr(args, "deploy_token_file", None)
-            transport = google_production.FirebaseHostingRestTransport(
-                token=token_file.read_text().strip() if token_file else None)
+            token = None
+            if token_file is not None:
+                try:
+                    token = token_file.read_text().strip()
+                except OSError as error:
+                    token = None
+                    detail = "cannot be read: %s" % (error.strerror or error)
+                else:
+                    detail = "is empty" if not token else None
+                if not token:
+                    print(json.dumps({"refused": {
+                        "code": "DEPLOY_TOKEN_UNAVAILABLE",
+                        "detail": "the deploy token file %s %s; no deployment "
+                                  "was attempted" % (token_file, detail)}},
+                        sort_keys=True))
+                    return 1
+            transport = google_production.FirebaseHostingRestTransport(token=token)
         resolver = (lambda d: google_production.file_system_artifact_resolver(d, base_dirs=[artifact_dir])) if artifact_dir else None
         port = google_production.FirebaseHostingDeploymentAdapter({}, transport=transport, artifact_resolver=resolver, store=store)
     else:
@@ -605,8 +625,20 @@ def _release(args, store) -> int:
             return 1
     try:
         if args.action == "seal":
-            body = (sys.stdin.read() if str(args.rel_bundle) == "-"
-                    else args.rel_bundle.read_text())
+            # Guarded here rather than by widening the handler below: an
+            # OSError raised deeper in this block comes from the adapter or
+            # the store, and naming that RELEASE_ARGUMENTS_INVALID would be a
+            # false refusal, which is worse than an unhandled one.
+            try:
+                body = (sys.stdin.read() if str(args.rel_bundle) == "-"
+                        else args.rel_bundle.read_text())
+            except OSError as error:
+                print(json.dumps({"refused": {
+                    "code": "RELEASE_BUNDLE_UNREADABLE",
+                    "detail": "the release bundle %s cannot be read: %s"
+                              % (args.rel_bundle, error.strerror or error)}},
+                    sort_keys=True))
+                return 1
             bundle = production.ReleaseBundle.from_payload(json.loads(body))
             result = lifecycle.seal(
                 args.rc_id, bundle,
