@@ -74,6 +74,22 @@ class GoogleTargetConfig:
     custom_domain: str | None = None
     require_https: bool = True
     metadata: Mapping[str, Any] = field(default_factory=dict)
+    # Factory environment identity for receipts.  Platform site/channel below
+    # remain what Hosting actually serves; tests and the ledger key by these.
+    identity_site_id: str | None = None
+    identity_channel_id: str | None = None
+
+    @property
+    def record_site_id(self) -> str:
+        return self.identity_site_id or self.site_id
+
+    @property
+    def record_channel_id(self) -> str:
+        return self.identity_channel_id or self.channel_id
+
+    @property
+    def record_key(self) -> str:
+        return f"{self.record_site_id}:{self.record_channel_id}"
 
     def __post_init__(self) -> None:
         if self.plan.lower() != ZERO_COST_PLAN:
@@ -366,7 +382,7 @@ class SimulatedFirebaseTransport:
         if fault == "auth_failed":
             raise PermissionError("Firebase deployment token missing or invalid")
 
-        key = f"{config.site_id}:{config.channel_id}"
+        key = config.record_key
         site_releases = self.releases.setdefault(key, [])
         version_num = len(site_releases) + 1
         version_id = f"v{version_num:04d}"
@@ -376,8 +392,8 @@ class SimulatedFirebaseTransport:
             "version_id": version_id,
             "release_id": release_id,
             "artifact_digest": artifact_digest,
-            "site_id": config.site_id,
-            "channel_id": config.channel_id,
+            "site_id": config.record_site_id,
+            "channel_id": config.record_channel_id,
             "url": config.default_url,
             "files": {name: hashlib.sha256(data).hexdigest() for name, data in files.items()},
             "files_content": dict(files),
@@ -386,7 +402,10 @@ class SimulatedFirebaseTransport:
         }
         site_releases.append(record)
         self.operations[operation_key] = record
-        self._served_content[key] = dict(files)
+        payload = dict(files)
+        self._served_content[key] = payload
+        platform_key = f"{config.site_id}:{config.channel_id}"
+        self._served_content[platform_key] = payload
         return record
 
     def rollback_release(
@@ -401,7 +420,7 @@ class SimulatedFirebaseTransport:
         if fault == "uncertain":
             raise RuntimeError("uncertain: rollback state unconfirmed")
 
-        key = f"{config.site_id}:{config.channel_id}"
+        key = config.record_key
         site_releases = self.releases.get(key, [])
         matched = next((r for r in site_releases if r["version_id"] == target_version_id), None)
         if matched is None:
@@ -415,14 +434,16 @@ class SimulatedFirebaseTransport:
             "release_id": matched.get("release_id", f"rel_rollback_{target_version_id}"),
             "rollback_to": matched["version_id"],
             "artifact_digest": matched.get("artifact_digest"),
-            "site_id": config.site_id,
-            "channel_id": config.channel_id,
+            "site_id": config.record_site_id,
+            "channel_id": config.record_channel_id,
             "operation_key": operation_key,
             "rolled_back_at": time.time(),
         }
         self.operations[operation_key] = record
         if "files_content" in matched:
-            self._served_content[key] = dict(matched["files_content"])
+            payload = dict(matched["files_content"])
+            self._served_content[key] = payload
+            self._served_content[f"{config.site_id}:{config.channel_id}"] = payload
         return record
 
     def get_served_file(self, site_id: str, channel_id: str, path: str) -> bytes | None:
@@ -470,18 +491,21 @@ DEFAULT_TARGET_CONFIGS: Mapping[str, GoogleTargetConfig] = {
         site_id="lodus-casino-review",
         channel_id="live",
         plan=ZERO_COST_PLAN,
+        identity_channel_id="review",
     ),
     "lodus-casino-cloud-review": GoogleTargetConfig(
         project_id="astral-dogfood",
         site_id="lodus-casino-review",
         channel_id="live",
         plan=ZERO_COST_PLAN,
+        identity_channel_id="review",
     ),
     "lodus-casino-production": GoogleTargetConfig(
         project_id="astral-dogfood",
         site_id="lodus-casino",
         channel_id="live",
         plan=ZERO_COST_PLAN,
+        identity_site_id="lodus-casino-production",
     ),
 }
 
@@ -571,7 +595,7 @@ class FirebaseHostingDeploymentAdapter:
         except Exception as exc:
             outcome = production.DeploymentOutcome(
                 reached=False,
-                operation_ref=f"google-firebase:{target.site_id}:{target.channel_id}:rejected",
+                operation_ref=f"google-firebase:{target.record_site_id}:{target.record_channel_id}:rejected",
                 adapter=self.name,
                 detail=json.dumps({
                     "error": "ARTIFACT_RESOLVER_FAILED",
@@ -585,7 +609,7 @@ class FirebaseHostingDeploymentAdapter:
         if not files:
             outcome = production.DeploymentOutcome(
                 reached=False,
-                operation_ref=f"google-firebase:{target.site_id}:{target.channel_id}:rejected",
+                operation_ref=f"google-firebase:{target.record_site_id}:{target.record_channel_id}:rejected",
                 adapter=self.name,
                 detail=json.dumps({
                     "error": "EMPTY_OR_MISSING_ARTIFACT",
@@ -600,7 +624,7 @@ class FirebaseHostingDeploymentAdapter:
         if computed_digest != artifact_digest:
             outcome = production.DeploymentOutcome(
                 reached=False,
-                operation_ref=f"google-firebase:{target.site_id}:{target.channel_id}:rejected",
+                operation_ref=f"google-firebase:{target.record_site_id}:{target.record_channel_id}:rejected",
                 adapter=self.name,
                 detail=json.dumps({
                     "error": "ARTIFACT_DIGEST_MISMATCH",
@@ -617,7 +641,7 @@ class FirebaseHostingDeploymentAdapter:
             )
             version_id = receipt.get("version_id", "v1")
             release_id = receipt.get("release_id")
-            op_ref = f"google-firebase:{target.site_id}:{target.channel_id}:{version_id}"
+            op_ref = f"google-firebase:{target.record_site_id}:{target.record_channel_id}:{version_id}"
             detail = json.dumps({
                 "artifact_digest": artifact_digest,
                 "channel_id": target.channel_id,
@@ -634,7 +658,7 @@ class FirebaseHostingDeploymentAdapter:
                 adapter=self.name,
                 detail=detail,
             )
-            target_key = f"{target.site_id}:{target.channel_id}"
+            target_key = f"{target.record_site_id}:{target.record_channel_id}"
             self._target_history.setdefault(target_key, []).append({
                 "version_id": version_id,
                 "release_id": release_id,
@@ -646,14 +670,14 @@ class FirebaseHostingDeploymentAdapter:
         except (TimeoutError, ConnectionError) as exc:
             outcome = production.DeploymentOutcome(
                 reached=None,
-                operation_ref=f"google-firebase:{target.site_id}:{target.channel_id}:uncertain",
+                operation_ref=f"google-firebase:{target.record_site_id}:{target.record_channel_id}:uncertain",
                 adapter=self.name,
                 detail=json.dumps({"uncertain": str(exc), "operation_key": operation_key}, sort_keys=True),
             )
         except ZeroCostViolation as exc:
             outcome = production.DeploymentOutcome(
                 reached=False,
-                operation_ref=f"google-firebase:{target.site_id}:{target.channel_id}:refused",
+                operation_ref=f"google-firebase:{target.record_site_id}:{target.record_channel_id}:refused",
                 adapter=self.name,
                 detail=json.dumps({"refusal": exc.code, "detail": exc.detail}, sort_keys=True),
             )
@@ -661,14 +685,14 @@ class FirebaseHostingDeploymentAdapter:
             if "uncertain" in str(exc).lower():
                 outcome = production.DeploymentOutcome(
                     reached=None,
-                    operation_ref=f"google-firebase:{target.site_id}:{target.channel_id}:uncertain",
+                    operation_ref=f"google-firebase:{target.record_site_id}:{target.record_channel_id}:uncertain",
                     adapter=self.name,
                     detail=json.dumps({"uncertain": str(exc)}, sort_keys=True),
                 )
             else:
                 outcome = production.DeploymentOutcome(
                     reached=False,
-                    operation_ref=f"google-firebase:{target.site_id}:{target.channel_id}:failed",
+                    operation_ref=f"google-firebase:{target.record_site_id}:{target.record_channel_id}:failed",
                     adapter=self.name,
                     detail=json.dumps({"failed": str(exc)}, sort_keys=True),
                 )
@@ -697,7 +721,7 @@ class FirebaseHostingDeploymentAdapter:
         if self._store is None:
             return None
         deployment_id = operation_key.split(":")[0]
-        prefix = f"google-firebase:{target.site_id}:{target.channel_id}:"
+        prefix = f"google-firebase:{target.record_site_id}:{target.record_channel_id}:"
         try:
             with self._store.transaction() as db:
                 row = db.execute(
@@ -744,7 +768,7 @@ class FirebaseHostingDeploymentAdapter:
 
         target = self._resolve_target(environment)
         attempted_digest = self._extract_artifact_digest(bundle)
-        target_key = f"{target.site_id}:{target.channel_id}"
+        target_key = f"{target.record_site_id}:{target.record_channel_id}"
 
         # Requirement 5: Real rollback identity, chosen by the ledger.
         #
@@ -771,7 +795,7 @@ class FirebaseHostingDeploymentAdapter:
         if not prior_records:
             outcome = production.DeploymentOutcome(
                 reached=False,
-                operation_ref=f"google-firebase-rollback:{target.site_id}:{target.channel_id}:rejected",
+                operation_ref=f"google-firebase-rollback:{target.record_site_id}:{target.record_channel_id}:rejected",
                 adapter=self.name,
                 detail=json.dumps({
                     "error": "NO_PREVIOUS_VERSION_FOR_ROLLBACK",
@@ -792,7 +816,7 @@ class FirebaseHostingDeploymentAdapter:
             restored_version_id = receipt.get("version_id", target_version_id)
             restored_release_id = receipt.get("release_id") or target_version_record.get("release_id")
             restored_artifact_digest = target_version_record.get("artifact_digest")
-            op_ref = f"google-firebase-rollback:{target.site_id}:{target.channel_id}:{restored_version_id}"
+            op_ref = f"google-firebase-rollback:{target.record_site_id}:{target.record_channel_id}:{restored_version_id}"
             detail = json.dumps({
                 "action": "rollback",
                 "attempted_artifact_digest": attempted_digest,
@@ -817,7 +841,7 @@ class FirebaseHostingDeploymentAdapter:
         except (TimeoutError, ConnectionError) as exc:
             outcome = production.DeploymentOutcome(
                 reached=None,
-                operation_ref=f"google-firebase-rollback:{target.site_id}:{target.channel_id}:uncertain",
+                operation_ref=f"google-firebase-rollback:{target.record_site_id}:{target.record_channel_id}:uncertain",
                 adapter=self.name,
                 detail=json.dumps({"uncertain": str(exc), "operation_key": operation_key}, sort_keys=True),
             )
@@ -825,14 +849,14 @@ class FirebaseHostingDeploymentAdapter:
             if "uncertain" in str(exc).lower():
                 outcome = production.DeploymentOutcome(
                     reached=None,
-                    operation_ref=f"google-firebase-rollback:{target.site_id}:{target.channel_id}:uncertain",
+                    operation_ref=f"google-firebase-rollback:{target.record_site_id}:{target.record_channel_id}:uncertain",
                     adapter=self.name,
                     detail=json.dumps({"uncertain": str(exc)}, sort_keys=True),
                 )
             else:
                 outcome = production.DeploymentOutcome(
                     reached=False,
-                    operation_ref=f"google-firebase-rollback:{target.site_id}:{target.channel_id}:failed",
+                    operation_ref=f"google-firebase-rollback:{target.record_site_id}:{target.record_channel_id}:failed",
                     adapter=self.name,
                     detail=json.dumps({"failed": str(exc)}, sort_keys=True),
                 )

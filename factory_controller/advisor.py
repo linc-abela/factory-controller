@@ -336,6 +336,29 @@ class StaticAdvisor:
             return None
         return self.responses.pop(0) if len(self.responses) > 1 else self.responses[0]
 
+    def judge(self, snapshot: dict[str, Any]) -> dict[str, Any]:
+        body = self.advise(snapshot)
+        if not isinstance(body, dict):
+            raise ValueError("ADVISOR_MALFORMED_RESPONSE")
+        reasoning = body.get("reasoning")
+        if not isinstance(reasoning, str) or not reasoning.strip():
+            raise ValueError("ADVISOR_REASONING_ABSENT")
+        if "proposals" not in body:
+            raise ValueError("ADVISOR_PROPOSALS_ABSENT")
+        return body
+
+    def observed_identity(self, body: Mapping[str, Any] | None = None) -> dict[str, Any]:
+        reported = (body or {}).get("observed_identity") if isinstance(body, Mapping) else None
+        observed = reported if isinstance(reported, dict) else {}
+        return {
+            "requested_profile": "scripted-advisor",
+            "requested_effort": "recorded",
+            "observed_profile": observed.get("profile", "scripted-advisor"),
+            "observed_effort": observed.get("effort", "recorded"),
+            "present": True,
+            "credential_held": False,
+        }
+
 
 def endpoint_advisor(base_url: str | None = None, *, token: str | None = None):
     """Build the HTTP advisory adapter without naming its vendor at the call site.
@@ -403,6 +426,41 @@ class HermesAdvisor:
         if self.token is None:
             raise PermissionError("ADVISOR_CREDENTIAL_ABSENT")
         return self._post(self.ORCHESTRATION_PATH, request)
+
+    def judge(self, snapshot: dict[str, Any]) -> dict[str, Any]:
+        """Ask for a management judgment.  Presence/status is not this method.
+
+        The body must carry a non-empty ``reasoning`` string plus ``proposals``.
+        Probe-shaped answers (version, gateway_running, HTTP status) are
+        refused here so a later plane cannot treat liveness as judgment.
+        """
+
+        if self.token is None:
+            raise PermissionError("ADVISOR_CREDENTIAL_ABSENT")
+        body = self._post(self.ORCHESTRATION_PATH, {"kind": "manage", "snapshot": snapshot})
+        if not isinstance(body, dict):
+            raise ValueError("ADVISOR_MALFORMED_RESPONSE")
+        reasoning = body.get("reasoning")
+        if not isinstance(reasoning, str) or not reasoning.strip():
+            raise ValueError("ADVISOR_REASONING_ABSENT")
+        if "proposals" not in body:
+            raise ValueError("ADVISOR_PROPOSALS_ABSENT")
+        return body
+
+    def observed_identity(self, body: Mapping[str, Any] | None = None) -> dict[str, Any]:
+        """What this adapter can honestly say about who answered."""
+
+        probe = self.probe()
+        reported = (body or {}).get("observed_identity") if isinstance(body, Mapping) else None
+        observed = reported if isinstance(reported, dict) else {}
+        return {
+            "requested_profile": "advisory-endpoint",
+            "requested_effort": "unknown",
+            "observed_profile": observed.get("profile", probe.get("version") or "unknown"),
+            "observed_effort": observed.get("effort", "unknown"),
+            "present": probe.get("present"),
+            "credential_held": probe.get("credential_held"),
+        }
 
     def _headers(self) -> dict[str, str]:
         headers = {"Accept": "application/json"}

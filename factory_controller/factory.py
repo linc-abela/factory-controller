@@ -35,6 +35,7 @@ from . import dogfood
 from . import dogfood_improvement
 from . import dogfood_intake
 from . import improvement
+from . import management
 from . import pcp
 from . import portfolio
 from . import product
@@ -2757,6 +2758,16 @@ class FactoryLifecycle:
                 "Start the surface with './dev review up' if it is not already "
                 "running.")
 
+    def _management_summary(self) -> tuple[tuple[str, ...], dict[str, Any]]:
+        """Owner-visible management/reconciliation state.  Vendor-neutral."""
+
+        try:
+            plane = management.ManagementPlane(self.store, clock=self.clock)
+            reading = plane.status()
+        except Exception:  # noqa: BLE001
+            reading = {"degraded": "status_unreadable"}
+        return management.status_lines(reading), reading
+
     def _work_summary(self) -> tuple[tuple[str, ...], str]:
         """What the Owner needs to know about work, with no internal ids.
 
@@ -2885,9 +2896,12 @@ class FactoryLifecycle:
         shift_summary = "Active" if live is not None else "Off"
         supervisor_summary = "Running" if supervisor_loaded else "Stopped"
         work, work_state = self._product_summary() or self._work_summary()
+        management_lines, management_reading = self._management_summary()
         status_attention = self._status_attention(
             doctor, live=live, bridge_healthy=bridge_healthy, primary=primary)
         if status_attention:
+            work_state = "attention"
+        if management_reading.get("owner_attention_need"):
             work_state = "attention"
         return FactoryResult(
             action="status", ok=True, state=state,
@@ -2897,9 +2911,11 @@ class FactoryLifecycle:
                    "Bridge: " + bridge_summary,
                    "Primary: " + primary)
             + status_attention
-            + work,
+            + work
+            + management_lines,
             details={"control": control, "grant": None if live is None else live.as_row(),
-                     "bridge": doctor, "work_state": work_state},
+                     "bridge": doctor, "work_state": work_state,
+                     "management": management_reading},
         )
 
     def watch(self, interval_seconds: float = DEFAULT_WATCH_INTERVAL_SECONDS,

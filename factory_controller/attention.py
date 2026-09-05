@@ -13,7 +13,7 @@ Key invariants:
 2. Zero-cost macOS-visible sink: uses native osascript notification banners without
    requiring external services or paid infrastructure.
 3. Pluggable channel seam: supports extensible channels (macOS notification, local
-   durable file, recording sink for tests/simulation, and external webhook/email stubs).
+   durable file, recording sink for tests/simulation, and external HTTP/email stubs).
 4. Deterministic deduplication and rate limiting: prevents supervisor cycle flapping from
    spamming the Owner. Repeated unresolved events for the same blocker are coalesced;
    changed, resolved, and reopened states are tracked predictably.
@@ -366,7 +366,7 @@ class CompositeAttentionSink:
 
 
 class ExternalChannelStub:
-    """Pluggable channel seam for later email / app / webhook delivery."""
+    """Pluggable channel seam for later email / app / HTTP-callback delivery."""
 
     def __init__(self, endpoint_label: str = "stub_external",
                  channel_name: str = "external_stub") -> None:

@@ -26,6 +26,7 @@ from . import shift_runtime
 from . import supervisor as sup
 from . import work_intake as intake
 from . import work_source as wsrc
+from . import management as mgmt
 from .adapter import JsonProcessAdapter
 from .engine import Controller, RetryPolicy
 from .store import MissionStore
@@ -295,6 +296,24 @@ def parser() -> argparse.ArgumentParser:
     wi.add_argument("--state", dest="wi_state", choices=intake.ITEM_STATES)
     wi.add_argument("--no-execute", dest="wi_execute", action="store_false",
                     help="admit only; leave execution to supervisor cycle")
+
+    manage = sub.add_parser(
+        "manage",
+        help="one unattended management cycle over scheduled Factory-maintenance work")
+    manage.add_argument("action", choices=("cycle", "status", "export"))
+    manage.add_argument("--source-dir", dest="mg_source_dir",
+                        help="scheduled inbox of work_packet.v1 files plus authority.json")
+    manage.add_argument("--worker", dest="mg_worker", default="manager")
+    manage.add_argument("--proposals", dest="mg_proposals", type=Path,
+                        help="a recorded manager judgment to replay")
+    manage.add_argument("--priors", dest="mg_priors", type=Path,
+                        help="JSON map of profile -> conservative bootstrap prior")
+    manage.add_argument("--no-execute", dest="mg_execute", action="store_false")
+    manage.add_argument("--endpoint", dest="mg_endpoint")
+    manage.add_argument("--token", dest="mg_token",
+                        help="advisory-endpoint session argument; never stored")
+    manage.add_argument("--lease-seconds", type=float, dest="mg_lease",
+                        default=mgmt.DEFAULT_CYCLE_LEASE_SECONDS)
 
     dog = sub.add_parser("dogfood")
     dog.add_argument("action", choices=("contract", "preflight", "gate",
@@ -689,6 +708,7 @@ def _release(args, store) -> int:
                                 break
                     new_state = ledger.record_health(result["deployment_id"], probe_health)
                     result["state"] = new_state
+                    result["receipt"] = ledger.receipt(result["deployment_id"])
             else:
                 result = lifecycle.deploy_review(
                     args.rc_id, ledger, port,
@@ -720,6 +740,7 @@ def _release(args, store) -> int:
                                 break
                     new_state = ledger.record_health(result["deployment_id"], probe_health)
                     result["state"] = new_state
+                    result["receipt"] = ledger.receipt(result["deployment_id"])
             else:
                 result = lifecycle.promote_validated(
                     args.rc_id, args.validation_id, ledger, port,
@@ -789,6 +810,33 @@ def _work_intake(args, controller) -> int:
         detail = getattr(exc, "detail", str(exc))
         print(json.dumps({"refused": {"code": code, "detail": detail}},
                          sort_keys=True))
+        return 2
+    print(json.dumps(result, sort_keys=True, default=str))
+    return 0
+
+
+def _manage(args, controller) -> int:
+    plane = mgmt.ManagementPlane(controller.store)
+    try:
+        if args.action == "status":
+            result = plane.status()
+        elif args.action == "export":
+            result = list(plane.export_records())
+        else:
+            if not args.mg_source_dir:
+                raise mgmt.ManagementRefusal(
+                    "MANAGEMENT_SOURCE_MISSING", "cycle requires --source-dir")
+            if args.mg_proposals:
+                port = advisory.StaticAdvisor(json.loads(args.mg_proposals.read_text()))
+            else:
+                port = advisory.endpoint_advisor(args.mg_endpoint, token=args.mg_token)
+            priors = json.loads(args.mg_priors.read_text()) if args.mg_priors else {}
+            result = plane.cycle(
+                args.mg_worker, source_dir=args.mg_source_dir,
+                controller=controller, manager=port, priors=priors,
+                lease_seconds=args.mg_lease, execute=args.mg_execute)
+    except mgmt.ManagementRefusal as refusal:
+        print(json.dumps({"refused": refusal.as_row()}, sort_keys=True))
         return 2
     print(json.dumps(result, sort_keys=True, default=str))
     return 0
@@ -1603,6 +1651,8 @@ def main(argv: list[str] | None = None) -> int:
         return _release(args, store)
     elif args.command == "work-intake":
         return _work_intake(args, controller)
+    elif args.command == "manage":
+        return _manage(args, controller)
     elif args.command == "maintenance":
         return _maintenance(args, controller)
     elif args.command == "improvement":

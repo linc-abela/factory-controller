@@ -193,6 +193,8 @@ class DirectoryWorkSource:
                 raise PacketError(
                     "WORK_PACKET_NOT_JSON",
                     "%s: %s" % (path.name, exc)) from exc
+            if raw.get("schema_version") == "factory.controller.intake_authority.v1":
+                continue
             loaded.append(load_packet(
                 raw, source_kind=self.source_kind, source_ref=path.name))
         loaded.sort(key=lambda packet: (packet.sequence, packet.work_item_id))
