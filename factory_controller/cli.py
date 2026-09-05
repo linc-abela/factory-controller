@@ -300,18 +300,27 @@ def parser() -> argparse.ArgumentParser:
     manage = sub.add_parser(
         "manage",
         help="one unattended management cycle over scheduled Factory-maintenance work")
-    manage.add_argument("action", choices=("cycle", "status", "export"))
+    manage.add_argument("action", choices=("cycle", "status", "export", "register-source"))
     manage.add_argument("--source-dir", dest="mg_source_dir",
                         help="scheduled inbox of work_packet.v1 files plus authority.json")
     manage.add_argument("--worker", dest="mg_worker", default="manager")
     manage.add_argument("--proposals", dest="mg_proposals", type=Path,
                         help="a recorded manager judgment to replay")
+    manage.add_argument("--manager-cmd", dest="mg_manager_cmd",
+                        help="governed manager argv; stdin JSON snapshot, stdout judgment")
+    manage.add_argument("--manager-profile", dest="mg_manager_profile",
+                        default="advisory-process")
+    manage.add_argument("--manager-effort", dest="mg_manager_effort", default="unknown")
+    manage.add_argument("--manager-provider", dest="mg_manager_provider")
+    manage.add_argument("--manager-model", dest="mg_manager_model")
     manage.add_argument("--priors", dest="mg_priors", type=Path,
                         help="JSON map of profile -> conservative bootstrap prior")
+    manage.add_argument("--fleet-json", dest="mg_fleet", type=Path,
+                        help="JSON map of profile -> governed fleet observation")
     manage.add_argument("--no-execute", dest="mg_execute", action="store_false")
     manage.add_argument("--endpoint", dest="mg_endpoint")
     manage.add_argument("--token", dest="mg_token",
-                        help="advisory-endpoint session argument; never stored")
+                        help="advisory-endpoint session argument; refused on cycle")
     manage.add_argument("--lease-seconds", type=float, dest="mg_lease",
                         default=mgmt.DEFAULT_CYCLE_LEASE_SECONDS)
 
@@ -822,14 +831,41 @@ def _manage(args, controller) -> int:
             result = plane.status()
         elif args.action == "export":
             result = list(plane.export_records())
+        elif args.action == "register-source":
+            if not args.mg_source_dir:
+                raise mgmt.ManagementRefusal(
+                    "MANAGEMENT_SOURCE_MISSING", "register-source requires --source-dir")
+            result = plane.register_source_manifest(args.mg_source_dir)
         else:
             if not args.mg_source_dir:
                 raise mgmt.ManagementRefusal(
                     "MANAGEMENT_SOURCE_MISSING", "cycle requires --source-dir")
+            if args.mg_token:
+                raise mgmt.ManagementRefusal(
+                    "MANAGEMENT_TOKEN_ARGUMENT_REFUSED",
+                    "scheduled manage cycle must not take --token; "
+                    "use the protected runtime session resolver")
             if args.mg_proposals:
                 port = advisory.StaticAdvisor(json.loads(args.mg_proposals.read_text()))
             else:
-                port = advisory.endpoint_advisor(args.mg_endpoint, token=args.mg_token)
+                command = shlex.split(args.mg_manager_cmd) if args.mg_manager_cmd else None
+                port = advisory.scheduled_manager(
+                    command=command,
+                    requested_profile=args.mg_manager_profile,
+                    requested_effort=args.mg_manager_effort,
+                    provider=args.mg_manager_provider,
+                    model=args.mg_manager_model)
+            if args.mg_fleet:
+                fleet = json.loads(args.mg_fleet.read_text())
+                if not isinstance(fleet, dict):
+                    raise mgmt.ManagementRefusal(
+                        "MANAGEMENT_FLEET_INVALID", "fleet-json must be an object")
+                for profile, observation in fleet.items():
+                    if not isinstance(profile, str) or not isinstance(observation, dict):
+                        raise mgmt.ManagementRefusal(
+                            "MANAGEMENT_FLEET_INVALID",
+                            "fleet-json values must be observation objects")
+                    plane.record_fleet_observation(profile, observation)
             priors = json.loads(args.mg_priors.read_text()) if args.mg_priors else {}
             result = plane.cycle(
                 args.mg_worker, source_dir=args.mg_source_dir,

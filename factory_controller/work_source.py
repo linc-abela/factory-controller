@@ -28,6 +28,7 @@ refuses to submit it.
 from __future__ import annotations
 
 import json
+import os
 from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any, Mapping, Protocol, Sequence
@@ -42,6 +43,7 @@ AUTHORITY_NAME = "authority.json"
 MAX_PACKET_BYTES = 64_000
 MAX_SOURCE_FILES = 64
 MAX_SOURCE_BYTES = 512_000
+MAX_AUTHORITY_BYTES = 16_000
 
 #: Reproduced from ``store`` / ``routing``; stated locally so a fork is a
 #: failing test rather than a silent drift.
@@ -179,14 +181,32 @@ def _required_str(raw: Mapping[str, Any], name: str, source_ref: str) -> str:
 def load_authority(root: str | Path) -> dict[str, Any]:
     """A directory adapter may not invent its own source identity."""
 
-    path = Path(root) / AUTHORITY_NAME
+    root_path = Path(root)
+    if root_path.is_symlink():
+        raise PacketError("WORK_SOURCE_SYMLINK_REFUSED", str(root_path))
+    path = root_path / AUTHORITY_NAME
     if not path.is_file():
         raise PacketError(
             "MANAGEMENT_SOURCE_UNAUTHORIZED",
             "scheduled intake requires %s" % AUTHORITY_NAME)
+    flags = os.O_RDONLY
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
     try:
-        raw = json.loads(path.read_text())
-    except json.JSONDecodeError as exc:
+        fd = os.open(path, flags)
+    except OSError as exc:
+        raise PacketError("MANAGEMENT_SOURCE_UNAUTHORIZED", str(exc)) from exc
+    try:
+        data = os.read(fd, MAX_AUTHORITY_BYTES + 1)
+    finally:
+        os.close(fd)
+    if len(data) > MAX_AUTHORITY_BYTES:
+        raise PacketError(
+            "MANAGEMENT_AUTHORITY_TOO_LARGE",
+            "%s exceeds %s bytes" % (AUTHORITY_NAME, MAX_AUTHORITY_BYTES))
+    try:
+        raw = json.loads(data.decode("utf-8"))
+    except (json.JSONDecodeError, UnicodeDecodeError) as exc:
         raise PacketError("MANAGEMENT_AUTHORITY_NOT_JSON", str(exc)) from exc
     if not isinstance(raw, dict):
         raise PacketError("MANAGEMENT_AUTHORITY_NOT_JSON", str(path))
@@ -234,6 +254,8 @@ class DirectoryWorkSource:
         self.source_kind = source_kind
 
     def packets(self) -> tuple[WorkPacket, ...]:
+        if self.root.is_symlink():
+            raise PacketError("WORK_SOURCE_SYMLINK_REFUSED", str(self.root))
         if not self.root.is_dir():
             raise PacketError(
                 "WORK_SOURCE_DIRECTORY_MISSING",

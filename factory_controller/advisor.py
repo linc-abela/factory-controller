@@ -21,6 +21,8 @@ from __future__ import annotations
 
 import dataclasses
 import json
+import shutil
+import subprocess
 import urllib.error
 import urllib.request
 from dataclasses import dataclass, field
@@ -421,6 +423,214 @@ def endpoint_advisor(base_url: str | None = None, *, token: str | None = None):
     """
 
     return HermesAdvisor(base_url or DEFAULT_ENDPOINT, token=token)
+
+
+def scheduled_manager(*, command: Sequence[str] | None = None,
+                      requested_profile: str = "advisory-process",
+                      requested_effort: str = "unknown",
+                      provider: str | None = None,
+                      model: str | None = None) -> "ManagerLike":
+    """Prefer a governed argv. HTTP session is not the scheduled path."""
+
+    if command:
+        return ProcessAdvisor(
+            command, requested_profile=requested_profile,
+            requested_effort=requested_effort)
+    executable = shutil.which("hermes")
+    if executable:
+        return HermesProcessAdvisor(
+            executable, requested_profile=requested_profile,
+            requested_effort=requested_effort, provider=provider, model=model)
+    return BlockedAdvisor(requested_profile, requested_effort)
+
+
+class ManagerLike(Protocol):
+    def judge(self, snapshot: dict[str, Any]) -> dict[str, Any]: ...
+    def observed_identity(self, body: Mapping[str, Any] | None = None) -> dict[str, Any]: ...
+
+
+class BlockedAdvisor:
+    """No governed manager process is installed. Judgment is absent."""
+
+    def __init__(self, requested_profile: str, requested_effort: str) -> None:
+        self.requested_profile = requested_profile
+        self.requested_effort = requested_effort
+
+    def judge(self, snapshot: dict[str, Any]) -> dict[str, Any]:
+        raise PermissionError("ADVISOR_MODEL_ABSENT")
+
+    def observed_identity(self, body: Mapping[str, Any] | None = None) -> dict[str, Any]:
+        return {
+            "requested_profile": self.requested_profile,
+            "requested_effort": self.requested_effort,
+            "observed_profile": "unknown",
+            "observed_effort": "unknown",
+            "present": False,
+            "credential_held": False,
+            "process_started": False,
+        }
+
+
+class ProcessAdvisor:
+    """Judgment through a Factory-owned argv. Response identity is ignored."""
+
+    def __init__(self, command: Sequence[str], *, requested_profile: str,
+                 requested_effort: str = "recorded", timeout: float = 300.0) -> None:
+        if not command or not all(isinstance(item, str) and item for item in command):
+            raise ValueError("manager command is a non-empty argument array")
+        self.command = tuple(command)
+        self.requested_profile = requested_profile
+        self.requested_effort = requested_effort
+        self.timeout = timeout
+        self._receipt: dict[str, Any] = {
+            "process_started": False,
+            "returncode": None,
+            "observed_executable": command[0],
+        }
+
+    def judge(self, snapshot: dict[str, Any]) -> dict[str, Any]:
+        payload = json.dumps({"snapshot": snapshot}, default=str)
+        try:
+            completed = subprocess.run(
+                self.command, input=payload, text=True, capture_output=True,
+                timeout=self.timeout, check=False)
+        except (OSError, subprocess.TimeoutExpired) as exc:
+            self._receipt = {
+                "process_started": False,
+                "returncode": None,
+                "observed_executable": self.command[0],
+                "error": type(exc).__name__,
+            }
+            raise PermissionError("ADVISOR_MODEL_ABSENT") from exc
+        self._receipt = {
+            "process_started": True,
+            "returncode": completed.returncode,
+            "observed_executable": self.command[0],
+        }
+        if completed.returncode != 0:
+            raise PermissionError("ADVISOR_MODEL_ABSENT")
+        try:
+            body = json.loads(completed.stdout)
+        except json.JSONDecodeError as exc:
+            raise ValueError("ADVISOR_MALFORMED_RESPONSE") from exc
+        if not isinstance(body, dict):
+            raise ValueError("ADVISOR_MALFORMED_RESPONSE")
+        reasoning = body.get("reasoning")
+        if not isinstance(reasoning, str) or not reasoning.strip():
+            raise ValueError("ADVISOR_REASONING_ABSENT")
+        if "proposals" not in body:
+            raise ValueError("ADVISOR_PROPOSALS_ABSENT")
+        return {"reasoning": reasoning.strip(), "proposals": body["proposals"]}
+
+    def observed_identity(self, body: Mapping[str, Any] | None = None) -> dict[str, Any]:
+        started = bool(self._receipt.get("process_started"))
+        code = self._receipt.get("returncode")
+        executable = self._receipt.get("observed_executable") or self.command[0]
+        return {
+            "requested_profile": self.requested_profile,
+            "requested_effort": self.requested_effort,
+            "observed_profile": executable if started and code == 0 else "unknown",
+            "observed_effort": "unknown",
+            "observed_executable": executable,
+            "process_started": started,
+            "present": started,
+            "credential_held": False,
+        }
+
+
+class HermesProcessAdvisor:
+    """Hermes 0.21 as an external process. No HTTP facade, no argv token."""
+
+    def __init__(self, executable: str, *, requested_profile: str,
+                 requested_effort: str = "unknown", provider: str | None = None,
+                 model: str | None = None, timeout: float = 120.0) -> None:
+        self.executable = executable
+        self.requested_profile = requested_profile
+        self.requested_effort = requested_effort
+        self.provider = provider
+        self.model = model
+        self.timeout = timeout
+        self._receipt: dict[str, Any] = {
+            "process_started": False,
+            "returncode": None,
+            "observed_executable": executable,
+        }
+
+    def judge(self, snapshot: dict[str, Any]) -> dict[str, Any]:
+        prompt = (
+            "Return only JSON with keys reasoning (string) and proposals (array). "
+            "Do not approve production, widen budgets, or invent gates.\n"
+            + json.dumps(snapshot, default=str)[:8000]
+        )
+        command = [self.executable, "chat", "-Q", "-q", prompt, "--cli", "--safe-mode"]
+        if isinstance(self.provider, str) and self.provider.strip():
+            command.extend(["--provider", self.provider.strip()])
+        if isinstance(self.model, str) and self.model.strip():
+            command.extend(["-m", self.model.strip()])
+        try:
+            completed = subprocess.run(
+                command, text=True, capture_output=True,
+                timeout=self.timeout, check=False)
+        except (OSError, subprocess.TimeoutExpired) as exc:
+            self._receipt = {
+                "process_started": False,
+                "returncode": None,
+                "observed_executable": self.executable,
+                "error": type(exc).__name__,
+            }
+            raise PermissionError("ADVISOR_MODEL_ABSENT") from exc
+        self._receipt = {
+            "process_started": True,
+            "returncode": completed.returncode,
+            "observed_executable": self.executable,
+            "argv_provider": self.provider,
+            "argv_model": self.model,
+        }
+        if completed.returncode != 0:
+            raise PermissionError("ADVISOR_MODEL_ABSENT")
+        text = (completed.stdout or "").strip()
+        body = _first_json_object(text)
+        if body is None:
+            if not text:
+                raise ValueError("ADVISOR_REASONING_ABSENT")
+            return {"reasoning": text, "proposals": []}
+        reasoning = body.get("reasoning")
+        if not isinstance(reasoning, str) or not reasoning.strip():
+            reasoning = text
+        if not isinstance(reasoning, str) or not reasoning.strip():
+            raise ValueError("ADVISOR_REASONING_ABSENT")
+        proposals = body.get("proposals")
+        if not isinstance(proposals, list):
+            proposals = []
+        return {"reasoning": reasoning.strip(), "proposals": proposals}
+
+    def observed_identity(self, body: Mapping[str, Any] | None = None) -> dict[str, Any]:
+        started = bool(self._receipt.get("process_started"))
+        code = self._receipt.get("returncode")
+        return {
+            "requested_profile": self.requested_profile,
+            "requested_effort": self.requested_effort,
+            "observed_profile": self.executable if started and code == 0 else "unknown",
+            "observed_effort": "unknown",
+            "observed_executable": self.executable,
+            "process_started": started,
+            "present": started,
+            "credential_held": False,
+            "argv_provider": self._receipt.get("argv_provider"),
+            "argv_model": self._receipt.get("argv_model"),
+        }
+
+
+def _first_json_object(text: str) -> dict[str, Any] | None:
+    start = text.find("{")
+    end = text.rfind("}")
+    if start < 0 or end <= start:
+        return None
+    try:
+        raw = json.loads(text[start:end + 1])
+    except json.JSONDecodeError:
+        return None
+    return raw if isinstance(raw, dict) else None
 
 
 class HermesAdvisor:
