@@ -480,7 +480,9 @@ class WorkIntakePlane:
             identity_changed = (
                 existing["payload_hash"] != digest
                 or existing["lineage_id"] != packet.lineage_id
-                or int(existing["sequence"]) != packet.sequence)
+                or int(existing["sequence"]) != packet.sequence
+                or existing["source_kind"] != packet.source_kind
+                or existing["source_ref"] != packet.source_ref)
             if identity_changed:
                 raise WorkIntakeRefusal(
                     "WORK_INTAKE_PACKET_IMMUTABLE",
@@ -515,12 +517,10 @@ class WorkIntakePlane:
                 blocked_reason = "not_applicable"
                 kind = "RESUMED"
             db.execute(
-                "UPDATE work_items SET source_kind=?,"
-                " source_ref=?, owner_only=?,"
+                "UPDATE work_items SET owner_only=?,"
                 " owner_reason=?, state=?, blocked_reason=?, updated_at=?"
                 " WHERE work_item_id=?",
-                (packet.source_kind,
-                 packet.source_ref, int(packet.owner_only),
+                (int(packet.owner_only),
                  packet.owner_reason, nxt,
                  blocked_reason, now, packet.work_item_id))
             if kind and nxt != current["state"]:
