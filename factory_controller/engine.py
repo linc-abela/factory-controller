@@ -755,10 +755,12 @@ class Controller:
     # ------------------------------------------------------------------ #
 
     def work_once(self, worker_id: str, *, resume_only: bool = False,
-                  project_ids: tuple[str, ...] | None = None) -> dict[str, Any] | None:
+                  project_ids: tuple[str, ...] | None = None,
+                  mission_id: str | None = None) -> dict[str, Any] | None:
         self.store.recover_stale()
         mission = self.store.claim(worker_id, lease_seconds=self.lease_seconds,
-                                   resume_only=resume_only, project_ids=project_ids)
+                                   resume_only=resume_only, project_ids=project_ids,
+                                   mission_id=mission_id)
         if mission is None:
             return None
         mission_id, token = mission["id"], mission["lease_token"]

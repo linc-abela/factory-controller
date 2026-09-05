@@ -26,8 +26,8 @@ from .store import canonical_json, payload_hash
 
 CONTRACT_VERSION = "factory-controller/management/1.0"
 EXPORT_SCHEMA = "factory.controller.management_record.v1"
-AUTHORITY_SCHEMA = "factory.controller.intake_authority.v1"
-AUTHORITY_NAME = "authority.json"
+AUTHORITY_SCHEMA = work_source.AUTHORITY_SCHEMA
+AUTHORITY_NAME = work_source.AUTHORITY_NAME
 
 BOOTSTRAP_PRIOR_VERSION = "phase-2-agent-capability-mapping/2026-09-05"
 
@@ -45,6 +45,7 @@ CREATE TABLE IF NOT EXISTS management_cycles (
   sequence INTEGER NOT NULL UNIQUE,
   previous_cycle_id TEXT,
   worker_id TEXT NOT NULL,
+  lease_token TEXT,
   lease_expires_at REAL NOT NULL,
   started_at REAL NOT NULL,
   ended_at REAL,
@@ -105,32 +106,10 @@ class ManagerPort(Protocol):
 def load_authority(root: str | Path) -> dict[str, Any]:
     """A scheduled inbox must carry an Owner-granted stamp, not a prompt."""
 
-    path = Path(root) / AUTHORITY_NAME
-    if not path.is_file():
-        raise ManagementRefusal(
-            "MANAGEMENT_SOURCE_UNAUTHORIZED",
-            "scheduled intake requires %s" % AUTHORITY_NAME)
     try:
-        raw = json.loads(path.read_text())
-    except json.JSONDecodeError as exc:
-        raise ManagementRefusal("MANAGEMENT_AUTHORITY_NOT_JSON", str(exc)) from exc
-    if raw.get("schema_version") != AUTHORITY_SCHEMA:
-        raise ManagementRefusal(
-            "MANAGEMENT_AUTHORITY_UNSUPPORTED",
-            "authority carries %r" % (raw.get("schema_version"),))
-    if raw.get("prompt") is True:
-        raise ManagementRefusal(
-            "MANAGEMENT_OWNER_PROMPT_POPULATED",
-            "authority admits a prompt populated this inbox")
-    if raw.get("granted_by") != "owner_policy":
-        raise ManagementRefusal(
-            "MANAGEMENT_AUTHORITY_UNSIGNED",
-            "authority is not owner_policy-granted")
-    if raw.get("source") != "scheduled_inbox":
-        raise ManagementRefusal(
-            "MANAGEMENT_SOURCE_NOT_SCHEDULED",
-            "authority source is %r" % (raw.get("source"),))
-    return raw
+        return work_source.load_authority(root)
+    except work_source.PacketError as exc:
+        raise ManagementRefusal(exc.code, exc.detail) from exc
 
 
 def inherit_envelope(parent: Mapping[str, Any], child: Mapping[str, Any]) -> dict[str, Any]:
@@ -242,6 +221,7 @@ class CycleReport:
     record_id: str | None = None
     owner_attention: dict[str, Any] | None = None
     degraded: str = "none"
+    lease_token: str | None = None
 
     def as_row(self) -> dict[str, Any]:
         return {
@@ -287,6 +267,11 @@ class ManagementPlane:
         self.clock = clock or store.clock
         with store.transaction() as db:
             db.executescript(SCHEMA)
+            columns = {row[1] for row in db.execute(
+                "PRAGMA table_info(management_cycles)")}
+            if "lease_token" not in columns:
+                db.execute(
+                    "ALTER TABLE management_cycles ADD COLUMN lease_token TEXT")
 
     def state_version(self) -> str:
         with self._store.transaction() as db:
@@ -346,7 +331,7 @@ class ManagementPlane:
         report = CycleReport(
             cycle_id=claim["cycle_id"], sequence=claim["sequence"],
             outcome="completed", started_at=claim["started_at"],
-            ended_at=claim["started_at"])
+            ended_at=claim["started_at"], lease_token=claim.get("lease_token"))
         try:
             authority = load_authority(source_dir)
             source = work_source.DirectoryWorkSource(
@@ -358,14 +343,27 @@ class ManagementPlane:
             try:
                 judgment = manager.judge(snapshot)
             except PermissionError as exc:
+                missing = str(exc).startswith("ADVISOR_") and str(exc).endswith("ABSENT")
+                attention = None
+                if missing:
+                    report.reason = "EXTERNAL_OWNER_AUTH_REQUIRED"
+                    report.next_action = "OWNER_AUTH"
+                    attention = {
+                        "code": "EXTERNAL_OWNER_AUTH_REQUIRED",
+                        "action": "sign in to the local advisory HTTP surface once; do not paste a secret into a task page or Git",
+                    }
+                    report.owner_attention = attention
+                else:
+                    report.reason = "MANAGER_UNAVAILABLE"
+                    report.next_action = "WAIT_MANAGER"
                 report.outcome = "idle"
-                report.reason = "MANAGER_UNAVAILABLE"
                 report.degraded = "manager_unavailable"
-                report.next_action = "WAIT_MANAGER"
                 self._recover_authorized(intake, controller, execute)
                 return self._close(report, snapshot=snapshot, judgment={
                     "error": str(exc)}, eligibility={}, selection={},
-                    receipt={}, reconciliation={"state": "manager_unavailable"})
+                    receipt={}, reconciliation={
+                        "state": "owner_auth_required" if missing else "manager_unavailable"},
+                    attention=attention)
             except (ValueError, OSError) as exc:
                 report.outcome = "idle"
                 report.reason = "MANAGER_JUDGMENT_UNUSABLE"
@@ -460,9 +458,9 @@ class ManagementPlane:
                 "dispatch_state": "authorized",
             }
             reconciliation = {"state": "admitted", "next_action": "DISPATCH"}
-            if execute:
-                mission = controller.work_once(worker_id)
-                if mission is None:
+            if execute and mission_id:
+                mission = controller.work_once(worker_id, mission_id=mission_id)
+                if mission is None or mission.get("id") != mission_id:
                     receipt["dispatch_state"] = "uncertain"
                     reconciliation = {"state": "uncertain",
                                       "detail": "dispatch timeout or missing mission"}
@@ -652,11 +650,16 @@ class ManagementPlane:
     def _finish(self, report: CycleReport, extra: Mapping[str, Any] | None = None) -> dict[str, Any]:
         report.ended_at = self.clock()
         with self._store.transaction() as db:
-            db.execute(
+            changed = db.execute(
                 "UPDATE management_cycles SET ended_at=?, outcome=?, detail_json=?"
-                " WHERE cycle_id=?",
+                " WHERE cycle_id=? AND lease_token=? AND ended_at IS NULL",
                 (report.ended_at, report.outcome, canonical_json(report.as_row()),
-                 report.cycle_id))
+                 report.cycle_id, report.lease_token)).rowcount
+            if changed != 1:
+                report.outcome = "uncertain"
+                report.reason = "MANAGEMENT_STALE_CYCLE"
+                report.degraded = "uncertain_dispatch"
+                report.next_action = "RECONCILE_UNCERTAIN"
         row = report.as_row()
         if extra:
             row.update(extra)
@@ -724,15 +727,17 @@ class ManagementPlane:
                 "previous": previous_id or "none", "sequence": sequence,
                 "worker_id": worker_id, "started_at": now,
             })[:24]
+            lease_token = str(uuid.uuid4())
             db.execute(
                 "INSERT INTO management_cycles (cycle_id, sequence,"
-                " previous_cycle_id, worker_id, lease_expires_at, started_at)"
-                " VALUES (?,?,?,?,?,?)",
-                (cycle_id, sequence, previous_id, worker_id,
+                " previous_cycle_id, worker_id, lease_token, lease_expires_at,"
+                " started_at) VALUES (?,?,?,?,?,?,?)",
+                (cycle_id, sequence, previous_id, worker_id, lease_token,
                  now + lease_seconds, now))
             recovered = [] if previous is None else []
             return {"cycle_id": cycle_id, "sequence": sequence,
-                    "started_at": now, "recovered": recovered}
+                    "started_at": now, "recovered": recovered,
+                    "lease_token": lease_token}
 
 
 def _observed_executor(mission: Mapping[str, Any], store=None) -> str:

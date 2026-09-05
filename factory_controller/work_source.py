@@ -28,7 +28,7 @@ refuses to submit it.
 from __future__ import annotations
 
 import json
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any, Mapping, Protocol, Sequence
 
@@ -37,6 +37,11 @@ from .store import canonical_json, payload_hash
 
 CONTRACT_VERSION = "factory-controller/work-source/1.0"
 PACKET_SCHEMA = "factory.controller.work_packet.v1"
+AUTHORITY_SCHEMA = "factory.controller.intake_authority.v1"
+AUTHORITY_NAME = "authority.json"
+MAX_PACKET_BYTES = 64_000
+MAX_SOURCE_FILES = 64
+MAX_SOURCE_BYTES = 512_000
 
 #: Reproduced from ``store`` / ``routing``; stated locally so a fork is a
 #: failing test rather than a silent drift.
@@ -77,6 +82,8 @@ class WorkPacket:
     owner_reason: str
     blocked: bool
     payload: dict[str, Any]
+    source_revision: str = "unknown"
+    authority_digest: str = "unknown"
 
     def as_row(self) -> dict[str, Any]:
         return {"work_item_id": self.work_item_id, "lineage_id": self.lineage_id,
@@ -85,6 +92,8 @@ class WorkPacket:
                 "owner_reason": self.owner_reason, "blocked": self.blocked,
                 "payload": dict(self.payload),
                 "payload_hash": payload_hash(self.payload),
+                "source_revision": self.source_revision,
+                "authority_digest": self.authority_digest,
                 "contract_version": CONTRACT_VERSION}
 
     def digest(self) -> str:
@@ -167,6 +176,52 @@ def _required_str(raw: Mapping[str, Any], name: str, source_ref: str) -> str:
     return value
 
 
+def load_authority(root: str | Path) -> dict[str, Any]:
+    """A directory adapter may not invent its own source identity."""
+
+    path = Path(root) / AUTHORITY_NAME
+    if not path.is_file():
+        raise PacketError(
+            "MANAGEMENT_SOURCE_UNAUTHORIZED",
+            "scheduled intake requires %s" % AUTHORITY_NAME)
+    try:
+        raw = json.loads(path.read_text())
+    except json.JSONDecodeError as exc:
+        raise PacketError("MANAGEMENT_AUTHORITY_NOT_JSON", str(exc)) from exc
+    if not isinstance(raw, dict):
+        raise PacketError("MANAGEMENT_AUTHORITY_NOT_JSON", str(path))
+    if raw.get("schema_version") != AUTHORITY_SCHEMA:
+        raise PacketError(
+            "MANAGEMENT_AUTHORITY_UNSUPPORTED",
+            "authority carries %r" % (raw.get("schema_version"),))
+    if raw.get("prompt") is True:
+        raise PacketError(
+            "MANAGEMENT_OWNER_PROMPT_POPULATED",
+            "authority admits a prompt populated this inbox")
+    if raw.get("granted_by") != "owner_policy":
+        raise PacketError(
+            "MANAGEMENT_AUTHORITY_UNSIGNED",
+            "authority is not owner_policy-granted")
+    if raw.get("source") != "scheduled_inbox":
+        raise PacketError(
+            "MANAGEMENT_SOURCE_NOT_SCHEDULED",
+            "authority source is %r" % (raw.get("source"),))
+    revision = raw.get("source_revision")
+    if not isinstance(revision, str) or not revision.strip():
+        raise PacketError(
+            "MANAGEMENT_SOURCE_REVISION_MISSING",
+            "%s has no source_revision" % AUTHORITY_NAME)
+    stamped = dict(raw)
+    stamped["authority_digest"] = payload_hash({
+        "schema_version": raw.get("schema_version"),
+        "granted_by": raw.get("granted_by"),
+        "source": raw.get("source"),
+        "prompt": raw.get("prompt"),
+        "source_revision": revision,
+    })
+    return stamped
+
+
 class DirectoryWorkSource:
     """JSON files in one directory, sorted by sequence then identity.
 
@@ -183,20 +238,53 @@ class DirectoryWorkSource:
             raise PacketError(
                 "WORK_SOURCE_DIRECTORY_MISSING",
                 str(self.root))
+        authority = load_authority(self.root)
         loaded: list[WorkPacket] = []
+        seen: set[str] = set()
+        file_count = 0
+        total_bytes = 0
         for path in sorted(self.root.iterdir()):
-            if path.suffix != ".json" or not path.is_file():
+            if path.suffix != ".json":
                 continue
+            if path.is_symlink() or not path.is_file():
+                raise PacketError(
+                    "WORK_SOURCE_SYMLINK_REFUSED",
+                    path.name)
+            size = path.stat().st_size
+            file_count += 1
+            total_bytes += size
+            if file_count > MAX_SOURCE_FILES:
+                raise PacketError(
+                    "WORK_SOURCE_FILE_BUDGET",
+                    "more than %s JSON files" % MAX_SOURCE_FILES)
+            if size > MAX_PACKET_BYTES:
+                raise PacketError(
+                    "WORK_SOURCE_PACKET_TOO_LARGE",
+                    path.name)
+            if total_bytes > MAX_SOURCE_BYTES:
+                raise PacketError(
+                    "WORK_SOURCE_BYTE_BUDGET",
+                    "source exceeds %s bytes" % MAX_SOURCE_BYTES)
             try:
                 raw = json.loads(path.read_text())
             except json.JSONDecodeError as exc:
                 raise PacketError(
                     "WORK_PACKET_NOT_JSON",
                     "%s: %s" % (path.name, exc)) from exc
-            if raw.get("schema_version") == "factory.controller.intake_authority.v1":
+            if raw.get("schema_version") == AUTHORITY_SCHEMA:
                 continue
-            loaded.append(load_packet(
-                raw, source_kind=self.source_kind, source_ref=path.name))
+            packet = load_packet(
+                raw, source_kind=self.source_kind, source_ref=path.name)
+            packet = replace(
+                packet,
+                source_revision=authority["source_revision"],
+                authority_digest=authority["authority_digest"])
+            if packet.work_item_id in seen:
+                raise PacketError(
+                    "WORK_SOURCE_DUPLICATE_IDENTITY",
+                    packet.work_item_id)
+            seen.add(packet.work_item_id)
+            loaded.append(packet)
         loaded.sort(key=lambda packet: (packet.sequence, packet.work_item_id))
         return tuple(loaded)
 

@@ -182,12 +182,12 @@ additionally:
 
 ### Reconciliation with factory-bridge
 
-Read against `factory-bridge` `c9787d5`. The bridge selects from its own
-priority-ordered registry, and `BridgeRequest` carries no field naming a
-requested profile, so the Controller cannot steer the choice -- it enforces the
-Owner's allow/deny list against the profile that actually ran
-(`PROVIDER_POLICY_VIOLATION`). Receipt field names are the bridge's own:
-`provider_profile`, `provider`, `selection_trace`.
+Read against `factory-bridge` `48dbd88878a450fb84485af82ae3d9691ff267cd`
+(provider-registry v4). The bridge selects from its own priority-ordered
+registry. The Controller records requested executor identity separately from
+observed execution identity and never fills a missing `provider_profile` from
+the selection. Receipt field names are the bridge's own: `provider_profile`,
+`provider`, `selection_trace`.
 
 Two drifts are held by `tests/test_bridge_reconciliation.py` rather than
 described in a document:

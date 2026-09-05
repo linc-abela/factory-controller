@@ -1,0 +1,7 @@
+{
+  "schema_version": "factory.controller.intake_authority.v1",
+  "granted_by": "owner_policy",
+  "source": "scheduled_inbox",
+  "prompt": false,
+  "source_revision": "work-exchange:SF-196"
+}

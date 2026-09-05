@@ -8,7 +8,11 @@ and none at all, come out in the same order.
 
 from __future__ import annotations
 
+import json
+import tempfile
 import unittest
+from pathlib import Path
+from unittest.mock import patch
 
 from factory_controller import advisor, portfolio
 from tests.support import PortfolioTestCase
@@ -244,13 +248,61 @@ class LiveEndpointTests(unittest.TestCase):
         self.assertEqual(result["reason"], "ADVISOR_ENDPOINT_UNREACHABLE")
 
     def test_consulting_without_a_credential_fails_closed(self):
-        port = advisor.endpoint_advisor()
-        outcome = advisor.consult(port, {}, policy(), advisor.Facts())
+        with tempfile.TemporaryDirectory() as tmp:
+            with patch.object(advisor.Path, "home", return_value=Path(tmp)):
+                port = advisor.endpoint_advisor()
+                outcome = advisor.consult(port, {}, policy(), advisor.Facts())
         self.assertEqual(outcome.status, "unavailable")
         self.assertEqual(outcome.detail["detail"], "ADVISOR_CREDENTIAL_ABSENT")
 
     def test_the_probe_never_returns_a_credential(self):
-        self.assertNotIn("token", advisor.endpoint_advisor(token=None).probe())
+        with tempfile.TemporaryDirectory() as tmp:
+            with patch.object(advisor.Path, "home", return_value=Path(tmp)):
+                self.assertNotIn("token", advisor.endpoint_advisor(token=None).probe())
+
+
+class SessionGrantTests(unittest.TestCase):
+    def _home(self, body):
+        root = Path(tempfile.mkdtemp())
+        store = root / ".hermes"
+        store.mkdir()
+        (store / "auth.json").write_text(json.dumps(body))
+        return root
+
+    def test_a_provider_model_key_is_not_an_http_session(self):
+        home = self._home({
+            "providers": {},
+            "pool": {"lmstudio": [{"auth_type": "api_key", "source": "env"}]},
+        })
+        with patch.object(advisor.Path, "home", return_value=home):
+            self.assertIsNone(advisor.runtime_session())
+
+    def test_a_local_http_session_grant_is_used(self):
+        home = self._home({
+            "providers": {
+                "local": {
+                    "auth_type": "session",
+                    "base_url": "http://127.0.0.1:9119",
+                    "session": "fixture-session",
+                }
+            }
+        })
+        with patch.object(advisor.Path, "home", return_value=home):
+            self.assertEqual(advisor.runtime_session(), "fixture-session")
+            self.assertIsNotNone(advisor.HermesAdvisor().token)
+
+    def test_an_explicit_session_wins_over_the_store(self):
+        home = self._home({
+            "providers": {
+                "local": {
+                    "auth_type": "session",
+                    "base_url": "http://127.0.0.1:9119",
+                    "session": "stored-session",
+                }
+            }
+        })
+        with patch.object(advisor.Path, "home", return_value=home):
+            self.assertEqual(advisor.runtime_session("cli-session"), "cli-session")
 
 
 if __name__ == "__main__":

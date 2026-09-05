@@ -24,6 +24,7 @@ import json
 import urllib.error
 import urllib.request
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Any, Mapping, Protocol, Sequence
 
 from . import portfolio
@@ -360,6 +361,57 @@ class StaticAdvisor:
         }
 
 
+def runtime_session(explicit: str | None = None) -> str | None:
+    """Use an operator-supplied session, or a local HTTP-session grant if present.
+
+    Provider model keys in the same store are not an advisory HTTP session and
+    are never returned.  The value is not written to durable Controller state.
+    """
+
+    if isinstance(explicit, str) and explicit.strip():
+        return explicit.strip()
+    path = Path.home() / ".hermes" / "auth.json"
+    if not path.is_file():
+        return None
+    try:
+        raw = json.loads(path.read_text())
+    except (OSError, json.JSONDecodeError, UnicodeDecodeError):
+        return None
+    if not isinstance(raw, dict):
+        return None
+    providers = raw.get("providers")
+    if isinstance(providers, dict):
+        for body in providers.values():
+            found = _http_session_grant(body)
+            if found:
+                return found
+    pool = raw.get("credential_pool")
+    if isinstance(pool, dict):
+        for entries in pool.values():
+            if not isinstance(entries, list):
+                continue
+            for body in entries:
+                found = _http_session_grant(body)
+                if found:
+                    return found
+    return None
+
+
+def _http_session_grant(body: Any) -> str | None:
+    if not isinstance(body, dict):
+        return None
+    if body.get("auth_type") not in ("session", "http_session"):
+        return None
+    base = body.get("base_url")
+    if not isinstance(base, str) or (
+            "127.0.0.1:9119" not in base and "localhost:9119" not in base):
+        return None
+    secret = body.get("session")
+    if isinstance(secret, str) and secret.strip():
+        return secret.strip()
+    return None
+
+
 def endpoint_advisor(base_url: str | None = None, *, token: str | None = None):
     """Build the HTTP advisory adapter without naming its vendor at the call site.
 
@@ -403,7 +455,7 @@ class HermesAdvisor:
     def __init__(self, base_url: str = "http://127.0.0.1:9119", *, token: str | None = None,
                  timeout: float = 5.0, opener=urllib.request.urlopen) -> None:
         self.base_url = base_url.rstrip("/")
-        self.token = token
+        self.token = runtime_session(token)
         self.timeout = timeout
         self.opener = opener
 

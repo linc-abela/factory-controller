@@ -102,6 +102,7 @@ CREATE TABLE IF NOT EXISTS work_intake_cycles (
   sequence INTEGER NOT NULL UNIQUE,
   previous_cycle_id TEXT,
   worker_id TEXT NOT NULL,
+  lease_token TEXT,
   lease_expires_at REAL NOT NULL,
   started_at REAL NOT NULL,
   ended_at REAL,
@@ -159,6 +160,7 @@ class CycleReport:
     owner_required: list[dict[str, Any]] = field(default_factory=list)
     next_action: str = "not_applicable"
     recovered: list[dict[str, Any]] = field(default_factory=list)
+    lease_token: str | None = None
 
     def as_row(self) -> dict[str, Any]:
         return {"cycle_id": self.cycle_id, "sequence": self.sequence,
@@ -180,12 +182,25 @@ class WorkIntakePlane:
         self.clock = clock or store.clock
         with store.transaction() as db:
             db.executescript(SCHEMA)
+            columns = {row[1] for row in db.execute(
+                "PRAGMA table_info(work_intake_cycles)")}
+            if "lease_token" not in columns:
+                db.execute(
+                    "ALTER TABLE work_intake_cycles ADD COLUMN lease_token TEXT")
 
     def observe(self, source: WorkSource) -> tuple[dict[str, Any], ...]:
         """Fold packets into the ledger without claiming or submitting."""
 
+        packets = tuple(source.packets())
+        seen: set[str] = set()
+        for packet in packets:
+            if packet.work_item_id in seen:
+                raise WorkIntakeRefusal(
+                    "WORK_INTAKE_DUPLICATE_IDENTITY",
+                    packet.work_item_id, work_item_id=packet.work_item_id)
+            seen.add(packet.work_item_id)
         changed: list[dict[str, Any]] = []
-        for packet in source.packets():
+        for packet in packets:
             changed.append(self._upsert(packet))
         return tuple(item for item in changed if item.get("changed"))
 
@@ -359,7 +374,8 @@ class WorkIntakePlane:
         report = CycleReport(
             cycle_id=claim["cycle_id"], sequence=claim["sequence"],
             outcome="completed", started_at=claim["started_at"],
-            ended_at=claim["started_at"], recovered=claim["recovered"])
+            ended_at=claim["started_at"], recovered=claim["recovered"],
+            lease_token=claim["lease_token"])
         try:
             if controller is None:
                 raise WorkIntakeRefusal(
@@ -399,9 +415,12 @@ class WorkIntakePlane:
                 return self._close_cycle(report)
             self.admit(claimed["work_item_id"], controller)
             report.admitted = claimed["work_item_id"]
-            if execute:
-                mission = controller.work_once(worker_id)
-                if mission is not None:
+            bound = self.item(claimed["work_item_id"]) or {}
+            bound_mission = bound.get("mission_ref")
+            if execute and bound_mission:
+                mission = controller.work_once(
+                    worker_id, mission_id=bound_mission)
+                if mission is not None and mission["id"] == bound_mission:
                     report.advanced.append({
                         "mission_id": mission["id"],
                         "state": mission["state"],
@@ -458,12 +477,15 @@ class WorkIntakePlane:
                 parsed["changed"] = True
                 return parsed
             current = self._row(existing)
-            if (existing["payload_hash"] != digest
-                    and existing["state"] in {"admitted", "in_progress", "done"}):
+            identity_changed = (
+                existing["payload_hash"] != digest
+                or existing["lineage_id"] != packet.lineage_id
+                or int(existing["sequence"]) != packet.sequence)
+            if identity_changed:
                 raise WorkIntakeRefusal(
-                    "WORK_INTAKE_PACKET_CHANGED",
-                    "item %s is %s and cannot change payload"
-                    % (packet.work_item_id, existing["state"]),
+                    "WORK_INTAKE_PACKET_IMMUTABLE",
+                    "item %s identity is frozen after observation"
+                    % packet.work_item_id,
                     work_item_id=packet.work_item_id)
             nxt = current["state"]
             blocked_reason = current["blocked_reason"]
@@ -493,13 +515,13 @@ class WorkIntakePlane:
                 blocked_reason = "not_applicable"
                 kind = "RESUMED"
             db.execute(
-                "UPDATE work_items SET lineage_id=?, sequence=?, source_kind=?,"
-                " source_ref=?, payload_hash=?, payload_json=?, owner_only=?,"
+                "UPDATE work_items SET source_kind=?,"
+                " source_ref=?, owner_only=?,"
                 " owner_reason=?, state=?, blocked_reason=?, updated_at=?"
                 " WHERE work_item_id=?",
-                (packet.lineage_id, packet.sequence, packet.source_kind,
-                 packet.source_ref, digest, canonical_json(packet.payload),
-                 int(packet.owner_only), packet.owner_reason, nxt,
+                (packet.source_kind,
+                 packet.source_ref, int(packet.owner_only),
+                 packet.owner_reason, nxt,
                  blocked_reason, now, packet.work_item_id))
             if kind and nxt != current["state"]:
                 self._event(db, packet.work_item_id, kind, current["state"], nxt,
@@ -612,14 +634,16 @@ class WorkIntakePlane:
             previous = None if last is None else last["cycle_id"]
             sequence = 1 if last is None else int(last["sequence"]) + 1
             cycle_id = cycle_reference(previous, sequence, worker_id, now)
+            lease_token = str(uuid.uuid4())
             db.execute(
                 "INSERT INTO work_intake_cycles (cycle_id, sequence,"
-                " previous_cycle_id, worker_id, lease_expires_at, started_at)"
-                " VALUES (?,?,?,?,?,?)",
-                (cycle_id, sequence, previous, worker_id,
+                " previous_cycle_id, worker_id, lease_token, lease_expires_at,"
+                " started_at) VALUES (?,?,?,?,?,?,?)",
+                (cycle_id, sequence, previous, worker_id, lease_token,
                  now + lease_seconds, now))
         return {"cycle_id": cycle_id, "sequence": sequence,
-                "started_at": now, "recovered": recovered}
+                "started_at": now, "recovered": recovered,
+                "lease_token": lease_token}
 
     def _close_cycle(self, report: CycleReport, *, outcome: str | None = None,
                      reason: str | None = None) -> dict[str, Any]:
@@ -629,11 +653,17 @@ class WorkIntakePlane:
             report.reason = reason
         report.ended_at = self.clock()
         with self._store.transaction() as db:
-            db.execute(
+            changed = db.execute(
                 "UPDATE work_intake_cycles SET ended_at=?, outcome=?,"
-                " detail_json=? WHERE cycle_id=?",
+                " detail_json=? WHERE cycle_id=? AND lease_token=?"
+                " AND ended_at IS NULL",
                 (report.ended_at, report.outcome,
-                 canonical_json(report.as_row()), report.cycle_id))
+                 canonical_json(report.as_row()), report.cycle_id,
+                 report.lease_token)).rowcount
+            if changed != 1:
+                report.outcome = "uncertain"
+                report.reason = "WORK_INTAKE_STALE_CYCLE"
+                report.next_action = "RECONCILE_UNCERTAIN"
         return report.as_row()
 
     def _event(self, db, work_item_id: str, kind: str, old: str | None,

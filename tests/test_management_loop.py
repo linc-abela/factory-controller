@@ -167,8 +167,9 @@ class LoopTests(Case):
                         "observed_effort": "unknown"}
 
         report = self.cycle(manager=Down())
-        self.assertEqual(report["reason"], "MANAGER_UNAVAILABLE")
-        self.assertEqual(report["next_action"], "WAIT_MANAGER")
+        self.assertEqual(report["reason"], "EXTERNAL_OWNER_AUTH_REQUIRED")
+        self.assertEqual(report["next_action"], "OWNER_AUTH")
+        self.assertEqual(report["owner_attention"]["code"], "EXTERNAL_OWNER_AUTH_REQUIRED")
         self.assertEqual(self.store.counts().get("completed", 0), 0)
 
     def test_a_stale_judgment_is_refused_before_dispatch(self):

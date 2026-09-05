@@ -56,6 +56,16 @@ def packet(**kwargs):
                        source_ref="memory")
 
 
+def write_authority(root, revision="work-exchange:test"):
+    (Path(root) / "authority.json").write_text(json.dumps({
+        "schema_version": work_source.AUTHORITY_SCHEMA,
+        "granted_by": "owner_policy",
+        "source": "scheduled_inbox",
+        "prompt": False,
+        "source_revision": revision,
+    }))
+
+
 class MemorySource:
     def __init__(self, items):
         self.items = list(items)
@@ -135,6 +145,7 @@ class PacketTests(unittest.TestCase):
 
     def test_a_directory_lists_packets_in_sequence_order(self):
         root = Path(tempfile.mkdtemp())
+        write_authority(root)
         later = packet_body("factory-maintenance:B", sequence=2)
         earlier = packet_body("factory-maintenance:A", sequence=1)
         (root / "z.json").write_text(json.dumps(later))
@@ -142,6 +153,23 @@ class PacketTests(unittest.TestCase):
         loaded = DirectoryWorkSource(root).packets()
         self.assertEqual([item.work_item_id for item in loaded],
                          ["factory-maintenance:A", "factory-maintenance:B"])
+        self.assertEqual(loaded[0].source_revision, "work-exchange:test")
+
+    def test_a_directory_without_authority_is_refused(self):
+        root = Path(tempfile.mkdtemp())
+        (root / "a.json").write_text(json.dumps(packet_body()))
+        with self.assertRaises(work_source.PacketError) as raised:
+            DirectoryWorkSource(root).packets()
+        self.assertEqual(raised.exception.code, "MANAGEMENT_SOURCE_UNAUTHORIZED")
+
+    def test_duplicate_identities_in_one_directory_are_refused(self):
+        root = Path(tempfile.mkdtemp())
+        write_authority(root)
+        (root / "a.json").write_text(json.dumps(packet_body()))
+        (root / "b.json").write_text(json.dumps(packet_body()))
+        with self.assertRaises(work_source.PacketError) as raised:
+            DirectoryWorkSource(root).packets()
+        self.assertEqual(raised.exception.code, "WORK_SOURCE_DUPLICATE_IDENTITY")
 
 
 class AdmissionTests(IntakeCase):
@@ -335,6 +363,53 @@ class CliTests(unittest.TestCase):
         self.assertEqual(report["admitted"], WORK_ITEM)
         code, item = self.run_cli("work-intake", "status", WORK_ITEM)
         self.assertEqual(item["state"], "done")
+
+
+class IntegrityTests(IntakeCase):
+    def test_duplicate_identities_in_one_snapshot_are_refused(self):
+        with self.assertRaises(work_intake.WorkIntakeRefusal) as raised:
+            self.plane.observe(MemorySource([packet(), packet()]))
+        self.assertEqual(raised.exception.code, "WORK_INTAKE_DUPLICATE_IDENTITY")
+
+    def test_observed_payload_identity_is_immutable(self):
+        self.ingest(packet())
+        changed = packet_body()
+        changed["payload"]["priority"] = 9
+        with self.assertRaises(work_intake.WorkIntakeRefusal) as raised:
+            self.plane.observe(MemorySource([load_packet(
+                changed, source_kind="memory", source_ref="later")]))
+        self.assertEqual(raised.exception.code, "WORK_INTAKE_PACKET_IMMUTABLE")
+
+    def test_a_stale_cycle_close_cannot_rewrite_a_recovered_cycle(self):
+        claim = self.plane._claim_cycle("a", 1)
+        self.clock.advance(2)
+        recovered = self.plane._claim_cycle("b", 30)
+        stale = work_intake.CycleReport(
+            cycle_id=claim["cycle_id"], sequence=claim["sequence"],
+            outcome="completed", started_at=claim["started_at"],
+            ended_at=claim["started_at"], lease_token=claim["lease_token"])
+        row = self.plane._close_cycle(stale)
+        self.assertEqual(row["reason"], "WORK_INTAKE_STALE_CYCLE")
+        with self.store.transaction() as db:
+            first = db.execute(
+                "SELECT outcome FROM work_intake_cycles WHERE cycle_id=?",
+                (claim["cycle_id"],)).fetchone()
+        self.assertEqual(first["outcome"], "idle")
+        self.assertEqual(recovered["cycle_id"] != claim["cycle_id"], True)
+
+    def test_cycle_execution_is_bound_to_the_claimed_item(self):
+        old, _ = self.controller.submit(
+            {"work_item_id": "old", "project_id": PROJECT,
+             "execution_mode": "fixture", "acceptance_gate_ids": GATES,
+             "provider_candidates": CANDIDATES}, "old-key")
+        self.ingest(packet())
+        report = self.plane.cycle("worker", controller=self.controller)
+        self.assertEqual(report["admitted"], WORK_ITEM)
+        advanced = report["advanced"]
+        self.assertEqual(len(advanced), 1)
+        self.assertEqual(advanced[0]["work_item_id"], WORK_ITEM)
+        self.assertNotEqual(advanced[0]["mission_id"], old["id"])
+        self.assertEqual(self.store.get(old["id"])["state"], "admitted")
 
 
 if __name__ == "__main__":

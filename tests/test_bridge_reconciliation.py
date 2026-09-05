@@ -1,10 +1,9 @@
 """Reconciliation against the landed `factory-bridge` multi-provider surface.
 
-Read against `factory-bridge` `c9787d5ce3c8605099d245204d53533aa155c720`
-(SF-135A, 144 tests green on this host, re-run from that checkout rather than
-quoted).  Two sides implemented the same rule independently -- fall back only
-before a provider process can have spawned -- and the reconciliation is about
-what survives the wire between them.
+Read against `factory-bridge` `48dbd88878a450fb84485af82ae3d9691ff267cd`
+(provider-registry v4).  Two sides implemented the same rule independently --
+fall back only before a provider process can have spawned -- and the
+reconciliation is about what survives the wire between them.
 
 Two drifts are recorded here as executable checks rather than as prose:
 
@@ -39,9 +38,10 @@ from factory_controller import routing
 from tests.support import ALPHA, BETA, LayerAdapter, RouteTestCase, mission_payload
 
 
-#: Verified at c9787d5: `protocol.REFUSALS` keys the Controller reasons about.
+#: Verified at factory-bridge 48dbd88878a450fb84485af82ae3d9691ff267cd.
 #: Reproduced, not imported -- the bridge is a separate repository with no
 #: dependency edge in either direction, which is the point of the boundary.
+BRIDGE_HEAD = "48dbd88878a450fb84485af82ae3d9691ff267cd"
 BRIDGE_REFUSALS_CONSUMED = (
     "ADAPTER_UNAVAILABLE",
     "IDEMPOTENCY_CONFLICT",
@@ -106,6 +106,7 @@ class RD1AdapterUnavailableTests(RouteTestCase, unittest.TestCase):
         self.assertEqual(store.route_history(mission["id"])["fallback_count"], 1)
 
     def test_the_refusal_codes_the_controller_reasons_about_are_the_bridges(self):
+        self.assertEqual(BRIDGE_HEAD, "48dbd88878a450fb84485af82ae3d9691ff267cd")
         self.assertIn("ADAPTER_UNAVAILABLE", BRIDGE_REFUSALS_CONSUMED)
         self.assertNotIn(routing.PROVIDER_UNAVAILABLE, BRIDGE_REFUSALS_CONSUMED)
 
@@ -184,7 +185,7 @@ class OwnerPolicyBindsTheLayersChoiceTests(RouteTestCase, unittest.TestCase):
         self.assertEqual(route["selected_provider_profile"], BETA)
         self.assertEqual(route["legs"][0]["selection_reason"], "first_admissible")
 
-    def test_a_layer_that_names_no_profile_falls_back_to_the_requested_one(self):
+    def test_a_layer_that_names_no_profile_is_not_filled_from_the_request(self):
         class Silent(LayerAdapter):
             def _dispatch(self, operation_key, value):
                 response = super()._dispatch(operation_key, value)
@@ -194,7 +195,9 @@ class OwnerPolicyBindsTheLayersChoiceTests(RouteTestCase, unittest.TestCase):
         controller, store, _ = self.build(Silent())
         mission, _ = controller.submit(mission_payload(), "policy:4")
         controller.work_once("w1")
-        self.assertEqual(store.route_history(mission["id"])["selected_provider_profile"], ALPHA)
+        route = store.route_history(mission["id"])
+        self.assertIsNone(route["selected_provider_profile"])
+        self.assertIsNone(route["legs"][0]["provider_profile"])
 
 
 if __name__ == "__main__":

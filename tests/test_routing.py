@@ -159,6 +159,11 @@ class ReceiptTests(unittest.TestCase):
         self.assertFalse(receipt.side_effect_possible)
         self.assertEqual(receipt.usage.cost_state, "not_applicable")
 
+    def test_a_missing_provider_profile_is_not_filled_from_selection(self):
+        receipt = self._receipt()
+        self.assertIsNone(receipt.provider_profile)
+        self.assertEqual(receipt.requested_profile, "p")
+
 
 class BudgetTests(unittest.TestCase):
     POLICY = ExecutionPolicy(budget_ceiling=10.0, budget_currency="USD")

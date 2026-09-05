@@ -265,6 +265,7 @@ class Receipt:
     execution_mode: str
     idempotency_key: str | None
     usage: Usage = field(default_factory=lambda: UNKNOWN_USAGE)
+    requested_profile: str | None = None
     #: Facts a model gateway reported about this leg, or ``None`` when no
     #: gateway served it.  A plain dict rather than a type, so this module stays
     #: free of the seam that names one; ``gateway.facts_from_response`` builds
@@ -296,8 +297,10 @@ def receipt_from_response(response: dict[str, Any], selection: Selection,
     started = raw.get("process_started")
     mode = raw.get("execution_mode", response.get("execution_mode"))
     trace = raw.get("selection_trace")
+    observed = _optional_string(raw.get("provider_profile"))
+    requested = selection.profile if isinstance(selection.profile, str) else None
     return Receipt(
-        provider_profile=_optional_string(raw.get("provider_profile")) or selection.profile,
+        provider_profile=observed,
         provider=_optional_string(raw.get("provider")),
         selection_reason=selection.reason,
         fallback_chain=tuple(fallback_chain),
@@ -311,6 +314,7 @@ def receipt_from_response(response: dict[str, Any], selection: Selection,
         idempotency_key=_optional_string(raw.get("idempotency_key")
                                          or response.get("idempotency_key")),
         usage=usage_from_response(raw.get("usage")),
+        requested_profile=requested,
     )
 
 
@@ -323,7 +327,7 @@ def unserved_receipt(selection: Selection, fallback_chain: Sequence[str],
     """
 
     return Receipt(
-        provider_profile=selection.profile,
+        provider_profile=None,
         provider=None,
         selection_reason=selection.reason,
         fallback_chain=tuple(fallback_chain),
@@ -335,6 +339,7 @@ def unserved_receipt(selection: Selection, fallback_chain: Sequence[str],
         execution_mode="not_applicable" if refusal_code else "unknown",
         idempotency_key=None,
         usage=Usage(cost_state="not_applicable"),
+        requested_profile=selection.profile if isinstance(selection.profile, str) else None,
     )
 
 

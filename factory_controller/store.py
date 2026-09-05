@@ -557,7 +557,8 @@ class MissionStore:
 
     def claim(self, worker_id: str, *, lease_seconds: float = 30,
               resume_only: bool = False,
-              project_ids: tuple[str, ...] | None = None) -> dict[str, Any] | None:
+              project_ids: tuple[str, ...] | None = None,
+              mission_id: str | None = None) -> dict[str, Any] | None:
         """Take the lease on the one mission the portfolio scheduler picked.
 
         Scheduling happens *inside* the claiming transaction, not in a separate
@@ -587,19 +588,30 @@ class MissionStore:
         now = self.clock()
         token = str(uuid.uuid4())
         with self.transaction() as db:
-            decision = self._schedule_locked(db, now, resume_only=resume_only,
-                                             project_ids=project_ids)
-            if decision.verdicts:
-                # An idle poll with nothing to consider writes nothing; a poll
-                # that passed over real work explains why, once, in one row.
-                self._coordination_locked(
-                    db, decision.selected, self._project_of(db, decision.selected),
-                    "claim", decision.reason, decision.as_row())
-            if decision.selected is None:
-                return None
-            row = db.execute("SELECT * FROM missions WHERE id=?", (decision.selected,)).fetchone()
-            if row is None:
-                return None
+            if mission_id:
+                row = db.execute(
+                    "SELECT * FROM missions WHERE id=?", (mission_id,)
+                ).fetchone()
+                if row is None:
+                    return None
+                if project_ids and row["project_id"] not in project_ids:
+                    return None
+                if resume_only and row["state"] == "admitted":
+                    return None
+            else:
+                decision = self._schedule_locked(db, now, resume_only=resume_only,
+                                                 project_ids=project_ids)
+                if decision.verdicts:
+                    # An idle poll with nothing to consider writes nothing; a poll
+                    # that passed over real work explains why, once, in one row.
+                    self._coordination_locked(
+                        db, decision.selected, self._project_of(db, decision.selected),
+                        "claim", decision.reason, decision.as_row())
+                if decision.selected is None:
+                    return None
+                row = db.execute("SELECT * FROM missions WHERE id=?", (decision.selected,)).fetchone()
+                if row is None:
+                    return None
             fresh_attempt = row["state"] == "admitted"
             attempt = row["attempt_count"] + 1 if fresh_attempt else row["attempt_count"]
             next_state = "dispatching" if fresh_attempt else row["state"]
