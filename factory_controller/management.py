@@ -343,14 +343,27 @@ class ManagementPlane:
             try:
                 judgment = manager.judge(snapshot)
             except PermissionError as exc:
-                missing = str(exc).startswith("ADVISOR_") and str(exc).endswith("ABSENT")
+                err = str(exc)
+                missing_model = err == "ADVISOR_MODEL_ABSENT"
+                missing_session = (
+                    err.startswith("ADVISOR_") and err.endswith("ABSENT")
+                    and not missing_model)
+                missing = missing_session or missing_model
                 attention = None
                 if missing:
-                    report.reason = "EXTERNAL_OWNER_AUTH_REQUIRED"
+                    report.reason = (
+                        "EXTERNAL_OWNER_AUTH_REQUIRED" if missing_session
+                        else "EXTERNAL_OWNER_MODEL_REQUIRED")
                     report.next_action = "OWNER_AUTH"
                     attention = {
-                        "code": "EXTERNAL_OWNER_AUTH_REQUIRED",
-                        "action": "sign in to the local advisory HTTP surface once; do not paste a secret into a task page or Git",
+                        "code": report.reason,
+                        "action": (
+                            "sign in to the local advisory HTTP surface once; "
+                            "do not paste a secret into a task page or Git"
+                            if missing_session else
+                            "configure a local advisory inference provider once; "
+                            "do not paste a secret into a task page or Git"
+                        ),
                     }
                     report.owner_attention = attention
                 else:

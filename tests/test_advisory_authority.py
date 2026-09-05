@@ -305,5 +305,55 @@ class SessionGrantTests(unittest.TestCase):
             self.assertEqual(advisor.runtime_session("cli-session"), "cli-session")
 
 
+class RecordingOpener:
+    def __init__(self, payloads):
+        self.payloads = list(payloads)
+        self.urls = []
+
+    def __call__(self, req, timeout=None):
+        self.urls.append(req.get_full_url())
+        payload = self.payloads.pop(0)
+
+        class Resp:
+            def __enter__(self_inner):
+                return self_inner
+
+            def __exit__(self_inner, *exc):
+                return False
+
+            def read(self_inner):
+                return json.dumps(payload).encode()
+
+        return Resp()
+
+
+class KanbanJudgeTests(unittest.TestCase):
+    def test_decompose_failure_is_missing_model_not_a_judgment(self):
+        opener = RecordingOpener([
+            {"task": {"id": "t_1"}},
+            {"ok": False, "reason": "LLM error: RuntimeError", "child_ids": []},
+        ])
+        port = advisor.HermesAdvisor(token="fixture-session", opener=opener)
+        with self.assertRaises(PermissionError) as raised:
+            port.judge({"work_items": [{"work_item_id": "factory-maintenance:SF-202"}]})
+        self.assertEqual(str(raised.exception), "ADVISOR_MODEL_ABSENT")
+        self.assertTrue(opener.urls[0].endswith("/api/plugins/kanban/tasks"))
+        self.assertTrue(opener.urls[1].endswith("/api/plugins/kanban/tasks/t_1/decompose"))
+
+    def test_a_successful_decompose_is_mapped_into_reviewable_proposals(self):
+        opener = RecordingOpener([
+            {"task": {"id": "t_2"}},
+            {"ok": True, "reason": "split implementer from reviewer",
+             "fanout": True, "child_ids": ["c1", "c2"]},
+        ])
+        port = advisor.HermesAdvisor(token="fixture-session", opener=opener)
+        body = port.judge({"mission_id": "fm_1"})
+        self.assertEqual(body["reasoning"], "split implementer from reviewer")
+        self.assertEqual(body["proposals"][0]["kind"], "decompose")
+        self.assertEqual(
+            [row["work_item_id"] for row in body["proposals"][0]["children"]],
+            ["c1", "c2"])
+
+
 if __name__ == "__main__":
     unittest.main()
