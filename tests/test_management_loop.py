@@ -172,7 +172,7 @@ class LoopTests(Case):
         self.assertEqual(report["owner_attention"]["code"], "EXTERNAL_OWNER_AUTH_REQUIRED")
         self.assertEqual(self.store.counts().get("completed", 0), 0)
 
-    def test_a_missing_inference_provider_is_owner_model_attention(self):
+    def test_a_missing_inference_provider_is_an_adapter_block_not_owner_auth(self):
         class Down:
             def judge(self, snapshot):
                 raise PermissionError("ADVISOR_MODEL_ABSENT")
@@ -184,10 +184,25 @@ class LoopTests(Case):
                         "observed_effort": "unknown"}
 
         report = self.cycle(manager=Down())
-        self.assertEqual(report["reason"], "EXTERNAL_OWNER_MODEL_REQUIRED")
-        self.assertEqual(report["next_action"], "OWNER_AUTH")
-        self.assertEqual(report["owner_attention"]["code"], "EXTERNAL_OWNER_MODEL_REQUIRED")
+        self.assertEqual(report["reason"], "MANAGER_PROVIDER_ADAPTER_BLOCKED")
+        self.assertEqual(report["next_action"], "WAIT_MANAGER")
+        self.assertIsNone(report.get("owner_attention"))
         self.assertEqual(self.store.counts().get("completed", 0), 0)
+
+    def test_elapsed_time_during_judgment_is_not_a_stale_decision(self):
+        clock = self.clock
+
+        class Slow:
+            def judge(self, snapshot):
+                clock.advance(90)
+                return judgment()
+
+            def observed_identity(self, body=None):
+                return advisor.StaticAdvisor().observed_identity(body)
+
+        report = self.cycle(manager=Slow())
+        self.assertEqual(report["outcome"], "completed")
+        self.assertTrue(report["export"]["judgment_reasoning_present"])
 
     def test_a_stale_judgment_is_refused_before_dispatch(self):
         plane = self.plane

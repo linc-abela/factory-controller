@@ -279,7 +279,7 @@ class ManagementPlane:
                 "SELECT COALESCE(MAX(sequence), 0) AS seq FROM events"
             ).fetchone()
             seq = int(row["seq"] if row is not None else 0)
-        return payload_hash({"events": seq, "clock": self.clock()})[:32]
+        return payload_hash({"events": seq})[:32]
 
     def status(self) -> dict[str, Any]:
         latest = self.latest_record()
@@ -348,34 +348,33 @@ class ManagementPlane:
                 missing_session = (
                     err.startswith("ADVISOR_") and err.endswith("ABSENT")
                     and not missing_model)
-                missing = missing_session or missing_model
                 attention = None
-                if missing:
-                    report.reason = (
-                        "EXTERNAL_OWNER_AUTH_REQUIRED" if missing_session
-                        else "EXTERNAL_OWNER_MODEL_REQUIRED")
+                if missing_session:
+                    report.reason = "EXTERNAL_OWNER_AUTH_REQUIRED"
                     report.next_action = "OWNER_AUTH"
                     attention = {
                         "code": report.reason,
                         "action": (
                             "sign in to the local advisory HTTP surface once; "
                             "do not paste a secret into a task page or Git"
-                            if missing_session else
-                            "configure a local advisory inference provider once; "
-                            "do not paste a secret into a task page or Git"
                         ),
                     }
                     report.owner_attention = attention
+                    recon = "owner_auth_required"
+                elif missing_model:
+                    report.reason = "MANAGER_PROVIDER_ADAPTER_BLOCKED"
+                    report.next_action = "WAIT_MANAGER"
+                    recon = "manager_adapter_blocked"
                 else:
                     report.reason = "MANAGER_UNAVAILABLE"
                     report.next_action = "WAIT_MANAGER"
+                    recon = "manager_unavailable"
                 report.outcome = "idle"
                 report.degraded = "manager_unavailable"
                 self._recover_authorized(intake, controller, execute)
                 return self._close(report, snapshot=snapshot, judgment={
                     "error": str(exc)}, eligibility={}, selection={},
-                    receipt={}, reconciliation={
-                        "state": "owner_auth_required" if missing else "manager_unavailable"},
+                    receipt={}, reconciliation={"state": recon},
                     attention=attention)
             except (ValueError, OSError) as exc:
                 report.outcome = "idle"

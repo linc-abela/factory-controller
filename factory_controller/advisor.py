@@ -13,8 +13,8 @@ row and the Factory schedules deterministically without it.  That is checked by
 running the same missions with an advisor, with a broken advisor, and with none
 at all, and comparing the schedules.
 
-Hermes is present on this host and is *not* usable without an Owner credential;
-see :class:`HermesAdvisor` for the measured facts.
+The local advisory HTTP session is Factory-owned. Inference behind that
+runtime is a fleet adapter, not a portal login; see :class:`HermesAdvisor`.
 """
 
 from __future__ import annotations
@@ -446,7 +446,7 @@ class HermesAdvisor:
     ADVISORY_PATHS = ("/api/plugins/kanban/tasks/{task_id}/decompose",
                       "/api/plugins/kanban/tasks/{task_id}/specify",
                       "/api/plugins/kanban/tasks/{task_id}/reassign")
-    JUDGE_TIMEOUT = 120.0
+    JUDGE_TIMEOUT = 300.0
     SNAPSHOT_BODY_LIMIT = 8000
 
     def __init__(self, base_url: str = "http://127.0.0.1:9119", *, token: str | None = None,
