@@ -30,11 +30,15 @@ from pathlib import Path
 from typing import Any, Mapping, Protocol, Sequence
 
 from . import portfolio
+from .store import payload_hash
 
 
 #: Where the advisory service answers on this host.  An address, not a
 #: dependency: nothing fails if it is absent.
 DEFAULT_ENDPOINT = "http://127.0.0.1:9119"
+MAX_MANAGER_STDIN = 64_000
+MAX_MANAGER_STDOUT = 64_000
+MANAGER_ENV = {"LC_ALL": "C", "PATH": "/usr/bin:/bin:/usr/local/bin"}
 
 PROPOSAL_KINDS = ("decompose", "dependency_edge", "project_priority",
                   "specialist_profile", "next_mission")
@@ -427,20 +431,16 @@ def endpoint_advisor(base_url: str | None = None, *, token: str | None = None):
 
 def scheduled_manager(*, command: Sequence[str] | None = None,
                       requested_profile: str = "advisory-process",
-                      requested_effort: str = "unknown",
-                      provider: str | None = None,
-                      model: str | None = None) -> "ManagerLike":
+                      requested_effort: str = "unknown") -> "ManagerLike":
     """Prefer a governed argv. HTTP session is not the scheduled path."""
 
     if command:
-        return ProcessAdvisor(
-            command, requested_profile=requested_profile,
-            requested_effort=requested_effort)
+        raise ValueError("ADVISOR_ARGV_NOT_ALLOWLISTED")
     executable = shutil.which("hermes")
     if executable:
         return HermesProcessAdvisor(
             executable, requested_profile=requested_profile,
-            requested_effort=requested_effort, provider=provider, model=model)
+            requested_effort=requested_effort)
     return BlockedAdvisor(requested_profile, requested_effort)
 
 
@@ -490,27 +490,43 @@ class ProcessAdvisor:
 
     def judge(self, snapshot: dict[str, Any]) -> dict[str, Any]:
         payload = json.dumps({"snapshot": snapshot}, default=str)
+        if len(payload.encode("utf-8")) > MAX_MANAGER_STDIN:
+            raise ValueError("ADVISOR_INPUT_TOO_LARGE")
         try:
             completed = subprocess.run(
                 self.command, input=payload, text=True, capture_output=True,
-                timeout=self.timeout, check=False)
+                timeout=self.timeout, check=False, env=MANAGER_ENV)
         except (OSError, subprocess.TimeoutExpired) as exc:
             self._receipt = {
                 "process_started": False,
                 "returncode": None,
                 "observed_executable": self.command[0],
+                "transport": "subprocess",
                 "error": type(exc).__name__,
             }
             raise PermissionError("ADVISOR_MODEL_ABSENT") from exc
+        stdout = completed.stdout or ""
+        stderr = completed.stderr or ""
+        if len(stdout) > MAX_MANAGER_STDOUT or len(stderr) > MAX_MANAGER_STDOUT:
+            self._receipt = {
+                "process_started": True,
+                "returncode": completed.returncode,
+                "observed_executable": self.command[0],
+                "transport": "subprocess",
+                "error": "ADVISOR_OUTPUT_TOO_LARGE",
+            }
+            raise PermissionError("ADVISOR_MODEL_ABSENT")
         self._receipt = {
             "process_started": True,
             "returncode": completed.returncode,
             "observed_executable": self.command[0],
+            "transport": "subprocess",
+            "stdout_digest": payload_hash(stdout),
         }
         if completed.returncode != 0:
             raise PermissionError("ADVISOR_MODEL_ABSENT")
         try:
-            body = json.loads(completed.stdout)
+            body = json.loads(stdout)
         except json.JSONDecodeError as exc:
             raise ValueError("ADVISOR_MALFORMED_RESPONSE") from exc
         if not isinstance(body, dict):
@@ -529,12 +545,15 @@ class ProcessAdvisor:
         return {
             "requested_profile": self.requested_profile,
             "requested_effort": self.requested_effort,
-            "observed_profile": executable if started and code == 0 else "unknown",
+            "observed_profile": "unknown",
             "observed_effort": "unknown",
             "observed_executable": executable,
+            "transport": self._receipt.get("transport") or "subprocess",
             "process_started": started,
-            "present": started,
+            "present": started and code == 0,
             "credential_held": False,
+            "stdout_digest": self._receipt.get("stdout_digest"),
+            "returncode": code,
         }
 
 
@@ -542,18 +561,16 @@ class HermesProcessAdvisor:
     """Hermes 0.21 as an external process. No HTTP facade, no argv token."""
 
     def __init__(self, executable: str, *, requested_profile: str,
-                 requested_effort: str = "unknown", provider: str | None = None,
-                 model: str | None = None, timeout: float = 120.0) -> None:
+                 requested_effort: str = "unknown", timeout: float = 120.0) -> None:
         self.executable = executable
         self.requested_profile = requested_profile
         self.requested_effort = requested_effort
-        self.provider = provider
-        self.model = model
         self.timeout = timeout
         self._receipt: dict[str, Any] = {
             "process_started": False,
             "returncode": None,
             "observed_executable": executable,
+            "transport": "subprocess",
         }
 
     def judge(self, snapshot: dict[str, Any]) -> dict[str, Any]:
@@ -563,32 +580,33 @@ class HermesProcessAdvisor:
             + json.dumps(snapshot, default=str)[:8000]
         )
         command = [self.executable, "chat", "-Q", "-q", prompt, "--cli", "--safe-mode"]
-        if isinstance(self.provider, str) and self.provider.strip():
-            command.extend(["--provider", self.provider.strip()])
-        if isinstance(self.model, str) and self.model.strip():
-            command.extend(["-m", self.model.strip()])
         try:
             completed = subprocess.run(
                 command, text=True, capture_output=True,
-                timeout=self.timeout, check=False)
+                timeout=self.timeout, check=False, env=MANAGER_ENV)
         except (OSError, subprocess.TimeoutExpired) as exc:
             self._receipt = {
                 "process_started": False,
                 "returncode": None,
                 "observed_executable": self.executable,
+                "transport": "subprocess",
                 "error": type(exc).__name__,
             }
             raise PermissionError("ADVISOR_MODEL_ABSENT") from exc
+        stdout = completed.stdout or ""
+        stderr = completed.stderr or ""
+        if len(stdout) > MAX_MANAGER_STDOUT or len(stderr) > MAX_MANAGER_STDOUT:
+            raise PermissionError("ADVISOR_MODEL_ABSENT")
         self._receipt = {
             "process_started": True,
             "returncode": completed.returncode,
             "observed_executable": self.executable,
-            "argv_provider": self.provider,
-            "argv_model": self.model,
+            "transport": "subprocess",
+            "stdout_digest": payload_hash(stdout),
         }
         if completed.returncode != 0:
             raise PermissionError("ADVISOR_MODEL_ABSENT")
-        text = (completed.stdout or "").strip()
+        text = stdout.strip()
         body = _first_json_object(text)
         if body is None:
             if not text:
@@ -610,14 +628,15 @@ class HermesProcessAdvisor:
         return {
             "requested_profile": self.requested_profile,
             "requested_effort": self.requested_effort,
-            "observed_profile": self.executable if started and code == 0 else "unknown",
+            "observed_profile": "unknown",
             "observed_effort": "unknown",
             "observed_executable": self.executable,
+            "transport": "subprocess",
             "process_started": started,
-            "present": started,
+            "present": started and code == 0,
             "credential_held": False,
-            "argv_provider": self._receipt.get("argv_provider"),
-            "argv_model": self._receipt.get("argv_model"),
+            "stdout_digest": self._receipt.get("stdout_digest"),
+            "returncode": code,
         }
 
 

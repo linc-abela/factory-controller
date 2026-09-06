@@ -124,13 +124,41 @@ def _table_exists(db, name: str) -> bool:
     return row is not None
 
 
-def load_authority(root: str | Path) -> dict[str, Any]:
-    """A scheduled inbox must carry an Owner-granted stamp, not a prompt."""
+def inspect_inbox(root: str | Path) -> None:
+    """Refuse Owner-prompted or self-attested inbox grants."""
 
     try:
-        return work_source.load_authority(root)
+        work_source.inspect_inbox(root)
     except work_source.PacketError as exc:
         raise ManagementRefusal(exc.code, exc.detail) from exc
+
+
+def load_authority(root: str | Path) -> dict[str, Any]:
+    """Inbox files cannot mint scheduled-source authority."""
+
+    inspect_inbox(root)
+    raise ManagementRefusal(
+        "MANAGEMENT_SELF_ATTESTED_AUTHORITY",
+        "inbox files cannot issue scheduled-source authority")
+
+
+def factory_grant(root: str | Path) -> dict[str, Any]:
+    """Controller-issued source identity from packet bytes, not inbox fields."""
+
+    inspect_inbox(root)
+    try:
+        digest = work_source.packet_digest(root)
+    except work_source.PacketError as exc:
+        raise ManagementRefusal(exc.code, exc.detail) from exc
+    real = str(Path(root).resolve())
+    return {
+        "granted_by": work_source.GRANT_ISSUER,
+        "source": work_source.GRANT_SOURCE,
+        "policy_id": work_source.GRANT_POLICY,
+        "source_revision": digest,
+        "authority_digest": digest,
+        "root_realpath": real,
+    }
 
 
 def inherit_envelope(parent: Mapping[str, Any], child: Mapping[str, Any]) -> dict[str, Any]:
@@ -181,7 +209,7 @@ def observation_status(obs: Any, *, now: float) -> str:
     if obs.get("quota_state") != "available":
         return "unknown"
     source = obs.get("source")
-    if not isinstance(source, str) or not source.strip():
+    if not isinstance(source, str) or not source.startswith("factory-bridge:"):
         return "unknown"
     if not isinstance(obs.get("observed_at"), (int, float)):
         return "unknown"
@@ -374,12 +402,13 @@ class ManagementPlane:
     def register_source_manifest(self, root: str | Path) -> dict[str, Any]:
         """Persist Factory-owned source identity. Inbox files are not authority."""
 
-        authority = load_authority(root)
-        real = str(Path(root).resolve())
+        grant = factory_grant(root)
+        real = grant["root_realpath"]
         manifest_id = payload_hash({
+            "issuer": grant["granted_by"],
+            "policy": grant["policy_id"],
             "root": real,
-            "digest": authority["authority_digest"],
-            "revision": authority["source_revision"],
+            "digest": grant["authority_digest"],
         })[:32]
         now = self.clock()
         with self._store.transaction() as db:
@@ -388,10 +417,10 @@ class ManagementPlane:
                 (real,)).fetchone()
             if existing is not None:
                 same = (
-                    existing["authority_digest"] == authority["authority_digest"]
-                    and existing["source_revision"] == authority["source_revision"]
-                    and existing["source"] == authority["source"]
-                    and existing["granted_by"] == authority["granted_by"])
+                    existing["authority_digest"] == grant["authority_digest"]
+                    and existing["source_revision"] == grant["source_revision"]
+                    and existing["source"] == grant["source"]
+                    and existing["granted_by"] == grant["granted_by"])
                 if not same:
                     raise ManagementRefusal(
                         "MANAGEMENT_SOURCE_IDENTITY_CHANGED",
@@ -402,12 +431,14 @@ class ManagementPlane:
                 " manifest_id, root_realpath, source, granted_by,"
                 " source_revision, authority_digest, registered_at)"
                 " VALUES (?,?,?,?,?,?,?)",
-                (manifest_id, real, authority["source"], authority["granted_by"],
-                 authority["source_revision"], authority["authority_digest"], now))
-        return {"manifest_id": manifest_id, **authority}
+                (manifest_id, real, grant["source"], grant["granted_by"],
+                 grant["source_revision"], grant["authority_digest"], now))
+        return {"manifest_id": manifest_id, **grant}
 
-    def bind_source(self, root: str | Path, authority: Mapping[str, Any]) -> dict[str, Any]:
-        real = str(Path(root).resolve())
+    def bind_source(self, root: str | Path,
+                    authority: Mapping[str, Any] | None = None) -> dict[str, Any]:
+        grant = factory_grant(root)
+        real = grant["root_realpath"]
         with self._store.transaction() as db:
             row = db.execute(
                 "SELECT * FROM source_manifests WHERE root_realpath=?",
@@ -416,18 +447,24 @@ class ManagementPlane:
             raise ManagementRefusal(
                 "MANAGEMENT_SOURCE_UNBOUND",
                 "no Factory-owned source manifest for %s" % real)
-        if row["authority_digest"] != authority.get("authority_digest"):
+        if row["authority_digest"] != grant["authority_digest"]:
             raise ManagementRefusal(
                 "MANAGEMENT_SOURCE_DIGEST_MISMATCH",
-                "inbox authority digest is not the registered manifest")
-        if row["source_revision"] != authority.get("source_revision"):
+                "packet digest is not the registered Factory grant")
+        if row["source_revision"] != grant["source_revision"]:
             raise ManagementRefusal(
                 "MANAGEMENT_SOURCE_REVISION_MISMATCH",
-                "inbox source_revision is not the registered manifest")
-        if row["source"] != authority.get("source") or row["granted_by"] != authority.get("granted_by"):
+                "packet digest is not the registered Factory grant")
+        if row["source"] != grant["source"] or row["granted_by"] != grant["granted_by"]:
             raise ManagementRefusal(
                 "MANAGEMENT_SOURCE_IDENTITY_MISMATCH",
-                "inbox source identity is not the registered manifest")
+                "Factory-owned source identity is not the registered grant")
+        if authority is not None:
+            if (authority.get("authority_digest") not in (None, grant["authority_digest"])
+                    or authority.get("source_revision") not in (None, grant["source_revision"])):
+                raise ManagementRefusal(
+                    "MANAGEMENT_SOURCE_DIGEST_MISMATCH",
+                    "caller-supplied grant fields are not Factory authority")
         return dict(row)
 
     def record_fleet_observation(self, profile: str, observation: Mapping[str, Any]) -> None:
@@ -497,10 +534,12 @@ class ManagementPlane:
             outcome="completed", started_at=claim["started_at"],
             ended_at=claim["started_at"], lease_token=claim.get("lease_token"))
         try:
-            authority = load_authority(source_dir)
-            self.bind_source(source_dir, authority)
+            grant = self.bind_source(source_dir)
+            authority = dict(grant)
             source = work_source.DirectoryWorkSource(
-                source_dir, source_kind="scheduled")
+                source_dir, source_kind="scheduled",
+                source_revision=grant["source_revision"],
+                authority_digest=grant["authority_digest"])
             intake = work_intake.WorkIntakePlane(self._store, clock=self.clock)
             observed = intake.observe(source)
             version = self.state_version()
@@ -875,13 +914,17 @@ class ManagementPlane:
             return
 
     def _recover_authorized(self, intake: work_intake.WorkIntakePlane,
-                            controller, execute: bool) -> None:
+                            controller, execute: bool,
+                            mission_id: str | None = None) -> None:
+        if not (execute and isinstance(mission_id, str) and mission_id):
+            return
         for item in intake.items():
+            if item.get("mission_ref") != mission_id:
+                continue
             if item["state"] in {"admitted", "in_progress"}:
                 intake.reconcile(item["work_item_id"], controller)
-                mission_id = item.get("mission_ref")
-                if execute and isinstance(mission_id, str) and mission_id:
-                    controller.work_once("recovery", mission_id=mission_id)
+                controller.work_once("recovery", mission_id=mission_id)
+                return
 
     def _open_cycle(self) -> dict[str, Any] | None:
         now = self.clock()

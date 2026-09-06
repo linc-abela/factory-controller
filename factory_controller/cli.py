@@ -302,12 +302,12 @@ def parser() -> argparse.ArgumentParser:
         help="one unattended management cycle over scheduled Factory-maintenance work")
     manage.add_argument("action", choices=("cycle", "status", "export", "register-source"))
     manage.add_argument("--source-dir", dest="mg_source_dir",
-                        help="scheduled inbox of work_packet.v1 files plus authority.json")
+                        help="scheduled inbox of work_packet.v1 files")
     manage.add_argument("--worker", dest="mg_worker", default="manager")
     manage.add_argument("--proposals", dest="mg_proposals", type=Path,
                         help="a recorded manager judgment to replay")
     manage.add_argument("--manager-cmd", dest="mg_manager_cmd",
-                        help="governed manager argv; stdin JSON snapshot, stdout judgment")
+                        help="refused: freeform manager argv is a command-injection seam")
     manage.add_argument("--manager-profile", dest="mg_manager_profile",
                         default="advisory-process")
     manage.add_argument("--manager-effort", dest="mg_manager_effort", default="unknown")
@@ -845,16 +845,20 @@ def _manage(args, controller) -> int:
                     "MANAGEMENT_TOKEN_ARGUMENT_REFUSED",
                     "scheduled manage cycle must not take --token; "
                     "use the protected runtime session resolver")
+            if args.mg_manager_cmd:
+                raise mgmt.ManagementRefusal(
+                    "MANAGEMENT_MANAGER_ARGV_REFUSED",
+                    "freeform --manager-cmd is not an allowlisted manager path")
+            if args.mg_manager_provider or args.mg_manager_model:
+                raise mgmt.ManagementRefusal(
+                    "MANAGEMENT_MANAGER_ARGV_REFUSED",
+                    "scheduled manager must not take --manager-provider or --manager-model")
             if args.mg_proposals:
                 port = advisory.StaticAdvisor(json.loads(args.mg_proposals.read_text()))
             else:
-                command = shlex.split(args.mg_manager_cmd) if args.mg_manager_cmd else None
                 port = advisory.scheduled_manager(
-                    command=command,
                     requested_profile=args.mg_manager_profile,
-                    requested_effort=args.mg_manager_effort,
-                    provider=args.mg_manager_provider,
-                    model=args.mg_manager_model)
+                    requested_effort=args.mg_manager_effort)
             if args.mg_fleet:
                 fleet = json.loads(args.mg_fleet.read_text())
                 if not isinstance(fleet, dict):
@@ -865,6 +869,11 @@ def _manage(args, controller) -> int:
                         raise mgmt.ManagementRefusal(
                             "MANAGEMENT_FLEET_INVALID",
                             "fleet-json values must be observation objects")
+                    source = observation.get("source")
+                    if not (isinstance(source, str) and source.startswith("factory-bridge:")):
+                        raise mgmt.ManagementRefusal(
+                            "MANAGEMENT_FLEET_CALLER_SUPPLIED",
+                            "fleet observations must carry factory-bridge provenance")
                     plane.record_fleet_observation(profile, observation)
             priors = json.loads(args.mg_priors.read_text()) if args.mg_priors else {}
             result = plane.cycle(

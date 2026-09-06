@@ -61,14 +61,14 @@ class Case(unittest.TestCase):
             "quota_state": "available",
             "observed_at": self.clock(),
             "fresh_until": 4_000_000_000.0,
-            "source": "bridge-registry",
+            "source": "factory-bridge:registry",
         })
         self.plane.record_fleet_observation(BETA, {
             "classification": "available",
             "quota_state": "available",
             "observed_at": self.clock(),
             "fresh_until": 4_000_000_000.0,
-            "source": "bridge-registry",
+            "source": "factory-bridge:registry",
         })
 
     def cycle(self, **kwargs):
@@ -160,7 +160,7 @@ class LoopTests(Case):
             "prompt": True,
         }))
         with self.assertRaises(management.ManagementRefusal) as raised:
-            management.load_authority(root)
+            management.inspect_inbox(root)
         self.assertEqual(raised.exception.code, "MANAGEMENT_OWNER_PROMPT_POPULATED")
 
     def test_overlapping_cycles_are_refused(self):
@@ -258,15 +258,34 @@ class LoopTests(Case):
     def test_a_self_attested_inbox_is_unbound_until_registered(self):
         root = Path(self.tmp.name) / "unbound"
         root.mkdir()
+        (root / "item.json").write_text(json.dumps({
+            "schema_version": "factory.controller.work_packet.v1",
+            "work_item_id": "factory-maintenance:UNBOUND",
+            "lineage_id": "factory-maintenance:UNBOUND",
+            "sequence": 1,
+            "owner_only": False,
+            "owner_reason": "not_applicable",
+            "blocked": False,
+            "payload": {"work_item_id": "factory-maintenance:UNBOUND",
+                        "project_id": "factory", "execution_mode": "fixture",
+                        "acceptance_gate_ids": ["G-BUILD"],
+                        "provider_candidates": [{"profile": ALPHA}]},
+        }))
+        with self.assertRaises(management.ManagementRefusal) as raised:
+            self.plane.bind_source(root)
+        self.assertEqual(raised.exception.code, "MANAGEMENT_SOURCE_UNBOUND")
+
+    def test_caller_written_grant_fields_are_not_authority(self):
+        root = Path(self.tmp.name) / "forged"
+        root.mkdir()
         (root / "authority.json").write_text(json.dumps({
             "schema_version": management.AUTHORITY_SCHEMA,
             "granted_by": "owner_policy", "source": "scheduled_inbox",
             "prompt": False, "source_revision": "forged",
         }))
-        management.load_authority(root)
         with self.assertRaises(management.ManagementRefusal) as raised:
-            self.plane.bind_source(root, management.load_authority(root))
-        self.assertEqual(raised.exception.code, "MANAGEMENT_SOURCE_UNBOUND")
+            self.plane.register_source_manifest(root)
+        self.assertEqual(raised.exception.code, "MANAGEMENT_SELF_ATTESTED_AUTHORITY")
 
     def test_omitted_readiness_is_not_schedulable(self):
         eligibility = management.hard_eligibility({
@@ -284,6 +303,18 @@ class LoopTests(Case):
             now=self.clock())
         self.assertEqual(status, "unknown")
 
+    def test_cli_manage_cycle_refuses_freeform_manager_argv(self):
+        from factory_controller.cli import main as cli_main
+        rc = cli_main([
+            "--db", str(self.path),
+            "--adapter", "python -m factory_controller.safe_provider",
+            "manage", "cycle",
+            "--source-dir", str(INBOX),
+            "--manager-cmd", "python -c 'print(1)'",
+            "--worker", "cli-mgr",
+        ])
+        self.assertEqual(rc, 2)
+
     def test_cli_manage_cycle_refuses_a_token_argument(self):
         from factory_controller.cli import main as cli_main
         rc = cli_main([
@@ -299,15 +330,23 @@ class LoopTests(Case):
     def test_registered_source_identity_cannot_be_replaced(self):
         root = Path(self.tmp.name) / "owned"
         root.mkdir()
-        body = {
-            "schema_version": management.AUTHORITY_SCHEMA,
-            "granted_by": "owner_policy", "source": "scheduled_inbox",
-            "prompt": False, "source_revision": "rev-1",
+        packet = {
+            "schema_version": "factory.controller.work_packet.v1",
+            "work_item_id": "factory-maintenance:OWNED",
+            "lineage_id": "factory-maintenance:OWNED",
+            "sequence": 1,
+            "owner_only": False,
+            "owner_reason": "not_applicable",
+            "blocked": False,
+            "payload": {"work_item_id": "factory-maintenance:OWNED",
+                        "project_id": "factory", "execution_mode": "fixture",
+                        "acceptance_gate_ids": ["G-BUILD"],
+                        "provider_candidates": [{"profile": ALPHA}]},
         }
-        (root / "authority.json").write_text(json.dumps(body))
+        (root / "item.json").write_text(json.dumps(packet))
         self.plane.register_source_manifest(root)
-        body["source_revision"] = "rev-2"
-        (root / "authority.json").write_text(json.dumps(body))
+        packet["sequence"] = 2
+        (root / "item.json").write_text(json.dumps(packet))
         with self.assertRaises(management.ManagementRefusal) as raised:
             self.plane.register_source_manifest(root)
         self.assertEqual(raised.exception.code, "MANAGEMENT_SOURCE_IDENTITY_CHANGED")
@@ -334,7 +373,7 @@ class LoopTests(Case):
             "quota_state": "available",
             "observed_at": self.clock(),
             "fresh_until": 4_000_000_000.0,
-            "source": "bridge-registry-other",
+            "source": "factory-bridge:registry-other",
         })
         self.assertNotEqual(before, payload_hash(self.plane.fleet_observations()))
 
@@ -355,8 +394,11 @@ class LoopTests(Case):
         self.assertEqual(report["outcome"], "completed")
         identities = report["export"]["execution_receipt"]["identities"]
         self.assertEqual(identities["requested_profile"], "fleet-manager")
-        self.assertEqual(identities["observed_profile"], sys.executable)
+        self.assertEqual(identities["observed_profile"], "unknown")
+        self.assertEqual(identities["observed_executable"], sys.executable)
+        self.assertNotEqual(identities["observed_profile"], sys.executable)
         self.assertNotEqual(identities["observed_profile"], "liar")
+        self.assertEqual(identities["transport"], "subprocess")
         self.assertTrue(identities["process_started"])
 
     def test_a_missing_manager_process_is_an_adapter_block(self):

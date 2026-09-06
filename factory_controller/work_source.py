@@ -40,6 +40,9 @@ CONTRACT_VERSION = "factory-controller/work-source/1.0"
 PACKET_SCHEMA = "factory.controller.work_packet.v1"
 AUTHORITY_SCHEMA = "factory.controller.intake_authority.v1"
 AUTHORITY_NAME = "authority.json"
+GRANT_ISSUER = "factory-controller"
+GRANT_POLICY = "factory.controller.scheduled_source.v1"
+GRANT_SOURCE = "factory-owned-grant"
 MAX_PACKET_BYTES = 64_000
 MAX_SOURCE_FILES = 64
 MAX_SOURCE_BYTES = 512_000
@@ -178,17 +181,12 @@ def _required_str(raw: Mapping[str, Any], name: str, source_ref: str) -> str:
     return value
 
 
-def load_authority(root: str | Path) -> dict[str, Any]:
-    """A directory adapter may not invent its own source identity."""
-
-    root_path = Path(root)
-    if root_path.is_symlink():
-        raise PacketError("WORK_SOURCE_SYMLINK_REFUSED", str(root_path))
-    path = root_path / AUTHORITY_NAME
-    if not path.is_file():
-        raise PacketError(
-            "MANAGEMENT_SOURCE_UNAUTHORIZED",
-            "scheduled intake requires %s" % AUTHORITY_NAME)
+def _read_authority_bytes(root: Path) -> bytes | None:
+    path = root / AUTHORITY_NAME
+    if not path.exists():
+        return None
+    if path.is_symlink() or not path.is_file():
+        raise PacketError("WORK_SOURCE_SYMLINK_REFUSED", str(path))
     flags = os.O_RDONLY
     if hasattr(os, "O_NOFOLLOW"):
         flags |= os.O_NOFOLLOW
@@ -197,9 +195,20 @@ def load_authority(root: str | Path) -> dict[str, Any]:
     except OSError as exc:
         raise PacketError("MANAGEMENT_SOURCE_UNAUTHORIZED", str(exc)) from exc
     try:
-        data = os.read(fd, MAX_AUTHORITY_BYTES + 1)
+        return os.read(fd, MAX_AUTHORITY_BYTES + 1)
     finally:
         os.close(fd)
+
+
+def inspect_inbox(root: str | Path) -> None:
+    """Inbox files are data. A self-attested grant file is not authority."""
+
+    root_path = Path(root)
+    if root_path.is_symlink():
+        raise PacketError("WORK_SOURCE_SYMLINK_REFUSED", str(root_path))
+    data = _read_authority_bytes(root_path)
+    if data is None:
+        return
     if len(data) > MAX_AUTHORITY_BYTES:
         raise PacketError(
             "MANAGEMENT_AUTHORITY_TOO_LARGE",
@@ -209,37 +218,40 @@ def load_authority(root: str | Path) -> dict[str, Any]:
     except (json.JSONDecodeError, UnicodeDecodeError) as exc:
         raise PacketError("MANAGEMENT_AUTHORITY_NOT_JSON", str(exc)) from exc
     if not isinstance(raw, dict):
-        raise PacketError("MANAGEMENT_AUTHORITY_NOT_JSON", str(path))
-    if raw.get("schema_version") != AUTHORITY_SCHEMA:
-        raise PacketError(
-            "MANAGEMENT_AUTHORITY_UNSUPPORTED",
-            "authority carries %r" % (raw.get("schema_version"),))
+        raise PacketError("MANAGEMENT_AUTHORITY_NOT_JSON", str(root_path / AUTHORITY_NAME))
     if raw.get("prompt") is True:
         raise PacketError(
             "MANAGEMENT_OWNER_PROMPT_POPULATED",
             "authority admits a prompt populated this inbox")
-    if raw.get("granted_by") != "owner_policy":
+    if any(raw.get(field) not in (None, "", False)
+           for field in ("granted_by", "source", "source_revision")):
         raise PacketError(
-            "MANAGEMENT_AUTHORITY_UNSIGNED",
-            "authority is not owner_policy-granted")
-    if raw.get("source") != "scheduled_inbox":
-        raise PacketError(
-            "MANAGEMENT_SOURCE_NOT_SCHEDULED",
-            "authority source is %r" % (raw.get("source"),))
-    revision = raw.get("source_revision")
-    if not isinstance(revision, str) or not revision.strip():
-        raise PacketError(
-            "MANAGEMENT_SOURCE_REVISION_MISSING",
-            "%s has no source_revision" % AUTHORITY_NAME)
-    stamped = dict(raw)
-    stamped["authority_digest"] = payload_hash({
-        "schema_version": raw.get("schema_version"),
-        "granted_by": raw.get("granted_by"),
-        "source": raw.get("source"),
-        "prompt": raw.get("prompt"),
-        "source_revision": revision,
-    })
-    return stamped
+            "MANAGEMENT_SELF_ATTESTED_AUTHORITY",
+            "caller-written granted_by/source/source_revision is not Factory authority")
+
+
+def packet_digest(root: str | Path) -> str:
+    """Controller-computed identity of packet files. Inbox grant fields are ignored."""
+
+    root_path = Path(root)
+    inspect_inbox(root_path)
+    rows: list[dict[str, Any]] = []
+    for path in sorted(root_path.iterdir()):
+        if path.suffix != ".json" or path.name == AUTHORITY_NAME:
+            continue
+        if path.is_symlink() or not path.is_file():
+            raise PacketError("WORK_SOURCE_SYMLINK_REFUSED", path.name)
+        rows.append({"name": path.name, "bytes": path.read_bytes().hex()})
+    return payload_hash({"root": str(root_path.resolve()), "packets": rows})
+
+
+def load_authority(root: str | Path) -> dict[str, Any]:
+    """Safety scan only. Never returns a grant minted from inbox fields."""
+
+    inspect_inbox(root)
+    raise PacketError(
+        "MANAGEMENT_SELF_ATTESTED_AUTHORITY",
+        "inbox files cannot issue scheduled-source authority")
 
 
 class DirectoryWorkSource:
@@ -249,9 +261,13 @@ class DirectoryWorkSource:
     is the claim.  A second worker reading the same directory is expected.
     """
 
-    def __init__(self, root: str | Path, *, source_kind: str = "directory") -> None:
+    def __init__(self, root: str | Path, *, source_kind: str = "directory",
+                 source_revision: str = "unknown",
+                 authority_digest: str = "unknown") -> None:
         self.root = Path(root)
         self.source_kind = source_kind
+        self.source_revision = source_revision
+        self.authority_digest = authority_digest
 
     def packets(self) -> tuple[WorkPacket, ...]:
         if self.root.is_symlink():
@@ -260,7 +276,7 @@ class DirectoryWorkSource:
             raise PacketError(
                 "WORK_SOURCE_DIRECTORY_MISSING",
                 str(self.root))
-        authority = load_authority(self.root)
+        inspect_inbox(self.root)
         loaded: list[WorkPacket] = []
         seen: set[str] = set()
         file_count = 0
@@ -299,8 +315,8 @@ class DirectoryWorkSource:
                 raw, source_kind=self.source_kind, source_ref=path.name)
             packet = replace(
                 packet,
-                source_revision=authority["source_revision"],
-                authority_digest=authority["authority_digest"])
+                source_revision=self.source_revision,
+                authority_digest=self.authority_digest)
             if packet.work_item_id in seen:
                 raise PacketError(
                     "WORK_SOURCE_DUPLICATE_IDENTITY",
