@@ -269,7 +269,8 @@ def run_live_demonstration(
             dry_run=True,
         )
         assert ag_wake.success is True, f"Antigravity wake failed: {ag_wake}"
-        print(f"  Antigravity headless wake command: {' '.join(ag_wake.command[:3])}... (Exit 0, no message bus needed)")
+        assert ag_wake.command[-1] == "Process your Queue.", ag_wake.command
+        print(f"  Antigravity headless wake command: {' '.join(ag_wake.command[:3])}... prompt={ag_wake.command[-1]!r}")
 
         # Codex wake formulation
         codex_wake = codex_adapter.wake(

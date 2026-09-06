@@ -262,6 +262,9 @@ class NotionClient:
     ) -> dict[str, Any]:
         return self._request("PATCH", f"blocks/{block_id}/children", {"children": list(children)})
 
+    def delete_block(self, block_id: str) -> dict[str, Any]:
+        return self._request("DELETE", f"blocks/{block_id}")
+
 
 class LiveNotionTaskSource:
     """Task source that fetches, parses, and paginates tasks from live Notion AWE database."""
@@ -472,8 +475,12 @@ class LiveNotionTaskSource:
 class NotionSourceOfRecord:
     """Manages authoritative task lifecycle transitions and write-back in Notion AWE."""
 
-    def __init__(self, client: NotionClient | None = None) -> None:
+    def __init__(self, client: NotionClient | None = None, dispatch: Any = None) -> None:
         self.client = client or NotionClient()
+        if dispatch is None:
+            from .dispatch import DispatchMaintainer
+            dispatch = DispatchMaintainer(client=self.client)
+        self.dispatch = dispatch
 
     def claim_task(
         self,
@@ -564,7 +571,26 @@ class NotionSourceOfRecord:
             except NotionAPIError as exc:
                 return False, f"NOTION_API_ERROR updating dashboard projection: {exc}"
 
+        dispatch_err = self._write_dispatch(task, AWEStatus.IN_PROGRESS.value)
+        if dispatch_err:
+            return False, dispatch_err
         return True, ""
+
+    def _write_dispatch(
+        self,
+        task: AWEWorkItem,
+        lifecycle_state: str,
+        dispatch_state: str = "EXECUTABLE",
+        frozen_head: str = "",
+    ) -> str:
+        if self.dispatch is None:
+            return ""
+        return self.dispatch.write_for_task(
+            task,
+            lifecycle_state=lifecycle_state,
+            dispatch_state=dispatch_state,
+            frozen_head=frozen_head,
+        )
 
     def _move_physical(self, task_page_id: str, folder_id: str) -> str:
         """Move a physical AWE page. Returns empty on success, error text on failure."""
@@ -620,10 +646,11 @@ class NotionSourceOfRecord:
                         "Last Checkpoint": {"date": {"start": now_iso}},
                     },
                 )
-                return True
             except Exception:
                 return False
-        return True
+        return not self._write_dispatch(
+            task, AWEStatus.DONE.value, dispatch_state="NO_EXECUTABLE_TASK"
+        )
 
     def block_task(
         self,
@@ -661,10 +688,11 @@ class NotionSourceOfRecord:
                         },
                     },
                 )
-                return True
             except Exception:
                 return False
-        return True
+        return not self._write_dispatch(
+            task, AWEStatus.BLOCKED.value, dispatch_state="NO_EXECUTABLE_TASK"
+        )
 
     def route_rework(
         self,
@@ -707,7 +735,6 @@ class NotionSourceOfRecord:
                         },
                     },
                 )
-                return True
             except Exception:
                 return False
-        return True
+        return not self._write_dispatch(task, AWEStatus.QUEUE.value)

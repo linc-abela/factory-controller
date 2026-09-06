@@ -224,6 +224,8 @@ class HarnessAdapterTests(unittest.TestCase):
             self.assertTrue(receipt.success)
             self.assertIn("--model", receipt.command)
             self.assertIn("gemini-3.8-flash-high", receipt.command)
+            self.assertEqual(receipt.command[-1], "Process your Queue.")
+            self.assertFalse(any("SF-217" in str(arg) for arg in receipt.command))
 
     def test_codex_adapter_dry_run(self):
         adapter = CodexHarnessAdapter()
@@ -242,6 +244,8 @@ class HarnessAdapterTests(unittest.TestCase):
             self.assertTrue(receipt.success)
             self.assertIn("exec", receipt.command)
             self.assertTrue(any("model_reasoning_effort=max" in arg for arg in receipt.command))
+            self.assertEqual(receipt.command[-1], "Process your Queue.")
+            self.assertFalse(any("SF-216" in str(arg) for arg in receipt.command))
 
 
 class TurnCadenceReconciliationTests(unittest.TestCase):
@@ -1009,6 +1013,221 @@ class LiveDemonstrationRegressionTests(unittest.TestCase):
         self.assertEqual(results["steps"]["step6_terminal_completion"], "PASSED")
         self.assertEqual(results["steps"]["step7_recovery"], "PASSED")
         self.assertEqual(results["steps"]["step8_teardown"], "PASSED")
+
+
+class DeterministicDispatchTests(unittest.TestCase):
+    def setUp(self):
+        from awe_worker.dispatch import (
+            DISPATCH_PAGE_IDS,
+            DISPATCH_STALE,
+            NO_EXECUTABLE_TASK,
+            DispatchMaintainer,
+            DispatchPointer,
+            HeadlessDispatchResolver,
+            format_pointer_text,
+            parse_pointers,
+        )
+        self.DISPATCH_STALE = DISPATCH_STALE
+        self.NO_EXECUTABLE_TASK = NO_EXECUTABLE_TASK
+        self.DISPATCH_PAGE_IDS = DISPATCH_PAGE_IDS
+        self.DispatchMaintainer = DispatchMaintainer
+        self.DispatchPointer = DispatchPointer
+        self.HeadlessDispatchResolver = HeadlessDispatchResolver
+        self.format_pointer_text = format_pointer_text
+        self.parse_pointers = parse_pointers
+        self.client = MagicMock()
+        self.client.is_configured = True
+        self.client.search = MagicMock(side_effect=AssertionError("workspace search is forbidden"))
+        self.client.query_database = MagicMock(side_effect=AssertionError("workspace search is forbidden"))
+        self.ag_queue = "3c5690f6-eb14-815c-a767-d6952b58f0de"
+        self.ag_in_progress = "3c5690f6-eb14-817e-ba22-f57ea996fec0"
+        self.task = AWEWorkItem(
+            task_id="SF-217",
+            title="SF-217 — Autonomous AWE Worker",
+            lane="Antigravity",
+            role="Parallel Developer",
+            status="Queue",
+            model="Gemini 3.8 Flash",
+            effort="High",
+            sequence=217,
+            task_page_id="aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee",
+            task_page_url="https://app.notion.com/p/aaaaaaaabbbbccccddddeeeeeeeeeeee",
+            dashboard_page_id="dash-page-123",
+        )
+
+    def _children(self, text: str) -> dict:
+        return {
+            "results": [
+                {
+                    "id": f"blk-{i}",
+                    "type": "paragraph",
+                    "paragraph": {"rich_text": [{"plain_text": line}]},
+                }
+                for i, line in enumerate(text.splitlines())
+            ]
+        }
+
+    def test_claim_updates_dispatch_in_same_pass(self):
+        self.client.retrieve_page.side_effect = [
+            {"id": self.task.task_page_id, "parent": {"type": "page_id", "page_id": self.ag_queue}},
+            {"id": "dash-page-123", "properties": {"Status": {"select": {"name": "Queue"}}}},
+        ]
+        self.client.retrieve_block_children.return_value = {"results": []}
+        sor = NotionSourceOfRecord(client=self.client)
+        ok, err = sor.claim_task(self.task, worker_id="w1", slot_key="antigravity/gemini-3.8-flash/high")
+        self.assertTrue(ok, err)
+        self.client.move_page.assert_called_once()
+        self.client.append_block_children.assert_called_once()
+        args, kwargs = self.client.append_block_children.call_args
+        self.assertEqual(args[0], self.DISPATCH_PAGE_IDS["antigravity"])
+        rendered = " ".join(
+            b["paragraph"]["rich_text"][0]["text"]["content"] for b in args[1]
+        )
+        self.assertIn("SF-217", rendered)
+        self.assertIn("In Progress", rendered)
+        self.assertIn("EXECUTABLE", rendered)
+
+    def test_missing_pointer_is_stale(self):
+        self.client.retrieve_block_children.return_value = {"results": []}
+        result = self.HeadlessDispatchResolver(self.client).resolve("antigravity")
+        self.assertFalse(result.ok)
+        self.assertEqual(result.code, self.DISPATCH_STALE)
+        self.client.search.assert_not_called()
+        self.client.query_database.assert_not_called()
+
+    def test_lifecycle_mismatch_is_stale(self):
+        pointer_text = self.format_pointer_text(
+            self.DispatchPointer(
+                task_id="SF-217",
+                execution_profile="Antigravity -> Gemini 3.8 Flash / High",
+                expected_lifecycle_state="Queue",
+                task_page_url=self.task.task_page_url,
+                dispatch_state="EXECUTABLE",
+                harness="antigravity",
+            )
+        )
+        self.client.retrieve_block_children.return_value = self._children(pointer_text)
+        self.client.retrieve_page.return_value = {
+            "id": self.task.task_page_id,
+            "parent": {"type": "page_id", "page_id": self.ag_in_progress},
+        }
+        result = self.HeadlessDispatchResolver(self.client).resolve("antigravity")
+        self.assertFalse(result.ok)
+        self.assertEqual(result.code, self.DISPATCH_STALE)
+        self.assertIn("physical ancestry", result.detail)
+
+    def test_duplicate_slot_without_identity_fails_closed(self):
+        text = "\n".join(
+            [
+                self.format_pointer_text(
+                    self.DispatchPointer(
+                        task_id="SF-217",
+                        execution_profile="Antigravity -> Gemini 3.8 Flash / High",
+                        expected_lifecycle_state="Queue",
+                        task_page_url=self.task.task_page_url,
+                        dispatch_state="EXECUTABLE",
+                        harness="antigravity",
+                    )
+                ),
+                self.format_pointer_text(
+                    self.DispatchPointer(
+                        task_id="SF-219",
+                        execution_profile="Antigravity -> Gemini 3.8 Flash / Medium",
+                        expected_lifecycle_state="Queue",
+                        task_page_url="https://app.notion.com/p/bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+                        dispatch_state="EXECUTABLE",
+                        harness="antigravity",
+                    )
+                ),
+            ]
+        )
+        self.client.retrieve_block_children.return_value = self._children(text)
+        result = self.HeadlessDispatchResolver(self.client).resolve("antigravity")
+        self.assertFalse(result.ok)
+        self.assertEqual(result.code, self.DISPATCH_STALE)
+        self.assertIn("duplicate-slot", result.detail)
+
+    def test_duplicate_slot_with_identity_selects_exact_pointer(self):
+        text = "\n".join(
+            [
+                self.format_pointer_text(
+                    self.DispatchPointer(
+                        task_id="SF-217",
+                        execution_profile="Antigravity -> Gemini 3.8 Flash / High",
+                        expected_lifecycle_state="Queue",
+                        task_page_url=self.task.task_page_url,
+                        dispatch_state="EXECUTABLE",
+                        harness="antigravity",
+                    )
+                ),
+                self.format_pointer_text(
+                    self.DispatchPointer(
+                        task_id="SF-219",
+                        execution_profile="Antigravity -> Gemini 3.8 Flash / Medium",
+                        expected_lifecycle_state="Queue",
+                        task_page_url="https://app.notion.com/p/bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+                        dispatch_state="EXECUTABLE",
+                        harness="antigravity",
+                    )
+                ),
+            ]
+        )
+        self.client.retrieve_block_children.return_value = self._children(text)
+        self.client.retrieve_page.return_value = {
+            "id": self.task.task_page_id,
+            "parent": {"type": "page_id", "page_id": self.ag_queue},
+        }
+        slot = ExecutionSlot(harness="antigravity", model="gemini-3.8-flash", effort="high")
+        result = self.HeadlessDispatchResolver(self.client).resolve("antigravity", slot=slot)
+        self.assertTrue(result.ok, result.detail)
+        self.assertEqual(result.code, "OK")
+        self.assertEqual(result.pointer.task_id, "SF-217")
+        self.client.search.assert_not_called()
+        self.client.query_database.assert_not_called()
+        self.client.retrieve_page.assert_called_once_with(self.task.task_page_id)
+
+    def test_no_executable_task_stops_without_search(self):
+        pointer_text = self.format_pointer_text(
+            self.DispatchPointer(
+                task_id="",
+                execution_profile="Antigravity -> Gemini 3.8 Flash / High",
+                expected_lifecycle_state="Done",
+                task_page_url="",
+                dispatch_state="NO_EXECUTABLE_TASK",
+                harness="antigravity",
+            )
+        )
+        self.client.retrieve_block_children.return_value = self._children(pointer_text)
+        result = self.HeadlessDispatchResolver(self.client).resolve("antigravity")
+        self.assertTrue(result.ok)
+        self.assertEqual(result.code, self.NO_EXECUTABLE_TASK)
+        self.client.retrieve_page.assert_not_called()
+        self.client.search.assert_not_called()
+
+    def test_restart_reconciles_from_dispatch_pointer(self):
+        pointer_text = self.format_pointer_text(
+            self.DispatchPointer(
+                task_id="SF-217",
+                execution_profile="Antigravity -> Gemini 3.8 Flash / High",
+                expected_lifecycle_state="In Progress",
+                task_page_url=self.task.task_page_url,
+                dispatch_state="EXECUTABLE",
+                harness="antigravity",
+            )
+        )
+        self.client.retrieve_block_children.return_value = self._children(pointer_text)
+        self.client.retrieve_page.return_value = {
+            "id": self.task.task_page_id,
+            "parent": {"type": "page_id", "page_id": self.ag_in_progress},
+        }
+        first = self.HeadlessDispatchResolver(self.client).resolve("antigravity")
+        second = self.HeadlessDispatchResolver(self.client).resolve("antigravity")
+        self.assertEqual(first.code, "OK")
+        self.assertEqual(second.code, "OK")
+        self.assertEqual(first.pointer.task_id, second.pointer.task_id)
+        self.assertEqual(self.client.retrieve_block_children.call_count, 2)
+        self.client.search.assert_not_called()
+        self.client.query_database.assert_not_called()
 
 
 if __name__ == "__main__":

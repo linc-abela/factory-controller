@@ -51,7 +51,7 @@ class ExecutionSlot:
                 model=cls._normalize_model(str(raw.get("model", ""))),
                 effort=str(raw.get("effort", "")).strip().lower(),
             )
-        raw_str = str(raw).strip()
+        raw_str = str(raw).strip().replace("→", "->")
         if "->" in raw_str:
             harness_part, rest = raw_str.split("->", 1)
             parts = [harness_part.strip()] + [p.strip() for p in rest.split("/") if p.strip()]

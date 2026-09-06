@@ -12,6 +12,7 @@ import shutil
 import subprocess
 from typing import Any, Protocol
 
+from .dispatch import OWNER_QUEUE_COMMAND
 from .model import AWEWorkItem, GroundingResult, WakeReceipt
 
 
@@ -73,13 +74,7 @@ class AntigravityHarnessAdapter:
                 detail=detail,
             )
 
-        prompt = f"Process task {task.task_id}: {task.title}\nRole: {task.role}\n"
-        if grounding and grounding.ok:
-            prompt += f"Grounding manifest: {grounding.manifest_digest} ({grounding.source})\n"
-            if grounding.selected_paths:
-                prompt += f"Selected paths: {', '.join(grounding.selected_paths[:10])}\n"
-        if task.body_markdown:
-            prompt += f"\n--- TASK PACKET ---\n{task.body_markdown[:2000]}\n"
+        prompt = OWNER_QUEUE_COMMAND
 
         cmd = [
             self.agy_bin,
@@ -163,11 +158,7 @@ class CodexHarnessAdapter:
                 detail=detail,
             )
 
-        prompt = f"Process task {task.task_id}: {task.title}\nRole: {task.role}\n"
-        if grounding and grounding.ok:
-            prompt += f"Grounding manifest: {grounding.manifest_digest} ({grounding.source})\n"
-        if task.body_markdown:
-            prompt += f"\n--- TASK PACKET ---\n{task.body_markdown[:2000]}\n"
+        prompt = OWNER_QUEUE_COMMAND
 
         cmd = [
             self.codex_bin,
@@ -275,7 +266,7 @@ class CursorHarnessAdapter:
             )
 
         # If logged in in future:
-        cmd = [self.cursor_bin, "agent", "-p", f"Process task {task.task_id}"]
+        cmd = [self.cursor_bin, "agent", "-p", OWNER_QUEUE_COMMAND]
         return WakeReceipt(
             success=True,
             harness="cursor",
@@ -320,7 +311,7 @@ class ClaudeHarnessAdapter:
                 error_code=code,
                 detail=detail,
             )
-        prompt = f"Process task {task.task_id}: {task.title}\nRole: {task.role}\n"
+        prompt = OWNER_QUEUE_COMMAND
         cmd = [self.claude_bin, "-p", prompt]
         if dry_run:
             return WakeReceipt(success=True, harness="claude", slot_key=task.slot.key, command=cmd, pid=99997)
