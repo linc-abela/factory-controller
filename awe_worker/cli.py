@@ -64,9 +64,10 @@ def _resolve_task_source(
     source_type: str,
     source_dir: str,
     database_id: str,
+    notion_token: str | None = None,
 ) -> tuple[Any, NotionSourceOfRecord | None]:
     """Resolve task source and optional source-of-record based on configuration."""
-    nc = NotionClient()
+    nc = NotionClient(token=notion_token)
     if source_type == "notion" and nc.is_configured:
         src = LiveNotionTaskSource(client=nc, database_id=database_id)
         sor = NotionSourceOfRecord(client=nc)
@@ -86,6 +87,11 @@ def main(argv: list[str] | None = None) -> int:
         "--db",
         default=os.environ.get("AWE_WORKER_DB", "awe_worker.db"),
         help="Path to SQLite claims ledger database",
+    )
+    parser.add_argument(
+        "--notion-token",
+        default=None,
+        help="Explicitly provisioned Notion token (defaults to NOTION_TOKEN or NOTION_API_KEY env vars)",
     )
 
     subparsers = parser.add_subparsers(dest="command", required=True)
@@ -147,7 +153,9 @@ def main(argv: list[str] | None = None) -> int:
     ledger = AWELedger(args.db)
 
     if args.command == "observe":
-        src, _ = _resolve_task_source(args.source, args.source_dir, args.database_id)
+        src, _ = _resolve_task_source(
+            args.source, args.source_dir, args.database_id, notion_token=args.notion_token
+        )
         obs = AWEObservationService(src)
         slot = ExecutionSlot.parse(args.slot) if args.slot else None
         tasks = obs.filter_eligible(slot=slot)
@@ -224,7 +232,9 @@ def main(argv: list[str] | None = None) -> int:
 
     elif args.command == "cycle":
         slot = ExecutionSlot.parse(args.slot) if args.slot else None
-        src, sor = _resolve_task_source(args.source, args.source_dir, args.database_id)
+        src, sor = _resolve_task_source(
+            args.source, args.source_dir, args.database_id, notion_token=args.notion_token
+        )
         worker = AWEAutonomousWorker(
             ledger=ledger,
             source=src,
@@ -255,7 +265,9 @@ def main(argv: list[str] | None = None) -> int:
 
     elif args.command == "run":
         slot = ExecutionSlot.parse(args.slot) if args.slot else None
-        src, sor = _resolve_task_source(args.source, args.source_dir, args.database_id)
+        src, sor = _resolve_task_source(
+            args.source, args.source_dir, args.database_id, notion_token=args.notion_token
+        )
         worker = AWEAutonomousWorker(
             ledger=ledger,
             source=src,

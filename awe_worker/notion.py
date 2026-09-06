@@ -34,33 +34,105 @@ class NotionAPIError(RuntimeError):
         self.body = body
 
 
-def resolve_notion_token() -> str:
-    """Resolve Notion authentication token from environment or local config."""
-    token = os.environ.get("NOTION_TOKEN") or os.environ.get("NOTION_API_KEY")
-    if token:
+def resolve_notion_token(token: str | None = None) -> str:
+    """Resolve Notion authentication token strictly from environment or argument.
+
+    Never inspects or scavenges another agent harness's configuration files,
+    tokens, or credential stores.
+    """
+    if token and token.strip():
         return token.strip()
-
-    # Fallback to local gemini config if available
-    config_paths = [
-        Path.home() / ".gemini" / "config" / "mcp_config.json",
-        Path.home() / ".gemini" / "antigravity" / "mcp_config.json",
-    ]
-    for cp in config_paths:
-        if cp.is_file():
-            try:
-                data = json.loads(cp.read_text(encoding="utf-8"))
-                env_dict = (
-                    data.get("mcpServers", {})
-                    .get("notion", {})
-                    .get("env", {})
-                )
-                t = env_dict.get("NOTION_TOKEN") or env_dict.get("NOTION_API_KEY")
-                if t:
-                    return str(t).strip()
-            except Exception:
-                continue
-
+    env_token = os.environ.get("NOTION_TOKEN") or os.environ.get("NOTION_API_KEY")
+    if env_token and env_token.strip():
+        return env_token.strip()
     return ""
+
+
+AWE_ROOT_PAGE_ID = "3c5690f6-eb14-81cc-810e-e9ffaa1dc3e5"
+AWE_PROCESSED_PAGE_ID = "3c5690f6-eb14-814f-8623-e5834cddc247"
+
+AWE_LANE_FOLDERS: dict[str, dict[str, str]] = {
+    "antigravity": {
+        "lane_id": "3c5690f6-eb14-8153-8e0d-db7cc6d2120a",
+        "queue": "3c5690f6-eb14-815c-a767-d6952b58f0de",
+        "in_progress": "3c5690f6-eb14-817e-ba22-f57ea996fec0",
+        "blocked": "3c5690f6-eb14-8180-8d85-e791738e1d45",
+        "done": "3c5690f6-eb14-81b7-b578-c9fad99c2e6a",
+    },
+    "codex": {
+        "lane_id": "3c5690f6-eb14-8156-bada-f5ce9ac2cdda",
+        "queue": "3c5690f6-eb14-8150-9704-e986d213f4f7",
+        "in_progress": "3c5690f6-eb14-818f-a036-e1a2634f5408",
+        "blocked": "3c5690f6-eb14-81ba-baf3-fe26ac7e8d83",
+        "done": "3c5690f6-eb14-8169-82e1-fb99cb96f474",
+    },
+    "cursor": {
+        "lane_id": "3d1690f6-eb14-810d-808d-d7f11667ddca",
+        "queue": "3d1690f6-eb14-819a-88b4-c0c020d0f75b",
+        "in_progress": "3d1690f6-eb14-8162-aadd-f7084de14b29",
+        "blocked": "3d1690f6-eb14-8186-905d-fbc76be99deb",
+        "done": "3d1690f6-eb14-8159-9acb-fb86a03bdd0f",
+    },
+    "claude": {
+        "lane_id": "3c5690f6-eb14-81af-ab59-da2f4aa94c23",
+        "queue": "3c5690f6-eb14-81a2-83c7-d68206398dea",
+        "in_progress": "3c5690f6-eb14-816c-b8d4-d0af7827e801",
+        "blocked": "3c5690f6-eb14-8189-be89-ec802c22fdc3",
+        "done": "3c5690f6-eb14-8124-9b14-d1dec66edd6c",
+    },
+}
+
+
+def resolve_physical_folder_status(parent_id: str, lane: str = "") -> str | None:
+    """Resolve canonical physical folder lifecycle status from parent page ID.
+
+    Returns one of: "Queue", "In Progress", "Blocked", "Done", "Processed", or None.
+    """
+    clean_id = parent_id.replace("-", "").lower()
+    if clean_id == AWE_PROCESSED_PAGE_ID.replace("-", "").lower():
+        return AWEStatus.PROCESSED.value
+
+    for l_name, folders in AWE_LANE_FOLDERS.items():
+        if lane and l_name != lane.lower():
+            continue
+        for status_key, folder_id in folders.items():
+            if status_key == "lane_id":
+                continue
+            if clean_id == folder_id.replace("-", "").lower():
+                if status_key == "queue":
+                    return AWEStatus.QUEUE.value
+                elif status_key == "in_progress":
+                    return AWEStatus.IN_PROGRESS.value
+                elif status_key == "blocked":
+                    return AWEStatus.BLOCKED.value
+                elif status_key == "done":
+                    return AWEStatus.DONE.value
+    return None
+
+
+def get_lane_folder_id(lane: str, status_name: str) -> str | None:
+    """Get physical folder UUID for a given harness lane and lifecycle status."""
+    l_key = lane.lower() if lane else "antigravity"
+    folders = AWE_LANE_FOLDERS.get(l_key)
+    if not folders:
+        folders = AWE_LANE_FOLDERS.get("antigravity", {})
+    key_map = {
+        AWEStatus.QUEUE.value.lower(): "queue",
+        AWEStatus.IN_PROGRESS.value.lower(): "in_progress",
+        "in progress": "in_progress",
+        AWEStatus.BLOCKED.value.lower(): "blocked",
+        AWEStatus.DONE.value.lower(): "done",
+        AWEStatus.PROCESSED.value.lower(): "processed",
+        "queue": "queue",
+        "in_progress": "in_progress",
+        "blocked": "blocked",
+        "done": "done",
+        "processed": "processed",
+    }
+    lookup = key_map.get(status_name.lower())
+    if lookup == "processed":
+        return AWE_PROCESSED_PAGE_ID
+    return folders.get(lookup) if lookup else None
 
 
 class NotionClient:
@@ -72,7 +144,7 @@ class NotionClient:
         base_url: str = NOTION_BASE_URL,
         timeout: float = 30.0,
     ) -> None:
-        self.token = token or resolve_notion_token()
+        self.token = resolve_notion_token(token)
         self.base_url = base_url.rstrip("/")
         self.timeout = timeout
 
@@ -164,6 +236,14 @@ class NotionClient:
             payload["children"] = list(children)
         return self._request("POST", "pages", payload)
 
+    def move_page(
+        self,
+        page_id: str,
+        parent: Mapping[str, Any],
+    ) -> dict[str, Any]:
+        """Move a page to a new parent location via POST /v1/pages/{page_id}/move."""
+        return self._request("POST", f"pages/{page_id}/move", {"parent": parent})
+
     def retrieve_block_children(
         self,
         block_id: str,
@@ -194,8 +274,26 @@ class LiveNotionTaskSource:
         self.client = client or NotionClient()
         self.database_id = os.environ.get("AWE_NOTION_DATABASE_ID", database_id)
 
+    def verify_physical_status(self, task: AWEWorkItem) -> AWEWorkItem:
+        """Bind canonical physical lifecycle status from the task page's parent folder."""
+        if not self.client.is_configured or not task.task_page_id:
+            return task
+
+        try:
+            page_obj = self.client.retrieve_page(task.task_page_id)
+            parent_info = page_obj.get("parent", {})
+            if parent_info.get("type") == "page_id":
+                parent_page_id = parent_info.get("page_id", "")
+                phys_status = resolve_physical_folder_status(parent_page_id, lane=task.lane)
+                if phys_status and phys_status != task.status:
+                    import dataclasses
+                    return dataclasses.replace(task, status=phys_status)
+        except Exception:
+            pass
+        return task
+
     def fetch_tasks(self, filter_status: str | None = None) -> list[AWEWorkItem]:
-        """Fetch all pages from Notion AWE database, handling pagination."""
+        """Fetch all pages from Notion AWE database, handling pagination and physical ancestry."""
         if not self.client.is_configured:
             return []
 
@@ -227,12 +325,48 @@ class LiveNotionTaskSource:
             try:
                 item = self._parse_row_to_work_item(row)
                 if item:
+                    # Canonical truth: verify physical folder ancestry
+                    item = self.verify_physical_status(item)
+                    if filter_status and item.status.lower() != filter_status.lower():
+                        continue
                     items.append(item)
             except Exception:
                 continue
 
         items.sort(key=lambda x: (x.sequence, x.task_id))
         return items
+
+    def fetch_tasks_from_physical_folder(
+        self,
+        lane: str,
+        folder_name: str = "queue",
+    ) -> list[dict[str, Any]]:
+        """Fetch child task pages physically residing in a specific lane folder."""
+        if not self.client.is_configured:
+            return []
+        folder_id = get_lane_folder_id(lane, folder_name)
+        if not folder_id:
+            return []
+
+        results: list[dict[str, Any]] = []
+        cursor: str | None = None
+        while True:
+            resp = self.client.retrieve_block_children(
+                folder_id, page_size=100, start_cursor=cursor
+            )
+            for b in resp.get("results", []):
+                if b.get("type") == "child_page":
+                    results.append({
+                        "page_id": b.get("id"),
+                        "title": b.get("child_page", {}).get("title", ""),
+                        "parent_id": folder_id,
+                        "lane": lane,
+                        "folder": folder_name,
+                    })
+            if not resp.get("has_more") or not resp.get("next_cursor"):
+                break
+            cursor = resp["next_cursor"]
+        return results
 
     def _parse_row_to_work_item(self, row: dict[str, Any]) -> AWEWorkItem | None:
         props = row.get("properties", {})
@@ -350,52 +484,90 @@ class NotionSourceOfRecord:
     ) -> tuple[bool, str]:
         """Atomically claim a task in Notion source of record (Queue -> In Progress).
 
-        Performs optimistic compare-and-swap check against Notion page properties.
+        Canonical lifecycle truth is the task page's physical folder ancestry:
+        1. Verifies the physical task page is currently in the lane's Queue folder.
+        2. Moves the physical task page to the lane's In Progress folder.
+        3. Synchronizes the dashboard projection row with Status='In Progress',
+           worker lease notes, and fencing metadata as ONE logical transition.
         """
         if not self.client.is_configured:
             return False, "NOTION_NOT_CONFIGURED"
 
+        lane_key = task.lane.lower() if task.lane else "antigravity"
+        expected_queue_id = get_lane_folder_id(lane_key, "queue")
+        target_in_progress_id = get_lane_folder_id(lane_key, "in_progress")
+
+        # 1. Verify physical task page ancestry
+        if task.task_page_id and expected_queue_id:
+            try:
+                page_obj = self.client.retrieve_page(task.task_page_id)
+                parent_info = page_obj.get("parent", {})
+                parent_page_id = parent_info.get("page_id", "") if parent_info.get("type") == "page_id" else ""
+                clean_parent = parent_page_id.replace("-", "").lower()
+                clean_queue = expected_queue_id.replace("-", "").lower()
+                clean_in_prog = target_in_progress_id.replace("-", "").lower() if target_in_progress_id else ""
+
+                if clean_parent == clean_in_prog:
+                    # Resumption allowed if already In Progress
+                    pass
+                elif clean_parent != clean_queue:
+                    actual_status = resolve_physical_folder_status(parent_page_id, lane=lane_key) or "Unknown"
+                    return False, f"PHYSICAL_ANCESTRY_CONFLICT: task {task.task_id} page is physically in '{actual_status}' ({parent_page_id}), not Queue"
+            except NotionAPIError as exc:
+                return False, f"NOTION_API_ERROR checking physical page: {exc}"
+
+        # 2. Check dashboard row state
         page_id = task.dashboard_page_id
-        if not page_id:
-            return False, "NO_DASHBOARD_PAGE_ID"
+        if page_id:
+            try:
+                current_page = self.client.retrieve_page(page_id)
+                current_status = (
+                    current_page.get("properties", {})
+                    .get("Status", {})
+                    .get("select", {})
+                    .get("name", "")
+                )
+                if current_status != AWEStatus.QUEUE.value:
+                    current_notes_list = current_page.get("properties", {}).get("Notes", {}).get("rich_text", [])
+                    current_notes_text = "".join(t.get("plain_text", "") for t in current_notes_list)
+                    if current_status == AWEStatus.IN_PROGRESS.value and f"Claimed by {worker_id}" in current_notes_text:
+                        pass  # Resumption by same worker allowed
+                    else:
+                        return False, f"SOURCE_OF_RECORD_CONFLICT: task {task.task_id} dashboard status is '{current_status}' (not Queue), held by another worker"
+            except NotionAPIError as exc:
+                return False, f"NOTION_API_ERROR checking dashboard page: {exc}"
 
-        try:
-            current_page = self.client.retrieve_page(page_id)
-            current_status = (
-                current_page.get("properties", {})
-                .get("Status", {})
-                .get("select", {})
-                .get("name", "")
-            )
-            # Check if task is still in Queue (or already assigned to this worker)
-            if current_status != AWEStatus.QUEUE.value:
-                current_notes_list = current_page.get("properties", {}).get("Notes", {}).get("rich_text", [])
-                current_notes_text = "".join(t.get("plain_text", "") for t in current_notes_list)
-                if current_status == AWEStatus.IN_PROGRESS.value and f"Claimed by {worker_id}" in current_notes_text:
-                    pass  # Resumption by same worker allowed
-                else:
-                    return False, f"SOURCE_OF_RECORD_CONFLICT: task {task.task_id} status is '{current_status}' (not Queue), held by another worker"
+        # 3. Execute physical move to In Progress folder
+        if task.task_page_id and target_in_progress_id:
+            try:
+                self.client.move_page(
+                    task.task_page_id,
+                    parent={"type": "page_id", "page_id": target_in_progress_id},
+                )
+            except NotionAPIError as exc:
+                return False, f"NOTION_API_ERROR moving task page to In Progress: {exc}"
 
-            now_iso = datetime.datetime.now(datetime.timezone.utc).date().isoformat()
-            claim_note = f"Claimed by {worker_id} ({slot_key}) at {now_iso}; lease {lease_seconds:.0f}s"
-
-            self.client.update_page(
-                page_id=page_id,
-                properties={
-                    "Status": {"select": {"name": AWEStatus.IN_PROGRESS.value}},
-                    "Current": {"checkbox": True},
-                    "Notes": {
-                        "rich_text": [
-                            {"type": "text", "text": {"content": claim_note[:2000]}}
-                        ]
+        # 4. Reconcile dashboard projection row
+        now_iso = datetime.datetime.now(datetime.timezone.utc).date().isoformat()
+        claim_note = f"Claimed by {worker_id} ({slot_key}) at {now_iso}; lease {lease_seconds:.0f}s"
+        if page_id:
+            try:
+                self.client.update_page(
+                    page_id=page_id,
+                    properties={
+                        "Status": {"select": {"name": AWEStatus.IN_PROGRESS.value}},
+                        "Current": {"checkbox": True},
+                        "Notes": {
+                            "rich_text": [
+                                {"type": "text", "text": {"content": claim_note[:2000]}}
+                            ]
+                        },
                     },
-                },
-            )
-            return True, ""
-        except NotionAPIError as exc:
-            return False, f"NOTION_API_ERROR: {exc}"
-        except Exception as exc:
-            return False, f"CLAIM_EXCEPTION: {exc}"
+                )
+            except NotionAPIError as exc:
+                return False, f"NOTION_API_ERROR updating dashboard projection: {exc}"
+
+        return True, ""
 
     def complete_task(
         self,
@@ -404,34 +576,53 @@ class NotionSourceOfRecord:
         evidence_ref: str = "",
         notes: str = "",
     ) -> bool:
-        """Move task to Done in Notion and record verdict and completion notes."""
-        if not self.client.is_configured or not task.dashboard_page_id:
+        """Move task to Done in Notion and record verdict and completion notes.
+
+        Reconciles physical folder move (-> Done) and dashboard projection row as
+        ONE logical transition.
+        """
+        if not self.client.is_configured:
             return False
 
-        now_iso = datetime.datetime.now(datetime.timezone.utc).date().isoformat()
-        full_note = notes or f"Completed by worker. Evidence: {evidence_ref}"
+        lane_key = task.lane.lower() if task.lane else "antigravity"
+        done_folder_id = get_lane_folder_id(lane_key, "done")
 
-        try:
-            self.client.update_page(
-                page_id=task.dashboard_page_id,
-                properties={
-                    "Status": {"select": {"name": AWEStatus.DONE.value}},
-                    "Verdict": {
-                        "rich_text": [
-                            {"type": "text", "text": {"content": verdict[:2000]}}
-                        ]
+        # 1. Move physical task page to Done folder
+        if task.task_page_id and done_folder_id:
+            try:
+                self.client.move_page(
+                    task.task_page_id,
+                    parent={"type": "page_id", "page_id": done_folder_id},
+                )
+            except Exception:
+                pass
+
+        # 2. Update dashboard projection row
+        if task.dashboard_page_id:
+            now_iso = datetime.datetime.now(datetime.timezone.utc).date().isoformat()
+            full_note = notes or f"Completed by worker. Evidence: {evidence_ref}"
+            try:
+                self.client.update_page(
+                    page_id=task.dashboard_page_id,
+                    properties={
+                        "Status": {"select": {"name": AWEStatus.DONE.value}},
+                        "Verdict": {
+                            "rich_text": [
+                                {"type": "text", "text": {"content": verdict[:2000]}}
+                            ]
+                        },
+                        "Notes": {
+                            "rich_text": [
+                                {"type": "text", "text": {"content": full_note[:2000]}}
+                            ]
+                        },
+                        "Last Checkpoint": {"date": {"start": now_iso}},
                     },
-                    "Notes": {
-                        "rich_text": [
-                            {"type": "text", "text": {"content": full_note[:2000]}}
-                        ]
-                    },
-                    "Last Checkpoint": {"date": {"start": now_iso}},
-                },
-            )
-            return True
-        except Exception:
-            return False
+                )
+                return True
+            except Exception:
+                return False
+        return True
 
     def block_task(
         self,
@@ -439,27 +630,47 @@ class NotionSourceOfRecord:
         reason: str,
         detail: str = "",
     ) -> bool:
-        """Move task to Blocked in Notion with escalation reason."""
-        if not self.client.is_configured or not task.dashboard_page_id:
+        """Move task to Blocked in Notion with escalation reason.
+
+        Reconciles physical folder move (-> Blocked) and dashboard projection row
+        as ONE logical transition.
+        """
+        if not self.client.is_configured:
             return False
 
-        block_note = f"BLOCKED: {reason} — {detail}"
-        try:
-            self.client.update_page(
-                page_id=task.dashboard_page_id,
-                properties={
-                    "Status": {"select": {"name": AWEStatus.BLOCKED.value}},
-                    "Needs Owner": {"checkbox": True},
-                    "Notes": {
-                        "rich_text": [
-                            {"type": "text", "text": {"content": block_note[:2000]}}
-                        ]
+        lane_key = task.lane.lower() if task.lane else "antigravity"
+        blocked_folder_id = get_lane_folder_id(lane_key, "blocked")
+
+        # 1. Move physical task page to Blocked folder
+        if task.task_page_id and blocked_folder_id:
+            try:
+                self.client.move_page(
+                    task.task_page_id,
+                    parent={"type": "page_id", "page_id": blocked_folder_id},
+                )
+            except Exception:
+                pass
+
+        # 2. Update dashboard projection row
+        if task.dashboard_page_id:
+            block_note = f"BLOCKED: {reason} — {detail}"
+            try:
+                self.client.update_page(
+                    page_id=task.dashboard_page_id,
+                    properties={
+                        "Status": {"select": {"name": AWEStatus.BLOCKED.value}},
+                        "Needs Owner": {"checkbox": True},
+                        "Notes": {
+                            "rich_text": [
+                                {"type": "text", "text": {"content": block_note[:2000]}}
+                            ]
+                        },
                     },
-                },
-            )
-            return True
-        except Exception:
-            return False
+                )
+                return True
+            except Exception:
+                return False
+        return True
 
     def route_rework(
         self,
@@ -467,30 +678,49 @@ class NotionSourceOfRecord:
         verdict: str,
         defects: Sequence[str],
     ) -> bool:
-        """Route defects back to same producer lineage as rework in Notion."""
-        if not self.client.is_configured or not task.dashboard_page_id:
+        """Route defects back to same producer lineage as rework in Notion.
+
+        Reconciles physical folder move (-> Queue) and dashboard projection row as
+        ONE logical transition.
+        """
+        if not self.client.is_configured:
             return False
 
-        defect_summary = "; ".join(defects) if defects else "Rework required by certifier"
-        rework_note = f"REWORK_REQUIRED: {defect_summary}"
+        lane_key = task.lane.lower() if task.lane else "antigravity"
+        queue_folder_id = get_lane_folder_id(lane_key, "queue")
 
-        try:
-            self.client.update_page(
-                page_id=task.dashboard_page_id,
-                properties={
-                    "Status": {"select": {"name": AWEStatus.QUEUE.value}},
-                    "Verdict": {
-                        "rich_text": [
-                            {"type": "text", "text": {"content": verdict[:2000]}}
-                        ]
+        # 1. Move physical task page back to Queue folder
+        if task.task_page_id and queue_folder_id:
+            try:
+                self.client.move_page(
+                    task.task_page_id,
+                    parent={"type": "page_id", "page_id": queue_folder_id},
+                )
+            except Exception:
+                pass
+
+        # 2. Update dashboard projection row
+        if task.dashboard_page_id:
+            defect_summary = "; ".join(defects) if defects else "Rework required by certifier"
+            rework_note = f"REWORK_REQUIRED: {defect_summary}"
+            try:
+                self.client.update_page(
+                    page_id=task.dashboard_page_id,
+                    properties={
+                        "Status": {"select": {"name": AWEStatus.QUEUE.value}},
+                        "Verdict": {
+                            "rich_text": [
+                                {"type": "text", "text": {"content": verdict[:2000]}}
+                            ]
+                        },
+                        "Notes": {
+                            "rich_text": [
+                                {"type": "text", "text": {"content": rework_note[:2000]}}
+                            ]
+                        },
                     },
-                    "Notes": {
-                        "rich_text": [
-                            {"type": "text", "text": {"content": rework_note[:2000]}}
-                        ]
-                    },
-                },
-            )
-            return True
-        except Exception:
-            return False
+                )
+                return True
+            except Exception:
+                return False
+        return True

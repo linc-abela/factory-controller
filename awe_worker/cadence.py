@@ -99,8 +99,11 @@ class CadenceContinuationCoordinator:
         )
 
         if gate.outcome == GateOutcome.ACCEPT:
-            # Reconcile ACCEPT: mark producer task Done, activate conditional next task
-            next_task_id = self._find_conditional_next_task(task_id, all_exchange_tasks)
+            # Reconcile ACCEPT: mark producer task Done with exact candidate evidence.
+            # NOTE: Cadence authority remains external to the worker: PR merge/integration
+            # and activation of dependent tasks remain strictly behind the canonical
+            # exact-head integration authority (merge gate / Factory Checkpoint).
+            # The worker does NOT merge PRs or activate downstream dependent tasks.
             if self.source_of_record:
                 self.source_of_record.complete_task(
                     producer_task,
@@ -108,22 +111,14 @@ class CadenceContinuationCoordinator:
                     evidence_ref=head_sha,
                     notes=gate.detail,
                 )
-                if next_task_id:
-                    # Activate dependent next task
-                    next_task = next((t for t in all_exchange_tasks if t.task_id == next_task_id), None)
-                    if next_task and next_task.dashboard_page_id:
-                        self.source_of_record.client.update_page(
-                            page_id=next_task.dashboard_page_id,
-                            properties={"Status": {"select": {"name": AWEStatus.QUEUE.value}}},
-                        )
 
             return CadenceAction(
                 action_type="GATE_ACCEPTED",
                 task_id=task_id,
                 head_sha=head_sha,
                 verdict="ACCEPT",
-                activated_next_task=next_task_id,
-                detail=gate.detail,
+                activated_next_task=None,
+                detail=f"{gate.detail} (PR merge and dependent task activation withheld for canonical integration authority)",
             )
 
         elif gate.outcome == GateOutcome.REJECT:

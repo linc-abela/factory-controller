@@ -508,63 +508,90 @@ class NotionSourceOfRecordTests(unittest.TestCase):
             model="Gemini 3.8 Flash",
             effort="High",
             sequence=217,
-            dashboard_page_id="page-123",
+            task_page_id="task-page-123",
+            dashboard_page_id="dash-page-123",
         )
 
-    def test_claim_task_optimistic_cas_success(self):
+    def test_claim_task_reconciles_physical_move_and_dashboard(self):
         self.mock_client.is_configured = True
-        self.mock_client.retrieve_page.return_value = {
-            "properties": {"Status": {"select": {"name": "Queue"}}}
-        }
+        # Page retrieval returns physical parent in Queue
+        queue_folder_id = "3c5690f6-eb14-815c-a767-d6952b58f0de"
+        self.mock_client.retrieve_page.side_effect = [
+            {"id": "task-page-123", "parent": {"type": "page_id", "page_id": queue_folder_id}},
+            {"id": "dash-page-123", "properties": {"Status": {"select": {"name": "Queue"}}}},
+        ]
         ok, err = self.sor.claim_task(self.task, worker_id="w1", slot_key="antigravity/flash/high")
         self.assertTrue(ok)
         self.assertEqual(err, "")
+        # Verify physical move called with in_progress folder
+        self.mock_client.move_page.assert_called_once()
+        move_args, move_kwargs = self.mock_client.move_page.call_args
+        self.assertEqual(move_args[0], "task-page-123")
+        self.assertEqual(move_kwargs["parent"]["page_id"], "3c5690f6-eb14-817e-ba22-f57ea996fec0")
+        # Verify dashboard update called
         self.mock_client.update_page.assert_called_once()
-        args, kwargs = self.mock_client.update_page.call_args
-        self.assertEqual(kwargs["page_id"], "page-123")
-        self.assertEqual(kwargs["properties"]["Status"]["select"]["name"], "In Progress")
+        up_args, up_kwargs = self.mock_client.update_page.call_args
+        self.assertEqual(up_kwargs["page_id"], "dash-page-123")
+        self.assertEqual(up_kwargs["properties"]["Status"]["select"]["name"], "In Progress")
 
-    def test_claim_task_optimistic_cas_conflict(self):
+    def test_claim_task_physical_ancestry_conflict(self):
         self.mock_client.is_configured = True
+        # Physical parent is already Done folder, not Queue
+        done_folder_id = "3c5690f6-eb14-81b7-b578-c9fad99c2e6a"
         self.mock_client.retrieve_page.return_value = {
-            "properties": {"Status": {"select": {"name": "In Progress"}}}
+            "id": "task-page-123",
+            "parent": {"type": "page_id", "page_id": done_folder_id},
         }
-        # If task is already claimed by someone else, CAS fails
-        # Let task status in object be Queue to test race condition
         ok, err = self.sor.claim_task(self.task, worker_id="w2", slot_key="antigravity/flash/high")
-        # In our implementation: if status is In Progress already, it allows resumption only if same worker, but from Queue it reports conflict if not in Queue
-        self.mock_client.retrieve_page.return_value = {
-            "properties": {"Status": {"select": {"name": "Done"}}}
-        }
+        self.assertFalse(ok)
+        self.assertIn("PHYSICAL_ANCESTRY_CONFLICT", err)
+        self.mock_client.move_page.assert_not_called()
+        self.mock_client.update_page.assert_not_called()
+
+    def test_claim_task_dashboard_conflict(self):
+        self.mock_client.is_configured = True
+        queue_folder_id = "3c5690f6-eb14-815c-a767-d6952b58f0de"
+        self.mock_client.retrieve_page.side_effect = [
+            {"id": "task-page-123", "parent": {"type": "page_id", "page_id": queue_folder_id}},
+            {"id": "dash-page-123", "properties": {"Status": {"select": {"name": "In Progress"}}, "Notes": {"rich_text": [{"plain_text": "Claimed by other"}]}}},
+        ]
         ok, err = self.sor.claim_task(self.task, worker_id="w2", slot_key="antigravity/flash/high")
         self.assertFalse(ok)
         self.assertIn("SOURCE_OF_RECORD_CONFLICT", err)
 
-    def test_complete_task_updates_notion(self):
+    def test_complete_task_moves_physical_page_to_done(self):
         self.mock_client.is_configured = True
         res = self.sor.complete_task(self.task, verdict="ACCEPT — abc1234", evidence_ref="abc1234", notes="All green")
         self.assertTrue(res)
+        self.mock_client.move_page.assert_called_once()
+        move_args, move_kwargs = self.mock_client.move_page.call_args
+        self.assertEqual(move_args[0], "task-page-123")
+        self.assertEqual(move_kwargs["parent"]["page_id"], "3c5690f6-eb14-81b7-b578-c9fad99c2e6a")
         self.mock_client.update_page.assert_called_once()
-        args, kwargs = self.mock_client.update_page.call_args
-        self.assertEqual(kwargs["properties"]["Status"]["select"]["name"], "Done")
-        self.assertEqual(kwargs["properties"]["Verdict"]["rich_text"][0]["type"], "text")
+        up_args, up_kwargs = self.mock_client.update_page.call_args
+        self.assertEqual(up_kwargs["properties"]["Status"]["select"]["name"], "Done")
 
-    def test_block_task_updates_notion(self):
+    def test_block_task_moves_physical_page_to_blocked(self):
         self.mock_client.is_configured = True
         res = self.sor.block_task(self.task, reason="NEEDS_OWNER", detail="destructive operation")
         self.assertTrue(res)
+        self.mock_client.move_page.assert_called_once()
+        move_args, move_kwargs = self.mock_client.move_page.call_args
+        self.assertEqual(move_kwargs["parent"]["page_id"], "3c5690f6-eb14-8180-8d85-e791738e1d45")
         self.mock_client.update_page.assert_called_once()
-        args, kwargs = self.mock_client.update_page.call_args
-        self.assertEqual(kwargs["properties"]["Status"]["select"]["name"], "Blocked")
-        self.assertTrue(kwargs["properties"]["Needs Owner"]["checkbox"])
+        up_args, up_kwargs = self.mock_client.update_page.call_args
+        self.assertEqual(up_kwargs["properties"]["Status"]["select"]["name"], "Blocked")
 
-    def test_route_rework_updates_notion(self):
+    def test_route_rework_moves_physical_page_to_queue(self):
         self.mock_client.is_configured = True
-        res = self.sor.route_rework(self.task, verdict="REWORK_REQUIRED", defects=["Test failed", "Escaped sandbox"])
+        res = self.sor.route_rework(self.task, verdict="REWORK_REQUIRED", defects=["Test failed"])
         self.assertTrue(res)
+        self.mock_client.move_page.assert_called_once()
+        move_args, move_kwargs = self.mock_client.move_page.call_args
+        self.assertEqual(move_kwargs["parent"]["page_id"], "3c5690f6-eb14-815c-a767-d6952b58f0de")
         self.mock_client.update_page.assert_called_once()
-        args, kwargs = self.mock_client.update_page.call_args
-        self.assertEqual(kwargs["properties"]["Status"]["select"]["name"], "Queue")
+        up_args, up_kwargs = self.mock_client.update_page.call_args
+        self.assertEqual(up_kwargs["properties"]["Status"]["select"]["name"], "Queue")
 
 
 class TwoTierClaimFencingTests(unittest.TestCase):
@@ -760,7 +787,7 @@ class CadenceContinuationCoordinatorTests(unittest.TestCase):
         self.assertIn("SF-213", action.queued_tasks)
         self.assertIn("SF-214", action.queued_tasks)
 
-    def test_both_accept_unblocks_dependent_task(self):
+    def test_both_accept_marks_done_and_withholds_merge_authority(self):
         certs = [
             CertificationRecord(
                 task_id="SF-212",
@@ -784,7 +811,9 @@ class CadenceContinuationCoordinatorTests(unittest.TestCase):
             certifications=certs,
         )
         self.assertEqual(action.action_type, "GATE_ACCEPTED")
-        self.assertEqual(action.activated_next_task, "SF-202")
+        # Integration authority remains external: worker does NOT activate next task
+        self.assertIsNone(action.activated_next_task)
+        self.assertIn("withheld for canonical integration authority", action.detail)
 
     def test_reject_routes_rework_and_does_not_activate_next_task(self):
         certs = [
@@ -815,10 +844,113 @@ class CadenceContinuationCoordinatorTests(unittest.TestCase):
         self.assertIn("Host escape flaw detected", action.defects)
 
 
+class PhysicalAncestryResolutionTests(unittest.TestCase):
+    def test_resolve_physical_folder_status(self):
+        from awe_worker.notion import (
+            AWE_LANE_FOLDERS,
+            AWE_PROCESSED_PAGE_ID,
+            resolve_physical_folder_status,
+        )
+        # Queue
+        antigravity_queue = AWE_LANE_FOLDERS["antigravity"]["queue"]
+        self.assertEqual(resolve_physical_folder_status(antigravity_queue, "antigravity"), "Queue")
+
+        # In Progress
+        antigravity_in_prog = AWE_LANE_FOLDERS["antigravity"]["in_progress"]
+        self.assertEqual(resolve_physical_folder_status(antigravity_in_prog, "antigravity"), "In Progress")
+
+        # Blocked
+        antigravity_blocked = AWE_LANE_FOLDERS["antigravity"]["blocked"]
+        self.assertEqual(resolve_physical_folder_status(antigravity_blocked, "antigravity"), "Blocked")
+
+        # Done
+        antigravity_done = AWE_LANE_FOLDERS["antigravity"]["done"]
+        self.assertEqual(resolve_physical_folder_status(antigravity_done, "antigravity"), "Done")
+
+        # Processed
+        self.assertEqual(resolve_physical_folder_status(AWE_PROCESSED_PAGE_ID), "Processed")
+
+    def test_verify_physical_status_overrides_dashboard_drift(self):
+        from awe_worker.notion import LiveNotionTaskSource
+        mock_client = MagicMock()
+        mock_client.is_configured = True
+        # Physical page in In Progress folder, while dashboard row had claimed Queue
+        mock_client.retrieve_page.return_value = {
+            "id": "task-page-drift",
+            "parent": {"type": "page_id", "page_id": "3c5690f6-eb14-817e-ba22-f57ea996fec0"},
+        }
+        source = LiveNotionTaskSource(client=mock_client)
+        task = AWEWorkItem(
+            task_id="SF-217",
+            title="SF-217",
+            lane="Antigravity",
+            role="Parallel Developer",
+            status="Queue",  # Drift: dashboard had Queue
+            model="Gemini 3.8 Flash",
+            effort="High",
+            sequence=217,
+            task_page_id="task-page-drift",
+        )
+        verified_task = source.verify_physical_status(task)
+        # Physical ancestry overrides dashboard drift!
+        self.assertEqual(verified_task.status, "In Progress")
+
+
+class ConcurrentClaimSingleWinnerTests(unittest.TestCase):
+    def test_concurrent_threads_single_winner(self):
+        import threading
+        with tempfile.TemporaryDirectory() as tmpdir:
+            db_path = Path(tmpdir) / "concurrent_test.db"
+            ledger = AWELedger(db_path)
+
+            task_id = "SF-CONCURRENT-1"
+            results = []
+            barrier = threading.Barrier(5)
+
+            def try_claim(worker_num):
+                worker_id = f"worker-{worker_num}"
+                barrier.wait()
+                res = ledger.claim(
+                    task_id=task_id,
+                    lineage_id=task_id,
+                    worker_id=worker_id,
+                    slot_key="antigravity/flash/high",
+                    lease_seconds=60.0,
+                )
+                results.append((worker_id, res.ok, res.code))
+
+            threads = [threading.Thread(target=try_claim, args=(i,)) for i in range(5)]
+            for t in threads:
+                t.start()
+            for t in threads:
+                t.join()
+
+            # Exactly one winner!
+            winners = [r for r in results if r[1] is True]
+            losers = [r for r in results if r[1] is False]
+            self.assertEqual(len(winners), 1)
+            self.assertEqual(len(losers), 4)
+            for l in losers:
+                self.assertEqual(l[2], "CLAIM_CONFLICT")
+
+
+class NoCredentialScavengingTests(unittest.TestCase):
+    def test_resolve_notion_token_zero_file_scavenging(self):
+        from awe_worker.notion import resolve_notion_token
+        # 1. Argument takes precedence
+        self.assertEqual(resolve_notion_token("explicit-token"), "explicit-token")
+
+        # 2. Environment variable
+        with patch.dict(os.environ, {"NOTION_TOKEN": "env-token"}):
+            self.assertEqual(resolve_notion_token(), "env-token")
+
+        # 3. If neither provided, returns empty string without reading files
+        with patch.dict(os.environ, {}, clear=True):
+            self.assertEqual(resolve_notion_token(), "")
+
+
 class CLIContractTests(unittest.TestCase):
     def test_cli_live_and_dry_run_flags(self):
-        from awe_worker.cli import main
-        # Test that --live flag parses dry_run=False
         import argparse
         from awe_worker.cli import _add_dry_run_arguments
         p = argparse.ArgumentParser()
@@ -839,6 +971,21 @@ class CLIContractTests(unittest.TestCase):
         # --dry-run explicitly keeps dry_run=True
         args_dry = p.parse_args(["--dry-run"])
         self.assertTrue(args_dry.dry_run)
+
+
+class LiveDemonstrationRegressionTests(unittest.TestCase):
+    def test_controlled_demonstration_dry_run(self):
+        from validation.awe_worker_live_demo import run_live_demonstration
+        results = run_live_demonstration(live=False)
+        self.assertTrue(results["passed"])
+        self.assertEqual(results["mode"], "MOCK_DRY_RUN")
+        self.assertEqual(results["steps"]["step2_observe"], "PASSED")
+        self.assertEqual(results["steps"]["step3_claim_concurrency"], "PASSED")
+        self.assertEqual(results["steps"]["step4_grounding"], "PASSED")
+        self.assertEqual(results["steps"]["step5_harness_wake"], "PASSED")
+        self.assertEqual(results["steps"]["step6_terminal_completion"], "PASSED")
+        self.assertEqual(results["steps"]["step7_recovery"], "PASSED")
+        self.assertEqual(results["steps"]["step8_teardown"], "PASSED")
 
 
 if __name__ == "__main__":
