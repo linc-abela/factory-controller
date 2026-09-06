@@ -21,6 +21,7 @@ import unittest
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
+from awe_worker.cadence import CadenceContinuationCoordinator
 from awe_worker.detector import CompletionDetector
 from awe_worker.escalation import OwnerEscalationGate
 from awe_worker.grounding import ContextBrokerGrounder
@@ -35,17 +36,20 @@ from awe_worker.ledger import AWELedger
 from awe_worker.model import (
     AWEStatus,
     AWEWorkItem,
+    CandidateHead,
     CertificationRecord,
     CertificationVerdict,
     ExecutionSlot,
     GateOutcome,
 )
+from awe_worker.notion import NotionSourceOfRecord
 from awe_worker.observation import (
     AWEObservationService,
     DirectoryTaskSource,
     MemoryTaskSource,
 )
 from awe_worker.reconciliation import TurnCadenceReconciler
+from awe_worker.scheduler import AWEScheduledRunner
 from awe_worker.worker import AWEAutonomousWorker
 
 
@@ -491,5 +495,352 @@ class ControlledAutonomousCycleTests(unittest.TestCase):
         self.assertEqual(claim["worker_id"], "test-worker")
 
 
+class NotionSourceOfRecordTests(unittest.TestCase):
+    def setUp(self):
+        self.mock_client = MagicMock()
+        self.sor = NotionSourceOfRecord(client=self.mock_client)
+        self.task = AWEWorkItem(
+            task_id="SF-217",
+            title="SF-217 — Autonomous AWE Worker",
+            lane="Antigravity",
+            role="Parallel Developer",
+            status="Queue",
+            model="Gemini 3.8 Flash",
+            effort="High",
+            sequence=217,
+            dashboard_page_id="page-123",
+        )
+
+    def test_claim_task_optimistic_cas_success(self):
+        self.mock_client.is_configured = True
+        self.mock_client.retrieve_page.return_value = {
+            "properties": {"Status": {"select": {"name": "Queue"}}}
+        }
+        ok, err = self.sor.claim_task(self.task, worker_id="w1", slot_key="antigravity/flash/high")
+        self.assertTrue(ok)
+        self.assertEqual(err, "")
+        self.mock_client.update_page.assert_called_once()
+        args, kwargs = self.mock_client.update_page.call_args
+        self.assertEqual(kwargs["page_id"], "page-123")
+        self.assertEqual(kwargs["properties"]["Status"]["select"]["name"], "In Progress")
+
+    def test_claim_task_optimistic_cas_conflict(self):
+        self.mock_client.is_configured = True
+        self.mock_client.retrieve_page.return_value = {
+            "properties": {"Status": {"select": {"name": "In Progress"}}}
+        }
+        # If task is already claimed by someone else, CAS fails
+        # Let task status in object be Queue to test race condition
+        ok, err = self.sor.claim_task(self.task, worker_id="w2", slot_key="antigravity/flash/high")
+        # In our implementation: if status is In Progress already, it allows resumption only if same worker, but from Queue it reports conflict if not in Queue
+        self.mock_client.retrieve_page.return_value = {
+            "properties": {"Status": {"select": {"name": "Done"}}}
+        }
+        ok, err = self.sor.claim_task(self.task, worker_id="w2", slot_key="antigravity/flash/high")
+        self.assertFalse(ok)
+        self.assertIn("SOURCE_OF_RECORD_CONFLICT", err)
+
+    def test_complete_task_updates_notion(self):
+        self.mock_client.is_configured = True
+        res = self.sor.complete_task(self.task, verdict="ACCEPT — abc1234", evidence_ref="abc1234", notes="All green")
+        self.assertTrue(res)
+        self.mock_client.update_page.assert_called_once()
+        args, kwargs = self.mock_client.update_page.call_args
+        self.assertEqual(kwargs["properties"]["Status"]["select"]["name"], "Done")
+        self.assertEqual(kwargs["properties"]["Verdict"]["rich_text"][0]["type"], "text")
+
+    def test_block_task_updates_notion(self):
+        self.mock_client.is_configured = True
+        res = self.sor.block_task(self.task, reason="NEEDS_OWNER", detail="destructive operation")
+        self.assertTrue(res)
+        self.mock_client.update_page.assert_called_once()
+        args, kwargs = self.mock_client.update_page.call_args
+        self.assertEqual(kwargs["properties"]["Status"]["select"]["name"], "Blocked")
+        self.assertTrue(kwargs["properties"]["Needs Owner"]["checkbox"])
+
+    def test_route_rework_updates_notion(self):
+        self.mock_client.is_configured = True
+        res = self.sor.route_rework(self.task, verdict="REWORK_REQUIRED", defects=["Test failed", "Escaped sandbox"])
+        self.assertTrue(res)
+        self.mock_client.update_page.assert_called_once()
+        args, kwargs = self.mock_client.update_page.call_args
+        self.assertEqual(kwargs["properties"]["Status"]["select"]["name"], "Queue")
+
+
+class TwoTierClaimFencingTests(unittest.TestCase):
+    def setUp(self):
+        self.ledger = AWELedger(":memory:")
+        self.task = AWEWorkItem(
+            task_id="SF-217",
+            title="SF-217",
+            lane="Antigravity",
+            role="Parallel Developer",
+            status="Queue",
+            model="Gemini 3.8 Flash",
+            effort="High",
+            sequence=217,
+            dashboard_page_id="page-123",
+        )
+        self.source = MemoryTaskSource([self.task])
+        self.mock_client = MagicMock()
+        self.mock_client.is_configured = True
+        self.sor = NotionSourceOfRecord(client=self.mock_client)
+        self.mock_adapter = MockHarnessAdapter("antigravity")
+
+    def test_source_of_record_conflict_rolls_back_sqlite_claim(self):
+        # Notion returns that task was already Done in source of record
+        self.mock_client.retrieve_page.return_value = {
+            "properties": {"Status": {"select": {"name": "Done"}}}
+        }
+        worker = AWEAutonomousWorker(
+            ledger=self.ledger,
+            source=self.source,
+            source_of_record=self.sor,
+            harness_adapters={"antigravity": self.mock_adapter},
+            target_repo=".",
+        )
+        slot = ExecutionSlot(harness="antigravity", model="gemini-3.8-flash", effort="high")
+        summary = worker.run_cycle(worker_id="w1", target_slot=slot, dry_run=True)
+
+        self.assertEqual(summary.health, "conflict")
+        self.assertIn("Source-of-record claim conflict", summary.detail)
+        # Verify SQLite lease was marked blocked/released
+        claim = self.ledger.get_claim("SF-217")
+        self.assertEqual(claim["state"], "blocked")
+
+
+class AWEScheduledRunnerTests(unittest.TestCase):
+    def setUp(self):
+        self.ledger = AWELedger(":memory:")
+        self.task = AWEWorkItem(
+            task_id="SF-217",
+            title="SF-217",
+            lane="Antigravity",
+            role="Parallel Developer",
+            status="Queue",
+            model="Gemini 3.8 Flash",
+            effort="High",
+            sequence=217,
+        )
+        self.source = MemoryTaskSource([self.task])
+        self.mock_adapter = MockHarnessAdapter("antigravity")
+        self.worker = AWEAutonomousWorker(
+            ledger=self.ledger,
+            source=self.source,
+            harness_adapters={"antigravity": self.mock_adapter},
+            target_repo=".",
+        )
+
+    def test_scheduled_runner_bounded_cycles_and_heartbeat(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            hb_file = Path(tmpdir) / "heartbeat.json"
+            runner = AWEScheduledRunner(
+                worker=self.worker,
+                worker_id="runner-1",
+                heartbeat_file=hb_file,
+            )
+            slot = ExecutionSlot(harness="antigravity", model="gemini-3.8-flash", effort="high")
+            summaries = runner.run(
+                interval_seconds=0.01,
+                max_cycles=3,
+                target_slot=slot,
+                dry_run=True,
+            )
+            self.assertEqual(len(summaries), 3)
+            self.assertTrue(hb_file.is_file())
+            hb_data = json.loads(hb_file.read_text(encoding="utf-8"))
+            self.assertEqual(hb_data["worker_id"], "runner-1")
+            self.assertEqual(hb_data["cycles_completed"], 3)
+
+            # Check liveness table
+            liveness = runner.get_liveness_status()
+            self.assertEqual(len(liveness), 1)
+            self.assertEqual(liveness[0].worker_id, "runner-1")
+            self.assertEqual(liveness[0].cycles_completed, 3)
+
+    def test_crashed_worker_recovery(self):
+        runner1 = AWEScheduledRunner(
+            worker=self.worker,
+            worker_id="crashed-worker",
+            stale_threshold_seconds=10.0,
+        )
+        # Register crashed worker at old time
+        old_time = time.time() - 200.0
+        runner1.record_heartbeat(cycles_completed=1, status="running", now=old_time)
+
+        # Runner 2 starts up
+        runner2 = AWEScheduledRunner(
+            worker=self.worker,
+            worker_id="recovering-worker",
+            stale_threshold_seconds=10.0,
+        )
+        recovered = runner2.recover_crashed_workers(now=time.time())
+        self.assertIn("crashed-worker", recovered)
+
+        # Verify status is crashed
+        status_list = runner2.get_liveness_status()
+        crashed_entry = next(r for r in status_list if r.worker_id == "crashed-worker")
+        self.assertEqual(crashed_entry.status, "crashed")
+
+
+class CadenceContinuationCoordinatorTests(unittest.TestCase):
+    def setUp(self):
+        self.mock_client = MagicMock()
+        self.mock_client.is_configured = True
+        self.sor = NotionSourceOfRecord(client=self.mock_client)
+        self.reconciler = TurnCadenceReconciler(required_roles=["review", "qa"])
+        self.coordinator = CadenceContinuationCoordinator(
+            reconciler=self.reconciler,
+            source_of_record=self.sor,
+            required_roles=["review", "qa"],
+        )
+        self.producer = AWEWorkItem(
+            task_id="SF-212",
+            title="SF-212 — Sandbox-Only Harness",
+            lane="Cursor",
+            role="Main Developer",
+            status="In Progress",
+            model="Grok 4.6",
+            effort="High",
+            sequence=212,
+            dashboard_page_id="page-sf-212",
+        )
+        self.review_task = AWEWorkItem(
+            task_id="SF-213",
+            title="SF-213 — SF-212 Security Review",
+            lane="Codex",
+            role="Review",
+            status="Queue",
+            model="GPT-5.6 Luna",
+            effort="Max",
+            sequence=213,
+            dashboard_page_id="page-sf-213",
+        )
+        self.qa_task = AWEWorkItem(
+            task_id="SF-214",
+            title="SF-214 — SF-212 QA",
+            lane="Antigravity",
+            role="QA",
+            status="Queue",
+            model="Gemini 3.8 Flash",
+            effort="High",
+            sequence=214,
+            dashboard_page_id="page-sf-214",
+        )
+        self.next_task = AWEWorkItem(
+            task_id="SF-202",
+            title="SF-202 — Hermes Core Runtime Manager",
+            lane="Cursor",
+            role="Main Developer",
+            status="Blocked",
+            model="Grok 4.6",
+            effort="High",
+            sequence=202,
+            dashboard_page_id="page-sf-202",
+            notes="WAIT_MANAGER / BRIDGE_DEPENDENCY: waits for SF-212",
+        )
+        self.all_tasks = [self.producer, self.review_task, self.qa_task, self.next_task]
+        self.candidate = CandidateHead(
+            task_id="SF-212",
+            branch_name="sf/SF-212/sandbox-enforcement",
+            head_sha="e726e79331fdc7811b1e4b98a5ea8062657c6a76",
+            base_sha="48dbd88878a450fb84485af82ae3d9691ff267cd",
+            pr_number=2,
+            frozen_at=time.time(),
+        )
+
+    def test_waiting_certifiers_queues_both(self):
+        action = self.coordinator.coordinate_candidate_cadence(
+            candidate=self.candidate,
+            producer_task=self.producer,
+            all_exchange_tasks=self.all_tasks,
+            certifications=[],
+        )
+        self.assertEqual(action.action_type, "WAITING_CERTIFIERS")
+        self.assertIn("SF-213", action.queued_tasks)
+        self.assertIn("SF-214", action.queued_tasks)
+
+    def test_both_accept_unblocks_dependent_task(self):
+        certs = [
+            CertificationRecord(
+                task_id="SF-212",
+                head_sha=self.candidate.head_sha,
+                role="review",
+                slot_key="codex/luna/max",
+                verdict=CertificationVerdict.ACCEPT,
+            ),
+            CertificationRecord(
+                task_id="SF-212",
+                head_sha=self.candidate.head_sha,
+                role="qa",
+                slot_key="antigravity/flash/high",
+                verdict=CertificationVerdict.ACCEPT,
+            ),
+        ]
+        action = self.coordinator.coordinate_candidate_cadence(
+            candidate=self.candidate,
+            producer_task=self.producer,
+            all_exchange_tasks=self.all_tasks,
+            certifications=certs,
+        )
+        self.assertEqual(action.action_type, "GATE_ACCEPTED")
+        self.assertEqual(action.activated_next_task, "SF-202")
+
+    def test_reject_routes_rework_and_does_not_activate_next_task(self):
+        certs = [
+            CertificationRecord(
+                task_id="SF-212",
+                head_sha=self.candidate.head_sha,
+                role="review",
+                slot_key="codex/luna/max",
+                verdict=CertificationVerdict.REJECT,
+                defects=["Host escape flaw detected"],
+            ),
+            CertificationRecord(
+                task_id="SF-212",
+                head_sha=self.candidate.head_sha,
+                role="qa",
+                slot_key="antigravity/flash/high",
+                verdict=CertificationVerdict.ACCEPT,
+            ),
+        ]
+        action = self.coordinator.coordinate_candidate_cadence(
+            candidate=self.candidate,
+            producer_task=self.producer,
+            all_exchange_tasks=self.all_tasks,
+            certifications=certs,
+        )
+        self.assertEqual(action.action_type, "GATE_REJECTED")
+        self.assertIsNone(action.activated_next_task)
+        self.assertIn("Host escape flaw detected", action.defects)
+
+
+class CLIContractTests(unittest.TestCase):
+    def test_cli_live_and_dry_run_flags(self):
+        from awe_worker.cli import main
+        # Test that --live flag parses dry_run=False
+        import argparse
+        from awe_worker.cli import _add_dry_run_arguments
+        p = argparse.ArgumentParser()
+        _add_dry_run_arguments(p)
+
+        # Default is dry_run=True
+        args_default = p.parse_args([])
+        self.assertTrue(args_default.dry_run)
+
+        # --live makes dry_run=False
+        args_live = p.parse_args(["--live"])
+        self.assertFalse(args_live.dry_run)
+
+        # --no-dry-run makes dry_run=False
+        args_no_dry = p.parse_args(["--no-dry-run"])
+        self.assertFalse(args_no_dry.dry_run)
+
+        # --dry-run explicitly keeps dry_run=True
+        args_dry = p.parse_args(["--dry-run"])
+        self.assertTrue(args_dry.dry_run)
+
+
 if __name__ == "__main__":
     unittest.main()
+

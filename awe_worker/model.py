@@ -51,8 +51,15 @@ class ExecutionSlot:
                 model=cls._normalize_model(str(raw.get("model", ""))),
                 effort=str(raw.get("effort", "")).strip().lower(),
             )
-        # String formats e.g. "Antigravity/Gemini 3.8 Flash/High" or "Antigravity -> Gemini 3.8 Flash / High"
-        parts = [p.strip() for p in re.split(r"[/->]", str(raw)) if p.strip()]
+        raw_str = str(raw).strip()
+        if "->" in raw_str:
+            harness_part, rest = raw_str.split("->", 1)
+            parts = [harness_part.strip()] + [p.strip() for p in rest.split("/") if p.strip()]
+        elif "/" in raw_str:
+            parts = [p.strip() for p in raw_str.split("/") if p.strip()]
+        else:
+            parts = [raw_str]
+
         if len(parts) >= 3:
             return cls(
                 harness=parts[0].lower(),

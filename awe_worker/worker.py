@@ -7,6 +7,7 @@ import uuid
 from pathlib import Path
 from typing import Any, Mapping
 
+from .cadence import CadenceAction, CadenceContinuationCoordinator
 from .detector import CompletionDetector
 from .escalation import OwnerEscalationGate
 from .grounding import ContextBrokerGrounder
@@ -32,6 +33,7 @@ from .model import (
     GroundingResult,
     WakeReceipt,
 )
+from .notion import NotionClient, NotionSourceOfRecord
 from .observation import AWEObservationService, MemoryTaskSource, TaskSource
 from .reconciliation import TurnCadenceReconciler
 
@@ -49,6 +51,8 @@ class AWEAutonomousWorker:
         escalation_gate: OwnerEscalationGate | None = None,
         harness_adapters: Mapping[str, HarnessAdapter] | None = None,
         target_repo: str | Path | None = None,
+        source_of_record: NotionSourceOfRecord | None = None,
+        cadence_coordinator: CadenceContinuationCoordinator | None = None,
     ) -> None:
         self.ledger = ledger
         self.observation = AWEObservationService(source)
@@ -57,6 +61,18 @@ class AWEAutonomousWorker:
         self.reconciler = reconciler or TurnCadenceReconciler()
         self.escalation = escalation_gate or OwnerEscalationGate()
         self.target_repo = Path(target_repo) if target_repo else Path(".")
+
+        # Auto-initialize source of record if Notion credentials are present
+        if source_of_record is None:
+            nc = NotionClient()
+            if nc.is_configured:
+                source_of_record = NotionSourceOfRecord(client=nc)
+        self.source_of_record = source_of_record
+
+        self.cadence = cadence_coordinator or CadenceContinuationCoordinator(
+            reconciler=self.reconciler,
+            source_of_record=self.source_of_record,
+        )
 
         default_adapters: dict[str, HarnessAdapter] = {
             "antigravity": AntigravityHarnessAdapter(),
@@ -122,6 +138,12 @@ class AWEAutonomousWorker:
                     detail=escalation.detail,
                     now=ts,
                 )
+            if self.source_of_record:
+                self.source_of_record.block_task(
+                    task=task,
+                    reason=escalation.reason_code,
+                    detail=escalation.detail,
+                )
             return CycleSummary(
                 worker_id=worker_id,
                 cycle_id=cycle_id,
@@ -161,6 +183,38 @@ class AWEAutonomousWorker:
                 detail=f"Claim refused: {claim_res.code} - {claim_res.detail}",
             )
 
+        # 4b. Source-of-record optimistic CAS claim on Notion
+        if self.source_of_record and task.status == AWEStatus.QUEUE.value:
+            sor_ok, sor_err = self.source_of_record.claim_task(
+                task=task,
+                worker_id=worker_id,
+                slot_key=task.slot.key,
+                lease_seconds=120.0,
+            )
+            if not sor_ok:
+                # Fencing conflict on Notion source of record! Roll back local lease
+                if claim_res.token:
+                    self.ledger.block(
+                        task.task_id,
+                        claim_res.token,
+                        "SOURCE_OF_RECORD_CONFLICT",
+                        sor_err,
+                        now=ts,
+                    )
+                return CycleSummary(
+                    worker_id=worker_id,
+                    cycle_id=cycle_id,
+                    observed_tasks=len(all_tasks),
+                    claimed_task=task.task_id,
+                    grounding_source=None,
+                    wake_receipt=None,
+                    completion_report=None,
+                    gate_decision=None,
+                    escalation=None,
+                    health="conflict",
+                    detail=f"Source-of-record claim conflict: {sor_err}",
+                )
+
         # 5. Context Broker Grounding (Preferred fast bounded path)
         grounding = self.grounder.ground_task(
             repo_path=self.target_repo,
@@ -190,7 +244,7 @@ class AWEAutonomousWorker:
                 agent_reported_done=(task.verdict != ""),
             )
             if completion.state == "DONE" and completion.head_sha:
-                # Freeze candidate head
+                # Freeze candidate head in ledger
                 candidate = self.ledger.freeze_candidate(
                     task_id=task.task_id,
                     branch_name=completion.branch_name,
@@ -206,6 +260,15 @@ class AWEAutonomousWorker:
                     current_head_sha=completion.head_sha,
                     certifications=certs,
                 )
+
+                # Execute live cadence coordination and write-back
+                cadence_action = self.cadence.coordinate_candidate_cadence(
+                    candidate=candidate,
+                    producer_task=task,
+                    all_exchange_tasks=all_tasks,
+                    certifications=certs,
+                )
+
                 if gate_decision.outcome == GateOutcome.ACCEPT and claim_res.token:
                     self.ledger.complete(
                         task_id=task.task_id,
@@ -214,6 +277,15 @@ class AWEAutonomousWorker:
                         evidence_ref=completion.head_sha,
                         now=ts,
                     )
+                elif gate_decision.outcome == GateOutcome.REJECT:
+                    if claim_res.token:
+                        self.ledger.block(
+                            task_id=task.task_id,
+                            claim_token=claim_res.token,
+                            reason="GATE_REJECTED",
+                            detail="; ".join(gate_decision.defects),
+                            now=ts,
+                        )
 
         return CycleSummary(
             worker_id=worker_id,

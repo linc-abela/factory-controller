@@ -70,10 +70,11 @@ class DirectoryTaskSource:
 
 
 class NotionTaskSource:
-    """Notion AWE task source that reads pages from AWE folder hierarchy."""
+    """Notion AWE task source that reads pages from live AWE database or mock source."""
 
-    def __init__(self, notion_client_or_pages: Any) -> None:
+    def __init__(self, notion_client_or_pages: Any = None, database_id: str | None = None) -> None:
         self.client_or_pages = notion_client_or_pages
+        self.database_id = database_id
 
     def fetch_tasks(self) -> list[AWEWorkItem]:
         # If passed a static list or mocked response
@@ -83,7 +84,13 @@ class NotionTaskSource:
         if callable(self.client_or_pages):
             raw_pages = self.client_or_pages()
             return [AWEWorkItem.from_dict(p) for p in raw_pages]
-        return []
+        # Live NotionTaskSource delegation
+        from .notion import DEFAULT_AWE_DATABASE_ID, LiveNotionTaskSource, NotionClient
+        client = self.client_or_pages if isinstance(self.client_or_pages, NotionClient) else NotionClient()
+        db_id = self.database_id or DEFAULT_AWE_DATABASE_ID
+        live_src = LiveNotionTaskSource(client=client, database_id=db_id)
+        return live_src.fetch_tasks()
+
 
 
 class AWEObservationService:
