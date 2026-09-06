@@ -183,7 +183,7 @@ class AWEAutonomousWorker:
                 detail=f"Claim refused: {claim_res.code} - {claim_res.detail}",
             )
 
-        # 4b. Source-of-record optimistic CAS claim on Notion
+        # 4b. Fail-closed physical AWE + dashboard reconciliation (not Notion CAS)
         if self.source_of_record and task.status == AWEStatus.QUEUE.value:
             sor_ok, sor_err = self.source_of_record.claim_task(
                 task=task,

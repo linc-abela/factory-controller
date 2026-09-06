@@ -42,7 +42,7 @@ from awe_worker.model import (
     ExecutionSlot,
     GateOutcome,
 )
-from awe_worker.notion import NotionSourceOfRecord
+from awe_worker.notion import NotionAPIError, NotionSourceOfRecord
 from awe_worker.observation import (
     AWEObservationService,
     DirectoryTaskSource,
@@ -263,7 +263,7 @@ class TurnCadenceReconciliationTests(unittest.TestCase):
         self.assertEqual(decision.outcome, GateOutcome.PENDING)
         self.assertEqual(decision.missing_roles, ["qa"])
 
-    def test_both_accept_integrates_and_activates_next_task(self):
+    def test_both_accept_proposes_canonical_integration(self):
         certs = [
             CertificationRecord(
                 task_id="SF-212",
@@ -284,7 +284,7 @@ class TurnCadenceReconciliationTests(unittest.TestCase):
             "SF-212", self.head, self.head, certs, real_post_merge_main_sha="postmerge_sha"
         )
         self.assertEqual(decision.outcome, GateOutcome.ACCEPT)
-        self.assertEqual(decision.next_action, "INTEGRATE_AND_ACTIVATE_NEXT_TASK")
+        self.assertEqual(decision.next_action, "PROPOSE_CANONICAL_INTEGRATION")
         self.assertEqual(decision.new_main_sha, "postmerge_sha")
 
     def test_qa_reject_routes_rework_only_and_blocks_next_task(self):
@@ -558,6 +558,8 @@ class NotionSourceOfRecordTests(unittest.TestCase):
         ok, err = self.sor.claim_task(self.task, worker_id="w2", slot_key="antigravity/flash/high")
         self.assertFalse(ok)
         self.assertIn("SOURCE_OF_RECORD_CONFLICT", err)
+        self.mock_client.move_page.assert_not_called()
+        self.mock_client.update_page.assert_not_called()
 
     def test_complete_task_moves_physical_page_to_done(self):
         self.mock_client.is_configured = True
@@ -592,6 +594,27 @@ class NotionSourceOfRecordTests(unittest.TestCase):
         self.mock_client.update_page.assert_called_once()
         up_args, up_kwargs = self.mock_client.update_page.call_args
         self.assertEqual(up_kwargs["properties"]["Status"]["select"]["name"], "Queue")
+
+    def test_complete_task_fail_closed_when_physical_move_fails(self):
+        self.mock_client.is_configured = True
+        self.mock_client.move_page.side_effect = NotionAPIError(503, "unavailable")
+        res = self.sor.complete_task(self.task, verdict="ACCEPT", evidence_ref="abc")
+        self.assertFalse(res)
+        self.mock_client.update_page.assert_not_called()
+
+    def test_block_task_fail_closed_when_physical_move_fails(self):
+        self.mock_client.is_configured = True
+        self.mock_client.move_page.side_effect = NotionAPIError(500, "move failed")
+        res = self.sor.block_task(self.task, reason="NEEDS_OWNER", detail="x")
+        self.assertFalse(res)
+        self.mock_client.update_page.assert_not_called()
+
+    def test_route_rework_fail_closed_when_physical_move_fails(self):
+        self.mock_client.is_configured = True
+        self.mock_client.move_page.side_effect = NotionAPIError(500, "move failed")
+        res = self.sor.route_rework(self.task, verdict="REWORK_REQUIRED", defects=["x"])
+        self.assertFalse(res)
+        self.mock_client.update_page.assert_not_called()
 
 
 class TwoTierClaimFencingTests(unittest.TestCase):

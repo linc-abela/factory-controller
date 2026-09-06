@@ -258,7 +258,7 @@ class GateDecision:
     outcome: GateOutcome
     task_id: str
     head_sha: str
-    next_action: str  # "INTEGRATE_AND_ACTIVATE_NEXT_TASK", "ROUTER_REWORK_SAME_LINEAGE", "WAIT_CERTIFICATION"
+    next_action: str  # "PROPOSE_CANONICAL_INTEGRATION", "ROUTER_REWORK_SAME_LINEAGE", "WAIT_CERTIFICATION"
     missing_roles: list[str] = field(default_factory=list)
     defects: list[str] = field(default_factory=list)
     new_main_sha: str = ""

@@ -5,9 +5,8 @@ Demonstrates and verifies:
 1. Physical AWE hierarchy + Dashboard projection dual-consistency:
    - Creation/observation in Antigravity Queue folder (physical page parent == Queue folder)
    - Observation via LiveNotionTaskSource (verifying physical status == Queue)
-   - Atomic claim via AWELedger + NotionSourceOfRecord.claim_task
-     -> Physical task page moved to Antigravity In Progress folder
-     -> Dashboard row status updated to In Progress
+   - Controller ledger fence (BEGIN IMMEDIATE) then fail-closed
+     NotionSourceOfRecord.claim_task (physical page move, then dashboard)
 2. Concurrency Race & Single-Winner Boundary:
    - Competing worker attempts concurrent claim on the same task
    - Fails deterministically (PhysicalAncestryConflict or CLAIM_CONFLICT in ledger)

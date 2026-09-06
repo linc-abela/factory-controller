@@ -104,7 +104,7 @@ def main(argv: list[str] | None = None) -> int:
     obs_p.add_argument("--slot", help="Optional execution slot (e.g. 'antigravity/gemini-3.8-flash/high')")
 
     # claim
-    claim_p = subparsers.add_parser("claim", help="Atomically claim a task")
+    claim_p = subparsers.add_parser("claim", help="Claim a task through the Controller ledger fence")
     claim_p.add_argument("--task-id", required=True, help="Task ID to claim")
     claim_p.add_argument("--worker-id", default="local-worker-1", help="Worker ID")
     claim_p.add_argument("--slot", default="antigravity/gemini-3.8-flash/high", help="Execution slot")

@@ -1,7 +1,7 @@
 """Live Notion Agent Work Exchange client, task source, and source-of-record manager.
 
-Provides live observation, pagination, optimistic claim fencing (Queue -> In Progress),
-and durable completion/block write-back against the authoritative Notion AWE dashboard.
+Provides live observation, pagination, and fail-closed physical AWE plus
+dashboard reconciliation after the Controller-owned claim fence.
 """
 
 from __future__ import annotations
@@ -482,13 +482,14 @@ class NotionSourceOfRecord:
         slot_key: str,
         lease_seconds: float = 120.0,
     ) -> tuple[bool, str]:
-        """Atomically claim a task in Notion source of record (Queue -> In Progress).
+        """Fail-closed physical AWE + dashboard reconciliation (Queue -> In Progress).
 
-        Canonical lifecycle truth is the task page's physical folder ancestry:
-        1. Verifies the physical task page is currently in the lane's Queue folder.
-        2. Moves the physical task page to the lane's In Progress folder.
-        3. Synchronizes the dashboard projection row with Status='In Progress',
-           worker lease notes, and fencing metadata as ONE logical transition.
+        Canonical lifecycle truth is the task page's physical folder ancestry.
+        This is not Notion atomic CAS and not one ACID transaction across Notion:
+        1. Verify the physical task page is currently in the lane's Queue folder.
+        2. Move the physical task page to the lane's In Progress folder.
+        3. Reconcile the dashboard projection row. If either Notion write fails,
+           return an error so the Controller fence can roll back the local lease.
         """
         if not self.client.is_configured:
             return False, "NOTION_NOT_CONFIGURED"
@@ -539,13 +540,9 @@ class NotionSourceOfRecord:
 
         # 3. Execute physical move to In Progress folder
         if task.task_page_id and target_in_progress_id:
-            try:
-                self.client.move_page(
-                    task.task_page_id,
-                    parent={"type": "page_id", "page_id": target_in_progress_id},
-                )
-            except NotionAPIError as exc:
-                return False, f"NOTION_API_ERROR moving task page to In Progress: {exc}"
+            move_err = self._move_physical(task.task_page_id, target_in_progress_id)
+            if move_err:
+                return False, move_err
 
         # 4. Reconcile dashboard projection row
         now_iso = datetime.datetime.now(datetime.timezone.utc).date().isoformat()
@@ -569,6 +566,17 @@ class NotionSourceOfRecord:
 
         return True, ""
 
+    def _move_physical(self, task_page_id: str, folder_id: str) -> str:
+        """Move a physical AWE page. Returns empty on success, error text on failure."""
+        try:
+            self.client.move_page(
+                task_page_id,
+                parent={"type": "page_id", "page_id": folder_id},
+            )
+            return ""
+        except NotionAPIError as exc:
+            return f"NOTION_API_ERROR moving task page: {exc}"
+
     def complete_task(
         self,
         task: AWEWorkItem,
@@ -576,10 +584,9 @@ class NotionSourceOfRecord:
         evidence_ref: str = "",
         notes: str = "",
     ) -> bool:
-        """Move task to Done in Notion and record verdict and completion notes.
+        """Move task to Done: physical folder first, then dashboard projection.
 
-        Reconciles physical folder move (-> Done) and dashboard projection row as
-        ONE logical transition.
+        Fail-closed: if the physical move fails, do not update the dashboard.
         """
         if not self.client.is_configured:
             return False
@@ -587,15 +594,9 @@ class NotionSourceOfRecord:
         lane_key = task.lane.lower() if task.lane else "antigravity"
         done_folder_id = get_lane_folder_id(lane_key, "done")
 
-        # 1. Move physical task page to Done folder
         if task.task_page_id and done_folder_id:
-            try:
-                self.client.move_page(
-                    task.task_page_id,
-                    parent={"type": "page_id", "page_id": done_folder_id},
-                )
-            except Exception:
-                pass
+            if self._move_physical(task.task_page_id, done_folder_id):
+                return False
 
         # 2. Update dashboard projection row
         if task.dashboard_page_id:
@@ -630,10 +631,9 @@ class NotionSourceOfRecord:
         reason: str,
         detail: str = "",
     ) -> bool:
-        """Move task to Blocked in Notion with escalation reason.
+        """Move task to Blocked: physical folder first, then dashboard projection.
 
-        Reconciles physical folder move (-> Blocked) and dashboard projection row
-        as ONE logical transition.
+        Fail-closed: if the physical move fails, do not update the dashboard.
         """
         if not self.client.is_configured:
             return False
@@ -641,15 +641,9 @@ class NotionSourceOfRecord:
         lane_key = task.lane.lower() if task.lane else "antigravity"
         blocked_folder_id = get_lane_folder_id(lane_key, "blocked")
 
-        # 1. Move physical task page to Blocked folder
         if task.task_page_id and blocked_folder_id:
-            try:
-                self.client.move_page(
-                    task.task_page_id,
-                    parent={"type": "page_id", "page_id": blocked_folder_id},
-                )
-            except Exception:
-                pass
+            if self._move_physical(task.task_page_id, blocked_folder_id):
+                return False
 
         # 2. Update dashboard projection row
         if task.dashboard_page_id:
@@ -678,10 +672,9 @@ class NotionSourceOfRecord:
         verdict: str,
         defects: Sequence[str],
     ) -> bool:
-        """Route defects back to same producer lineage as rework in Notion.
+        """Route rework to the same producer lineage: physical Queue, then dashboard.
 
-        Reconciles physical folder move (-> Queue) and dashboard projection row as
-        ONE logical transition.
+        Fail-closed: if the physical move fails, do not update the dashboard.
         """
         if not self.client.is_configured:
             return False
@@ -689,15 +682,9 @@ class NotionSourceOfRecord:
         lane_key = task.lane.lower() if task.lane else "antigravity"
         queue_folder_id = get_lane_folder_id(lane_key, "queue")
 
-        # 1. Move physical task page back to Queue folder
         if task.task_page_id and queue_folder_id:
-            try:
-                self.client.move_page(
-                    task.task_page_id,
-                    parent={"type": "page_id", "page_id": queue_folder_id},
-                )
-            except Exception:
-                pass
+            if self._move_physical(task.task_page_id, queue_folder_id):
+                return False
 
         # 2. Update dashboard projection row
         if task.dashboard_page_id:

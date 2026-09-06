@@ -7,7 +7,7 @@ Rules:
 1. Candidate Freeze: both certifiers (Review and QA) must bind their evidence to the exact candidate head SHA Hn.
 2. If the candidate changes after certification begins, evidence is stale.
 3. Gate ACCEPT requires BOTH independent certifiers to ACCEPT the exact head.
-4. On ACCEPT: PR is integrated, new main fetched, and next conditional task activated from real post-merge main.
+4. On ACCEPT: propose canonical expected-head integration. The worker does not merge PRs, advance `main`, or activate dependent work.
 5. On REJECT: consolidated defects route back to the SAME producer lineage as rework; the dependent next task remains INACTIVE.
 6. Forbidden anti-drift path `rework A + start dependent B in one turn` is strictly rejected.
 """
@@ -98,7 +98,11 @@ class TurnCadenceReconciler:
             outcome=GateOutcome.ACCEPT,
             task_id=task_id,
             head_sha=frozen_head_sha,
-            next_action="INTEGRATE_AND_ACTIVATE_NEXT_TASK",
+            next_action="PROPOSE_CANONICAL_INTEGRATION",
             new_main_sha=post_merge,
-            detail=f"Gate ACCEPTED: Review and QA certified exact head {frozen_head_sha}. Ready for PR integration and next task activation from real post-merge main.",
+            detail=(
+                f"Gate ACCEPTED: Review and QA certified exact head {frozen_head_sha}. "
+                "Propose canonical expected-head integration; worker does not merge PR "
+                "or activate dependent work."
+            ),
         )
