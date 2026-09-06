@@ -1,0 +1,21 @@
+---
+description: Hard-coded Software Factory Cursor queue dispatch bootstrap
+alwaysApply: true
+---
+
+# Software Factory Cursor dispatch bootstrap
+
+When the Owner says `Process your Queue.` (or equivalent Factory queue-processing instruction), the **first external/tool action** must be to fetch the Cursor Dispatch page directly:
+
+- Page ID: `3d3690f6-eb14-8178-b51c-f1baa2fd4d32`
+- URL: `https://app.notion.com/p/3d3690f6eb148178b51cf1baa2fd4d32`
+
+Before that fetch, do **not** search Notion, GitHub, the filesystem, repository history, lifecycle folders, task IDs, or prior task context, and do not perform task-routing analysis.
+
+If Dispatch says `NO_EXECUTABLE_TASK`, stop without searching elsewhere.
+If Dispatch says `EXECUTABLE`, follow only its direct Task Page pointer. Normal discovery is exactly Dispatch -> Task Page.
+If Dispatch and the pointed task disagree, report `DISPATCH_POINTER_STALE` and stop; never hunt for a replacement task.
+
+Startup performance invariant: zero search before Dispatch and at most two Notion reads to resolve normal work.
+
+After the exact task is resolved, follow its packet and the canonical Factory authority/lifecycle/PR rules.
