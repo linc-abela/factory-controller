@@ -20,17 +20,26 @@ runtime is a fleet adapter, not a portal login; see :class:`HermesAdvisor`.
 from __future__ import annotations
 
 import dataclasses
+import hashlib
 import json
 import shutil
 import subprocess
+import sys
+import tempfile
 import urllib.error
 import urllib.request
+import uuid
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Mapping, Protocol, Sequence
+from typing import Any, Callable, Mapping, Protocol, Sequence
 
 from . import portfolio
 from .store import payload_hash
+
+
+FROZEN_BRIDGE_DEPENDENCY_SHA = "d4fb19bdaa153bd220f346be657657c2749cfed8"
+FLEET_BLOCKED = "HERMES_MANAGER_PROVIDER_ADAPTER_BLOCKED"
+FLEET_TURN = Path(__file__).resolve().parent.parent / "validation" / "hermes_fleet_turn.py"
 
 
 #: Where the advisory service answers on this host.  An address, not a
@@ -431,8 +440,12 @@ def endpoint_advisor(base_url: str | None = None, *, token: str | None = None):
 
 def scheduled_manager(*, command: Sequence[str] | None = None,
                       requested_profile: str = "advisory-process",
-                      requested_effort: str = "unknown") -> "ManagerLike":
-    """Prefer a governed argv. HTTP session is not the scheduled path."""
+                      requested_effort: str = "unknown",
+                      bridge_root: str | Path | None = None,
+                      fleet_profile_id: str = "codex-luna-max",
+                      expected_bridge_sha: str = FROZEN_BRIDGE_DEPENDENCY_SHA,
+                      ) -> "ManagerLike":
+    """Hermes is the manager front door; inference is a frozen Bridge fleet profile."""
 
     if command:
         raise ValueError("ADVISOR_ARGV_NOT_ALLOWLISTED")
@@ -440,7 +453,9 @@ def scheduled_manager(*, command: Sequence[str] | None = None,
     if executable:
         return HermesProcessAdvisor(
             executable, requested_profile=requested_profile,
-            requested_effort=requested_effort)
+            requested_effort=requested_effort,
+            bridge_root=bridge_root, fleet_profile_id=fleet_profile_id,
+            expected_bridge_sha=expected_bridge_sha)
     return BlockedAdvisor(requested_profile, requested_effort)
 
 
@@ -558,56 +573,161 @@ class ProcessAdvisor:
 
 
 class HermesProcessAdvisor:
-    """Hermes 0.21 as an external process. No HTTP facade, no argv token."""
+    """Hermes 0.21 manager identity; inference is a frozen Bridge fleet profile."""
 
     def __init__(self, executable: str, *, requested_profile: str,
-                 requested_effort: str = "unknown", timeout: float = 120.0) -> None:
+                 requested_effort: str = "unknown", timeout: float = 120.0,
+                 bridge_root: str | Path | None = None,
+                 fleet_profile_id: str = "codex-luna-max",
+                 expected_bridge_sha: str = FROZEN_BRIDGE_DEPENDENCY_SHA,
+                 fleet_runner: Callable[..., dict[str, Any]] | None = None,
+                 ) -> None:
         self.executable = executable
         self.requested_profile = requested_profile
         self.requested_effort = requested_effort
         self.timeout = timeout
+        self.bridge_root = Path(bridge_root) if bridge_root else None
+        self.fleet_profile_id = fleet_profile_id
+        self.expected_bridge_sha = expected_bridge_sha
+        self._fleet_runner = fleet_runner
         self._receipt: dict[str, Any] = {
             "process_started": False,
             "returncode": None,
             "observed_executable": executable,
-            "transport": "subprocess",
+            "transport": "hermes-to-bridge-fleet",
+            "error": FLEET_BLOCKED,
         }
 
-    def judge(self, snapshot: dict[str, Any]) -> dict[str, Any]:
-        prompt = (
-            "Return only JSON with keys reasoning (string) and proposals (array). "
-            "Do not approve production, widen budgets, or invent gates.\n"
-            + json.dumps(snapshot, default=str)[:8000]
-        )
-        command = [self.executable, "chat", "-Q", "-q", prompt, "--cli", "--safe-mode"]
+    def _pin_hermes(self) -> dict[str, Any]:
+        path = Path(self.executable)
+        if not path.is_file():
+            raise PermissionError("ADVISOR_MODEL_ABSENT")
+        digest = hashlib.sha256(path.read_bytes()).hexdigest()
         try:
             completed = subprocess.run(
-                command, text=True, capture_output=True,
-                timeout=self.timeout, check=False, env=MANAGER_ENV)
+                [self.executable, "--version"], text=True, capture_output=True,
+                timeout=10, check=False, env=MANAGER_ENV)
         except (OSError, subprocess.TimeoutExpired) as exc:
-            self._receipt = {
-                "process_started": False,
-                "returncode": None,
-                "observed_executable": self.executable,
-                "transport": "subprocess",
-                "error": type(exc).__name__,
-            }
             raise PermissionError("ADVISOR_MODEL_ABSENT") from exc
-        stdout = completed.stdout or ""
-        stderr = completed.stderr or ""
-        if len(stdout) > MAX_MANAGER_STDOUT or len(stderr) > MAX_MANAGER_STDOUT:
+        version = (completed.stdout or completed.stderr or "").strip()[:240]
+        if "0.21" not in version:
+            self._receipt["error"] = FLEET_BLOCKED
+            self._receipt["detail"] = "hermes version is not 0.21"
             raise PermissionError("ADVISOR_MODEL_ABSENT")
-        self._receipt = {
-            "process_started": True,
-            "returncode": completed.returncode,
-            "observed_executable": self.executable,
-            "transport": "subprocess",
-            "stdout_digest": payload_hash(stdout),
+        return {"digest": digest, "version": version}
+
+    def _bind_fleet(self) -> dict[str, Any]:
+        if self.bridge_root is None:
+            self._receipt["detail"] = "FACTORY_BRIDGE_ROOT/--bridge-root is required"
+            raise PermissionError("ADVISOR_MODEL_ABSENT")
+        completed = subprocess.run(
+            ["git", "-C", str(self.bridge_root), "log", "-1", "--format=%H"],
+            capture_output=True, text=True, check=False, env=MANAGER_ENV)
+        sha = (completed.stdout or "").strip()
+        if completed.returncode != 0 or sha != self.expected_bridge_sha:
+            self._receipt["detail"] = "bridge SHA mismatch or unreadable"
+            self._receipt["observed_bridge_sha"] = sha or "unknown"
+            raise PermissionError("ADVISOR_MODEL_ABSENT")
+        registry_path = self.bridge_root / "providers.json"
+        try:
+            body = json.loads(registry_path.read_text(encoding="utf-8"))
+        except (OSError, ValueError) as exc:
+            self._receipt["detail"] = "frozen registry unreadable"
+            raise PermissionError("ADVISOR_MODEL_ABSENT") from exc
+        profiles = body.get("profiles") if isinstance(body, dict) else None
+        raw = profiles.get(self.fleet_profile_id) if isinstance(profiles, dict) else None
+        if not isinstance(raw, dict):
+            self._receipt["detail"] = "fleet profile %s missing" % self.fleet_profile_id
+            raise PermissionError("ADVISOR_MODEL_ABSENT")
+        model = raw.get("model") if isinstance(raw.get("model"), str) else "unknown"
+        effort = raw.get("effort") if isinstance(raw.get("effort"), str) else "unknown"
+        return {
+            "bridge_sha": sha,
+            "profile_id": self.fleet_profile_id,
+            "model": model,
+            "effort": effort,
+            "provider": raw.get("provider") if isinstance(raw.get("provider"), str) else "unknown",
+            "harness": raw.get("harness") if isinstance(raw.get("harness"), str) else "unknown",
+            "registry_digest": payload_hash(body),
         }
-        if completed.returncode != 0:
+
+    def _default_runner(self, snapshot: dict[str, Any], operation_id: str) -> dict[str, Any]:
+        snapshot_path = Path(tempfile.mkdtemp(prefix="sf-hermes-snap-")) / "snapshot.json"
+        snapshot_path.write_text(json.dumps(snapshot, default=str), encoding="utf-8")
+        command = [
+            sys.executable, str(FLEET_TURN),
+            "--bridge-root", str(self.bridge_root),
+            "--profile", self.fleet_profile_id,
+            "--snapshot-file", str(snapshot_path),
+            "--operation-id", operation_id,
+            "--timeout", str(int(self.timeout)),
+            "--expected-sha", self.expected_bridge_sha,
+        ]
+        env = dict(MANAGER_ENV)
+        env["PYTHONPATH"] = str(self.bridge_root / "src")
+        completed = subprocess.run(
+            command, text=True, capture_output=True,
+            timeout=self.timeout + 30, check=False, env=env)
+        stdout = completed.stdout or ""
+        if len(stdout) > MAX_MANAGER_STDOUT:
+            raise PermissionError("ADVISOR_MODEL_ABSENT")
+        body = _first_json_object(stdout)
+        if not isinstance(body, dict):
+            raise PermissionError("ADVISOR_MODEL_ABSENT")
+        if body.get("error") == FLEET_BLOCKED or completed.returncode != 0:
+            self._receipt["detail"] = body.get("detail") or "fleet turn refused"
+            raise PermissionError("ADVISOR_MODEL_ABSENT")
+        return body
+
+    def judge(self, snapshot: dict[str, Any]) -> dict[str, Any]:
+        operation_id = "hop_%s" % uuid.uuid4().hex
+        hermes = self._pin_hermes()
+        fleet = self._bind_fleet()
+        self._receipt = {
+            "process_started": False,
+            "returncode": None,
+            "observed_executable": self.executable,
+            "transport": "hermes-to-bridge-fleet",
+            "operation_id": operation_id,
+            "hermes_digest": hermes["digest"],
+            "hermes_version": hermes["version"],
+            "bridge_sha": fleet["bridge_sha"],
+            "registry_digest": fleet["registry_digest"],
+            "requested_model": fleet["model"],
+            "requested_effort": fleet["effort"],
+            "observed_profile": "unknown",
+            "observed_effort": "unknown",
+            "observed_model": "unknown",
+            "error": FLEET_BLOCKED,
+        }
+        try:
+            runner = self._fleet_runner or self._default_runner
+            raw = runner(snapshot, operation_id)
+        except (OSError, subprocess.TimeoutExpired, PermissionError) as exc:
+            if isinstance(exc, PermissionError) and str(exc) == "ADVISOR_MODEL_ABSENT":
+                raise
+            self._receipt["error"] = type(exc).__name__
+            raise PermissionError("ADVISOR_MODEL_ABSENT") from exc
+        stdout = raw.get("stdout") if isinstance(raw.get("stdout"), str) else ""
+        self._receipt.update({
+            "process_started": True,
+            "returncode": raw.get("returncode"),
+            "stdout_digest": payload_hash(stdout),
+            "observed_executable": raw.get("observed_executable") or self.executable,
+            "observed_profile": fleet["profile_id"],
+            "observed_effort": fleet["effort"],
+            "observed_model": fleet["model"],
+            "observed_provider": fleet["provider"],
+            "observed_harness": fleet["harness"],
+            "request_digest": payload_hash(snapshot),
+            "error": None,
+        })
+        if raw.get("returncode") not in (0, None):
             raise PermissionError("ADVISOR_MODEL_ABSENT")
         text = stdout.strip()
-        body = _first_json_object(text)
+        body = _first_json_object(text) if text else None
+        if body is None and isinstance(raw.get("reasoning"), str):
+            body = {"reasoning": raw["reasoning"], "proposals": raw.get("proposals") or []}
         if body is None:
             if not text:
                 raise ValueError("ADVISOR_REASONING_ABSENT")
@@ -628,15 +748,23 @@ class HermesProcessAdvisor:
         return {
             "requested_profile": self.requested_profile,
             "requested_effort": self.requested_effort,
-            "observed_profile": "unknown",
-            "observed_effort": "unknown",
-            "observed_executable": self.executable,
-            "transport": "subprocess",
+            "observed_profile": self._receipt.get("observed_profile") or "unknown",
+            "observed_effort": self._receipt.get("observed_effort") or "unknown",
+            "observed_model": self._receipt.get("observed_model") or "unknown",
+            "observed_provider": self._receipt.get("observed_provider") or "unknown",
+            "observed_harness": self._receipt.get("observed_harness") or "unknown",
+            "observed_executable": self._receipt.get("observed_executable") or self.executable,
+            "transport": self._receipt.get("transport") or "hermes-to-bridge-fleet",
             "process_started": started,
-            "present": started and code == 0,
+            "present": started and code in (0, None) and not self._receipt.get("error"),
             "credential_held": False,
             "stdout_digest": self._receipt.get("stdout_digest"),
             "returncode": code,
+            "operation_id": self._receipt.get("operation_id"),
+            "bridge_sha": self._receipt.get("bridge_sha"),
+            "hermes_digest": self._receipt.get("hermes_digest"),
+            "registry_digest": self._receipt.get("registry_digest"),
+            "request_digest": self._receipt.get("request_digest"),
         }
 
 

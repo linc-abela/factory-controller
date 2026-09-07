@@ -323,6 +323,10 @@ def parser() -> argparse.ArgumentParser:
                         help="advisory-endpoint session argument; refused on cycle")
     manage.add_argument("--lease-seconds", type=float, dest="mg_lease",
                         default=mgmt.DEFAULT_CYCLE_LEASE_SECONDS)
+    manage.add_argument("--bridge-root", dest="mg_bridge_root", type=Path,
+                        help="explicit frozen factory-bridge checkout for manager fleet inference")
+    manage.add_argument("--fleet-profile", dest="mg_fleet_profile",
+                        help="Bridge registry profile used as the manager reasoning fleet")
 
     dog = sub.add_parser("dogfood")
     dog.add_argument("action", choices=("contract", "preflight", "gate",
@@ -858,7 +862,10 @@ def _manage(args, controller) -> int:
             else:
                 port = advisory.scheduled_manager(
                     requested_profile=args.mg_manager_profile,
-                    requested_effort=args.mg_manager_effort)
+                    requested_effort=args.mg_manager_effort,
+                    bridge_root=args.mg_bridge_root,
+                    **({"fleet_profile_id": args.mg_fleet_profile}
+                       if args.mg_fleet_profile else {}))
             if args.mg_fleet:
                 fleet = json.loads(args.mg_fleet.read_text())
                 if not isinstance(fleet, dict):
