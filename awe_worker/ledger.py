@@ -123,7 +123,7 @@ class AWELedger:
                 current_slot = row["slot_key"]
                 token = row["claim_token"]
 
-                if current_state == "done":
+                if current_state in ("done", "review"):
                     conn.execute("ROLLBACK;")
                     return ClaimResult(
                         ok=False,
@@ -170,6 +170,29 @@ class AWELedger:
                             detail=f"task {task_id} actively claimed by worker {current_worker} ({current_slot}) until {current_expires}",
                         )
 
+                # Lease has expired: safely reclaim only if the exact slot is free
+                occupied = conn.execute(
+                    """
+                    SELECT task_id FROM awe_claims
+                    WHERE slot_key = ?
+                      AND task_id != ?
+                      AND state NOT IN ('review', 'done', 'blocked')
+                      AND lease_expires_at > ?;
+                    """,
+                    (slot_key, task_id, ts),
+                ).fetchone()
+                if occupied is not None:
+                    conn.execute("ROLLBACK;")
+                    return ClaimResult(
+                        ok=False,
+                        action="refused",
+                        code="SLOT_ALREADY_OWNED",
+                        detail=(
+                            f"exact slot {slot_key} already has a live claim on "
+                            f"task {occupied['task_id']}"
+                        ),
+                    )
+
                 # Lease has expired: safely reclaim
                 new_token = uuid.uuid4().hex
                 conn.execute(
@@ -196,6 +219,29 @@ class AWELedger:
                     action="claimed",
                     token=new_token,
                     lease_expires_at=expires_at,
+                )
+
+            # Fresh claim: one live task per exact slot
+            occupied = conn.execute(
+                """
+                SELECT task_id FROM awe_claims
+                WHERE slot_key = ?
+                  AND task_id != ?
+                  AND state NOT IN ('review', 'done', 'blocked')
+                  AND lease_expires_at > ?;
+                """,
+                (slot_key, task_id, ts),
+            ).fetchone()
+            if occupied is not None:
+                conn.execute("ROLLBACK;")
+                return ClaimResult(
+                    ok=False,
+                    action="refused",
+                    code="SLOT_ALREADY_OWNED",
+                    detail=(
+                        f"exact slot {slot_key} already has a live claim on "
+                        f"task {occupied['task_id']}"
+                    ),
                 )
 
             # Fresh claim
@@ -261,7 +307,7 @@ class AWELedger:
             cursor = conn.execute(
                 """
                 UPDATE awe_claims
-                SET state = 'done', lease_expires_at = 0, updated_at = ?, result_json = ?
+                SET state = 'review', lease_expires_at = 0, updated_at = ?, result_json = ?
                 WHERE task_id = ? AND claim_token = ?;
                 """,
                 (ts, result_json, task_id, claim_token),

@@ -142,14 +142,18 @@ class AtomicClaimAndConcurrencyTests(unittest.TestCase):
         self.assertIsNotNone(res.token)
 
     def test_duplicate_claim_conflict(self):
-        res1 = self.ledger.claim("SF-217", "SF-217", "worker-1", self.slot, lease_seconds=60)
-        self.assertTrue(res1.ok)
+        first = self.ledger.claim("SF-217", "SF-217", "worker-1", self.slot, lease_seconds=60)
+        second = self.ledger.claim("SF-217", "SF-217", "worker-2", self.slot, lease_seconds=60)
+        self.assertTrue(first.ok)
+        self.assertFalse(second.ok)
+        self.assertEqual(second.code, "CLAIM_CONFLICT")
 
-        # Worker 2 tries to claim the same task before lease expires
-        res2 = self.ledger.claim("SF-217", "SF-217", "worker-2", self.slot, lease_seconds=60)
-        self.assertFalse(res2.ok)
-        self.assertEqual(res2.code, "CLAIM_CONFLICT")
-        self.assertEqual(res2.action, "refused")
+    def test_exact_slot_ownership_is_unique(self):
+        first = self.ledger.claim("SF-217", "SF-217", "worker-1", self.slot, lease_seconds=60)
+        second = self.ledger.claim("SF-219", "SF-219", "worker-2", self.slot, lease_seconds=60)
+        self.assertTrue(first.ok)
+        self.assertFalse(second.ok)
+        self.assertEqual(second.code, "SLOT_ALREADY_OWNED")
 
     def test_worker_restart_and_resumption(self):
         t0 = 1000.0
@@ -429,6 +433,10 @@ class ContextBrokerGroundingTests(unittest.TestCase):
         self.assertEqual(res.source, "direct_git_fallback")
         self.assertTrue(len(res.selected_paths) > 0)
         self.assertIn("README.md", res.selected_paths)
+        self.assertGreater(res.full_eligible_bytes, 0)
+        self.assertGreaterEqual(res.full_eligible_bytes, res.selected_bytes)
+        self.assertNotEqual(res.full_eligible_bytes, res.selected_bytes * 5)
+        self.assertGreaterEqual(res.reduction_ratio, 0.0)
 
     def test_broker_grounding_measures_context_reduction(self):
         task = AWEWorkItem(
@@ -484,7 +492,7 @@ class ControlledAutonomousCycleTests(unittest.TestCase):
 
     def test_autonomous_intake_claim_ground_and_wake(self):
         slot = ExecutionSlot(harness="antigravity", model="gemini-3.8-flash", effort="high")
-        summary = self.worker.run_cycle(worker_id="test-worker", target_slot=slot, dry_run=True)
+        summary = self.worker.run_cycle(worker_id="test-worker", target_slot=slot, dry_run=False)
 
         self.assertEqual(summary.claimed_task, "SF-217")
         self.assertIsNotNone(summary.wake_receipt)
@@ -497,6 +505,19 @@ class ControlledAutonomousCycleTests(unittest.TestCase):
         self.assertIsNotNone(claim)
         self.assertEqual(claim["state"], "in_progress")
         self.assertEqual(claim["worker_id"], "test-worker")
+
+    def test_dry_run_never_mutates_claim_or_lifecycle(self):
+        slot = ExecutionSlot(harness="antigravity", model="gemini-3.8-flash", effort="high")
+        summary = self.worker.run_cycle(worker_id="test-worker", target_slot=slot, dry_run=True)
+        self.assertIsNone(summary.claimed_task)
+        self.assertEqual(summary.health, "dry_run")
+        self.assertIsNone(self.ledger.get_claim("SF-217"))
+
+    def test_missing_target_slot_refuses_execution(self):
+        summary = self.worker.run_cycle(worker_id="test-worker", target_slot=None, dry_run=False)
+        self.assertEqual(summary.health, "refused")
+        self.assertIn("TARGET_SLOT_REQUIRED", summary.detail)
+        self.assertIsNone(self.ledger.get_claim("SF-217"))
 
 
 class NotionSourceOfRecordTests(unittest.TestCase):
@@ -575,7 +596,7 @@ class NotionSourceOfRecordTests(unittest.TestCase):
         self.assertEqual(move_kwargs["parent"]["page_id"], "3c5690f6-eb14-81b7-b578-c9fad99c2e6a")
         self.mock_client.update_page.assert_called_once()
         up_args, up_kwargs = self.mock_client.update_page.call_args
-        self.assertEqual(up_kwargs["properties"]["Status"]["select"]["name"], "Done")
+        self.assertEqual(up_kwargs["properties"]["Status"]["select"]["name"], "Review")
 
     def test_block_task_moves_physical_page_to_blocked(self):
         self.mock_client.is_configured = True
@@ -654,7 +675,7 @@ class TwoTierClaimFencingTests(unittest.TestCase):
             target_repo=".",
         )
         slot = ExecutionSlot(harness="antigravity", model="gemini-3.8-flash", effort="high")
-        summary = worker.run_cycle(worker_id="w1", target_slot=slot, dry_run=True)
+        summary = worker.run_cycle(worker_id="w1", target_slot=slot, dry_run=False)
 
         self.assertEqual(summary.health, "conflict")
         self.assertIn("Source-of-record claim conflict", summary.detail)
@@ -892,7 +913,7 @@ class PhysicalAncestryResolutionTests(unittest.TestCase):
 
         # Done
         antigravity_done = AWE_LANE_FOLDERS["antigravity"]["done"]
-        self.assertEqual(resolve_physical_folder_status(antigravity_done, "antigravity"), "Done")
+        self.assertEqual(resolve_physical_folder_status(antigravity_done, "antigravity"), "Review")
 
         # Processed
         self.assertEqual(resolve_physical_folder_status(AWE_PROCESSED_PAGE_ID), "Processed")
@@ -1228,6 +1249,61 @@ class DeterministicDispatchTests(unittest.TestCase):
         self.assertEqual(self.client.retrieve_block_children.call_count, 2)
         self.client.search.assert_not_called()
         self.client.query_database.assert_not_called()
+
+    def test_native_mention_task_page_parses(self):
+        text = (
+            "## Current pointer\n"
+            "- Task ID: `SF-217`\n"
+            "- Execution profile: **Cursor → Grok 4.6 / High**\n"
+            "- Expected lifecycle state: `Queue`\n"
+            "- Task page: <mention-page url=\"https://app.notion.com/p/aaaaaaaabbbbccccddddeeeeeeeeeeee\"/>\n"
+            "- Dispatch state: `EXECUTABLE`\n"
+        )
+        pointers = self.parse_pointers(text, harness="cursor")
+        self.assertEqual(len(pointers), 1)
+        self.assertEqual(pointers[0].task_id, "SF-217")
+        self.assertEqual(pointers[0].task_page_id, "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee")
+        self.assertNotIn("<mention-page", pointers[0].task_page_url)
+
+    def test_unknown_physical_ancestry_is_stale(self):
+        pointer_text = self.format_pointer_text(
+            self.DispatchPointer(
+                task_id="SF-217",
+                execution_profile="Antigravity -> Gemini 3.8 Flash / High",
+                expected_lifecycle_state="Queue",
+                task_page_url=self.task.task_page_url,
+                dispatch_state="EXECUTABLE",
+                harness="antigravity",
+            )
+        )
+        self.client.retrieve_block_children.return_value = self._children(pointer_text)
+        self.client.retrieve_page.return_value = {
+            "id": self.task.task_page_id,
+            "parent": {"type": "page_id", "page_id": "00000000-0000-0000-0000-000000000000"},
+        }
+        result = self.HeadlessDispatchResolver(self.client).resolve("antigravity")
+        self.assertFalse(result.ok)
+        self.assertEqual(result.code, self.DISPATCH_STALE)
+        self.assertIn("UNKNOWN_PHYSICAL_ANCESTRY", result.detail)
+
+    def test_stale_pointer_deletion_failure_does_not_append(self):
+        from awe_worker.notion import NotionAPIError
+        existing = self._children("- Task ID: `SF-OLD`\n- Dispatch state: `EXECUTABLE`")
+        self.client.retrieve_block_children.return_value = existing
+        self.client.delete_block.side_effect = NotionAPIError(500, "delete failed")
+        maintainer = self.DispatchMaintainer(self.client)
+        err = maintainer.write_pointer(
+            self.DispatchPointer(
+                task_id="SF-217",
+                execution_profile="Antigravity -> Gemini 3.8 Flash / High",
+                expected_lifecycle_state="Queue",
+                task_page_url=self.task.task_page_url,
+                dispatch_state="EXECUTABLE",
+                harness="antigravity",
+            )
+        )
+        self.assertIn(self.DISPATCH_STALE, err)
+        self.client.append_block_children.assert_not_called()
 
 
 if __name__ == "__main__":

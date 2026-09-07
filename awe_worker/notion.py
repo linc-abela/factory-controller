@@ -86,9 +86,13 @@ AWE_LANE_FOLDERS: dict[str, dict[str, str]] = {
 def resolve_physical_folder_status(parent_id: str, lane: str = "") -> str | None:
     """Resolve canonical physical folder lifecycle status from parent page ID.
 
-    Returns one of: "Queue", "In Progress", "Blocked", "Done", "Processed", or None.
+    Returns one of: Queue, In Progress, Blocked, Review, Processed, or None.
+    The physical folder historically named Done is the canonical Review folder.
+    Unknown ancestry returns None and must fail closed.
     """
-    clean_id = parent_id.replace("-", "").lower()
+    clean_id = (parent_id or "").replace("-", "").lower()
+    if not clean_id:
+        return None
     if clean_id == AWE_PROCESSED_PAGE_ID.replace("-", "").lower():
         return AWEStatus.PROCESSED.value
 
@@ -101,12 +105,12 @@ def resolve_physical_folder_status(parent_id: str, lane: str = "") -> str | None
             if clean_id == folder_id.replace("-", "").lower():
                 if status_key == "queue":
                     return AWEStatus.QUEUE.value
-                elif status_key == "in_progress":
+                if status_key == "in_progress":
                     return AWEStatus.IN_PROGRESS.value
-                elif status_key == "blocked":
+                if status_key == "blocked":
                     return AWEStatus.BLOCKED.value
-                elif status_key == "done":
-                    return AWEStatus.DONE.value
+                if status_key in ("done", "review"):
+                    return AWEStatus.REVIEW.value
     return None
 
 
@@ -121,11 +125,13 @@ def get_lane_folder_id(lane: str, status_name: str) -> str | None:
         AWEStatus.IN_PROGRESS.value.lower(): "in_progress",
         "in progress": "in_progress",
         AWEStatus.BLOCKED.value.lower(): "blocked",
+        AWEStatus.REVIEW.value.lower(): "done",
         AWEStatus.DONE.value.lower(): "done",
         AWEStatus.PROCESSED.value.lower(): "processed",
         "queue": "queue",
         "in_progress": "in_progress",
         "blocked": "blocked",
+        "review": "done",
         "done": "done",
         "processed": "processed",
     }
@@ -278,21 +284,38 @@ class LiveNotionTaskSource:
         self.database_id = os.environ.get("AWE_NOTION_DATABASE_ID", database_id)
 
     def verify_physical_status(self, task: AWEWorkItem) -> AWEWorkItem:
-        """Bind canonical physical lifecycle status from the task page's parent folder."""
+        """Bind canonical physical lifecycle status from the task page's parent folder.
+
+        Fail closed: unknown ancestry or retrieval failure raise rather than
+        preserving a dashboard Queue/In Progress projection as executable truth.
+        """
+        import dataclasses
+
         if not self.client.is_configured or not task.task_page_id:
-            return task
+            raise NotionAPIError(401, "PHYSICAL_ANCESTRY_RETRIEVAL_FAILED: Notion not configured")
 
         try:
             page_obj = self.client.retrieve_page(task.task_page_id)
-            parent_info = page_obj.get("parent", {})
-            if parent_info.get("type") == "page_id":
-                parent_page_id = parent_info.get("page_id", "")
-                phys_status = resolve_physical_folder_status(parent_page_id, lane=task.lane)
-                if phys_status and phys_status != task.status:
-                    import dataclasses
-                    return dataclasses.replace(task, status=phys_status)
-        except Exception:
-            pass
+        except NotionAPIError:
+            raise
+        except Exception as exc:
+            raise NotionAPIError(502, f"PHYSICAL_ANCESTRY_RETRIEVAL_FAILED: {exc}") from exc
+
+        parent_info = page_obj.get("parent", {}) if isinstance(page_obj, dict) else {}
+        if parent_info.get("type") != "page_id":
+            raise NotionAPIError(
+                409,
+                f"UNKNOWN_PHYSICAL_ANCESTRY: task {task.task_id} parent is not an AWE folder",
+            )
+        parent_page_id = parent_info.get("page_id", "")
+        phys_status = resolve_physical_folder_status(parent_page_id, lane=task.lane)
+        if not phys_status:
+            raise NotionAPIError(
+                409,
+                f"UNKNOWN_PHYSICAL_ANCESTRY: task {task.task_id} parent {parent_page_id} is not a known AWE folder",
+            )
+        if phys_status != task.status:
+            return dataclasses.replace(task, status=phys_status)
         return task
 
     def fetch_tasks(self, filter_status: str | None = None) -> list[AWEWorkItem]:
@@ -327,12 +350,15 @@ class LiveNotionTaskSource:
         for row in all_rows:
             try:
                 item = self._parse_row_to_work_item(row)
-                if item:
-                    # Canonical truth: verify physical folder ancestry
-                    item = self.verify_physical_status(item)
-                    if filter_status and item.status.lower() != filter_status.lower():
-                        continue
-                    items.append(item)
+                if not item:
+                    continue
+                item = self.verify_physical_status(item)
+                if filter_status and item.status.lower() != filter_status.lower():
+                    continue
+                items.append(item)
+            except NotionAPIError:
+                # Fail closed: unknown ancestry / retrieval failure is not executable Queue.
+                continue
             except Exception:
                 continue
 
@@ -610,18 +636,19 @@ class NotionSourceOfRecord:
         evidence_ref: str = "",
         notes: str = "",
     ) -> bool:
-        """Move task to Done: physical folder first, then dashboard projection.
+        """Move task to Review: physical folder first, then dashboard projection.
 
         Fail-closed: if the physical move fails, do not update the dashboard.
+        New writes use canonical Review, never legacy Done.
         """
         if not self.client.is_configured:
             return False
 
         lane_key = task.lane.lower() if task.lane else "antigravity"
-        done_folder_id = get_lane_folder_id(lane_key, "done")
+        review_folder_id = get_lane_folder_id(lane_key, AWEStatus.REVIEW.value)
 
-        if task.task_page_id and done_folder_id:
-            if self._move_physical(task.task_page_id, done_folder_id):
+        if task.task_page_id and review_folder_id:
+            if self._move_physical(task.task_page_id, review_folder_id):
                 return False
 
         # 2. Update dashboard projection row
@@ -632,7 +659,7 @@ class NotionSourceOfRecord:
                 self.client.update_page(
                     page_id=task.dashboard_page_id,
                     properties={
-                        "Status": {"select": {"name": AWEStatus.DONE.value}},
+                        "Status": {"select": {"name": AWEStatus.REVIEW.value}},
                         "Verdict": {
                             "rich_text": [
                                 {"type": "text", "text": {"content": verdict[:2000]}}
@@ -649,7 +676,7 @@ class NotionSourceOfRecord:
             except Exception:
                 return False
         return not self._write_dispatch(
-            task, AWEStatus.DONE.value, dispatch_state="NO_EXECUTABLE_TASK"
+            task, AWEStatus.REVIEW.value, dispatch_state="NO_EXECUTABLE_TASK"
         )
 
     def block_task(

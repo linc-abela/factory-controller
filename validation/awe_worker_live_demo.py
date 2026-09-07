@@ -332,20 +332,20 @@ def run_live_demonstration(
                 notes="Controlled live demonstration complete. Dual physical/dashboard reconciliation verified.",
             )
             assert sor_done is True, "Notion complete_task failed"
-            print("  [Live] Notion complete_task succeeded: physical page moved to Done folder, dashboard row updated to Done")
+            print("  [Live] Notion complete_task succeeded: physical page moved to Review folder, dashboard row updated to Review")
 
-            # Verify physical folder is now Done
+            # Verify physical folder is now Review (legacy Done folder id)
             page_after_done = client.retrieve_page(demo_page_id)
             done_parent = page_after_done.get("parent", {}).get("page_id", "")
             assert done_parent.replace("-", "").lower() == antigravity_done_id.replace("-", "").lower(), (
-                f"Page parent {done_parent} did not match Done folder {antigravity_done_id}"
+                f"Page parent {done_parent} did not match Review folder {antigravity_done_id}"
             )
-            print(f"  [Live] Confirmed physical ancestry: {done_parent} == Done folder")
+            print(f"  [Live] Confirmed physical ancestry: {done_parent} == Review folder")
 
-            # Verify dashboard row is now Done
+            # Verify dashboard row is now Review
             row_after_done = client.retrieve_page(demo_row_id)
             status_done = row_after_done.get("properties", {}).get("Status", {}).get("select", {}).get("name", "")
-            assert status_done == "Done", f"Expected dashboard Status='Done', got '{status_done}'"
+            assert status_done == "Review", f"Expected dashboard Status='Review', got '{status_done}'"
             print(f"  [Live] Confirmed dashboard row Status: '{status_done}'")
 
         results["steps"]["step6_terminal_completion"] = "PASSED"

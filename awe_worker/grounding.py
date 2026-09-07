@@ -14,7 +14,7 @@ import subprocess
 import tempfile
 import time
 from pathlib import Path
-from typing import Any
+from typing import Any, Mapping
 
 from .model import AWEWorkItem, GroundingResult
 
@@ -98,30 +98,36 @@ class ContextBrokerGrounder:
                 max_files=max_files,
             )
             if broker_res is not None:
-                # Calculate latency
                 latency_ms = (time.time() - start_time) * 1000.0
-                full_b = broker_res.get("full_eligible_bytes", 0)
-                sel_b = broker_res.get("selected_bytes", 0)
-                reduction = (1.0 - (sel_b / full_b)) if full_b > 0 else 0.0
-
-                return GroundingResult(
-                    ok=True,
-                    source="broker",
-                    repo_identity=repo_id,
-                    head_sha=head_sha,
-                    manifest_digest=broker_res.get("manifest_digest", ""),
-                    manifest_ref=broker_res.get("manifest_ref", {}),
-                    selected_paths=broker_res.get("selected_paths", []),
-                    overview=broker_res.get("overview", {}),
-                    full_eligible_bytes=full_b,
-                    selected_bytes=sel_b,
-                    reduction_ratio=reduction,
-                    latency_ms=latency_ms,
-                )
+                full_b = int(broker_res.get("full_eligible_bytes", 0) or 0)
+                sel_b = int(broker_res.get("selected_bytes", 0) or 0)
+                if full_b <= 0 or sel_b < 0 or sel_b > full_b:
+                    broker_res = None
+                else:
+                    reduction = 1.0 - (sel_b / full_b)
+                    return GroundingResult(
+                        ok=True,
+                        source="broker",
+                        repo_identity=repo_id,
+                        head_sha=head_sha,
+                        manifest_digest=broker_res.get("manifest_digest", ""),
+                        manifest_ref=broker_res.get("manifest_ref", {}),
+                        selected_paths=broker_res.get("selected_paths", []),
+                        overview=broker_res.get("overview", {}),
+                        full_eligible_bytes=full_b,
+                        selected_bytes=sel_b,
+                        reduction_ratio=reduction,
+                        latency_ms=latency_ms,
+                    )
 
         # Fallback to direct Git repository inspection
         fallback_res = self._direct_git_fallback(repo, head_sha, repo_id, requested_paths)
         latency_ms = (time.time() - start_time) * 1000.0
+        full_b = int(fallback_res.get("full_eligible_bytes", 0) or 0)
+        sel_b = int(fallback_res.get("selected_bytes", 0) or 0)
+        reduction = fallback_res.get("reduction_ratio")
+        if reduction is None:
+            reduction = (1.0 - (sel_b / full_b)) if full_b > 0 else 0.0
         return GroundingResult(
             ok=True,
             source="direct_git_fallback",
@@ -129,9 +135,9 @@ class ContextBrokerGrounder:
             head_sha=head_sha,
             selected_paths=fallback_res.get("selected_paths", []),
             overview=fallback_res.get("overview", {}),
-            full_eligible_bytes=fallback_res.get("full_eligible_bytes", 0),
-            selected_bytes=fallback_res.get("selected_bytes", 0),
-            reduction_ratio=0.0,
+            full_eligible_bytes=full_b,
+            selected_bytes=sel_b,
+            reduction_ratio=float(reduction),
             latency_ms=latency_ms,
             fallback_reason="broker_unavailable_or_stale" if not force_fallback else "forced_fallback",
         )
@@ -164,9 +170,8 @@ class ContextBrokerGrounder:
             receipt = broker.build(repo, request_data)
             manifest = receipt.manifest
 
-            # Strict freshness verification: manifest head MUST match repository current HEAD
-            if manifest.get("head") != head_sha:
-                # Stale manifest detected!
+            # Strict freshness, identity, provenance, and path bounds
+            if not self._manifest_is_valid(manifest, repo=repo, repo_id=repo_id, head_sha=head_sha):
                 return None
 
             economics = manifest.get("economics", {})
@@ -250,21 +255,56 @@ class ContextBrokerGrounder:
                     out = json.loads(proc.stdout)
                     manifest = out.get("manifest", {})
                     # Freshness check
-                    if manifest.get("head") == head_sha:
-                        economics = manifest.get("economics", {})
-                        selected = [item["path"] for item in manifest.get("selected", [])]
-                        return {
-                            "manifest_digest": manifest.get("manifest_digest", ""),
-                            "manifest_ref": out.get("manifest_ref", {}),
-                            "selected_paths": selected,
-                            "overview": manifest.get("overview", {}),
-                            "full_eligible_bytes": economics.get("full_eligible_bytes", 0),
-                            "selected_bytes": economics.get("selected_bytes", 0),
-                        }
+                    if not self._manifest_is_valid(manifest, repo=repo, repo_id=repo_id, head_sha=head_sha):
+                        return None
+                    economics = manifest.get("economics", {})
+                    selected = [item["path"] for item in manifest.get("selected", [])]
+                    return {
+                        "manifest_digest": manifest.get("manifest_digest", ""),
+                        "manifest_ref": out.get("manifest_ref", {}),
+                        "selected_paths": selected,
+                        "overview": manifest.get("overview", {}),
+                        "full_eligible_bytes": economics.get("full_eligible_bytes", 0),
+                        "selected_bytes": economics.get("selected_bytes", 0),
+                    }
             except Exception:
                 pass
 
         return None
+
+    def _manifest_is_valid(
+        self,
+        manifest: Mapping[str, Any] | Any,
+        repo: Path,
+        repo_id: str,
+        head_sha: str,
+    ) -> bool:
+        if not isinstance(manifest, dict):
+            return False
+        if manifest.get("head") != head_sha:
+            return False
+        identity = str(manifest.get("repo_identity") or manifest.get("repository") or "")
+        if identity and identity.rstrip("/") != repo_id.rstrip("/"):
+            return False
+        digest = str(manifest.get("manifest_digest") or "")
+        if not digest:
+            return False
+        selected_items = manifest.get("selected") or []
+        for item in selected_items:
+            path = item.get("path") if isinstance(item, dict) else None
+            if not path or Path(str(path)).is_absolute() or ".." in Path(str(path)).parts:
+                return False
+        economics = manifest.get("economics") or {}
+        try:
+            full_b = int(economics.get("full_eligible_bytes", 0) or 0)
+            sel_b = int(economics.get("selected_bytes", 0) or 0)
+        except (TypeError, ValueError):
+            return False
+        if full_b <= 0 or sel_b < 0 or sel_b > full_b:
+            return False
+        if economics.get("estimated") is True:
+            return False
+        return True
 
     def _direct_git_fallback(
         self,
@@ -281,14 +321,30 @@ class ContextBrokerGrounder:
         # Read top-level tracked files
         try:
             res = subprocess.run(
-                ["git", "-C", str(repo), "ls-tree", "-r", "--name-only", head_sha],
+                ["git", "-C", str(repo), "ls-tree", "-r", "-l", head_sha],
                 capture_output=True,
                 text=True,
                 check=True,
             )
-            all_files = [f.strip() for f in res.stdout.splitlines() if f.strip()]
+            all_files: list[str] = []
+            sizes: dict[str, int] = {}
+            for line in res.stdout.splitlines():
+                # <mode> <type> <object> <size>\t<path>
+                try:
+                    meta, path = line.split("\t", 1)
+                    parts = meta.split()
+                    size = int(parts[3]) if len(parts) >= 4 and parts[3] != "-" else 0
+                except ValueError:
+                    continue
+                path = path.strip()
+                if not path:
+                    continue
+                all_files.append(path)
+                sizes[path] = size
+                total_bytes += size
         except Exception:
             all_files = []
+            sizes = {}
 
         # Find authoritative files like README, MISSION, etc.
         authoritative = [
@@ -300,24 +356,18 @@ class ContextBrokerGrounder:
                 target_selection.append(a)
 
         selected_paths = target_selection[:20]
-        # Calculate selected bytes
-        for p in selected_paths:
-            try:
-                show_res = subprocess.run(
-                    ["git", "-C", str(repo), "cat-file", "-s", f"{head_sha}:{p}"],
-                    capture_output=True,
-                    text=True,
-                    check=False,
-                )
-                if show_res.returncode == 0:
-                    size = int(show_res.stdout.strip())
-                    selected_bytes += size
-            except Exception:
-                pass
-
+        selected_bytes = sum(sizes.get(p, 0) for p in selected_paths)
+        if total_bytes <= 0:
+            total_bytes = selected_bytes
+        reduction = (1.0 - (selected_bytes / total_bytes)) if total_bytes > 0 else 0.0
         return {
             "selected_paths": selected_paths,
-            "overview": {"tracked_file_count": len(all_files), "authoritative": authoritative[:10]},
-            "full_eligible_bytes": selected_bytes * 5,  # Estimated baseline
+            "overview": {
+                "tracked_file_count": len(all_files),
+                "authoritative": authoritative[:10],
+                "economics_mode": "measured_git_ls_tree",
+            },
+            "full_eligible_bytes": total_bytes,
             "selected_bytes": selected_bytes,
+            "reduction_ratio": reduction,
         }

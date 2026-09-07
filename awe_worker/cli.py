@@ -126,7 +126,7 @@ def main(argv: list[str] | None = None) -> int:
     # cycle
     cycle_p = subparsers.add_parser("cycle", help="Run one autonomous intake/dispatch/reconcile cycle")
     cycle_p.add_argument("--worker-id", default="host-worker", help="Worker identity")
-    cycle_p.add_argument("--slot", help="Target execution slot")
+    cycle_p.add_argument("--slot", required=True, help="Exact execution slot (harness/model/effort)")
     cycle_p.add_argument("--source", choices=["notion", "dir"], default="notion", help="Task source (default: notion)")
     cycle_p.add_argument("--source-dir", default="tests/fixtures/work_exchange")
     cycle_p.add_argument("--database-id", default=DEFAULT_AWE_DATABASE_ID)
@@ -136,7 +136,7 @@ def main(argv: list[str] | None = None) -> int:
     # run (scheduled worker service)
     run_p = subparsers.add_parser("run", help="Run bounded or persistent scheduled worker loop")
     run_p.add_argument("--worker-id", default="host-worker-1", help="Worker identity")
-    run_p.add_argument("--slot", help="Target execution slot")
+    run_p.add_argument("--slot", required=True, help="Exact execution slot (harness/model/effort)")
     run_p.add_argument("--interval", type=float, default=10.0, help="Cycle interval in seconds")
     run_p.add_argument("--max-cycles", type=int, default=None, help="Maximum cycles before stopping (optional)")
     run_p.add_argument("--source", choices=["notion", "dir"], default="notion")
@@ -157,8 +157,8 @@ def main(argv: list[str] | None = None) -> int:
             args.source, args.source_dir, args.database_id, notion_token=args.notion_token
         )
         obs = AWEObservationService(src)
-        slot = ExecutionSlot.parse(args.slot) if args.slot else None
-        tasks = obs.filter_eligible(slot=slot)
+        slot = ExecutionSlot.parse(args.slot)
+        tasks = obs.filter_eligible(slot=slot) if args.slot else obs.observe_all()
         output = [t.as_dict() for t in tasks]
         json.dump({"eligible_count": len(tasks), "source": args.source, "tasks": output}, sys.stdout, indent=2)
         print()
@@ -231,7 +231,7 @@ def main(argv: list[str] | None = None) -> int:
         return 0 if res.ok else 1
 
     elif args.command == "cycle":
-        slot = ExecutionSlot.parse(args.slot) if args.slot else None
+        slot = ExecutionSlot.parse(args.slot)
         src, sor = _resolve_task_source(
             args.source, args.source_dir, args.database_id, notion_token=args.notion_token
         )
@@ -264,7 +264,7 @@ def main(argv: list[str] | None = None) -> int:
         return 0
 
     elif args.command == "run":
-        slot = ExecutionSlot.parse(args.slot) if args.slot else None
+        slot = ExecutionSlot.parse(args.slot)
         src, sor = _resolve_task_source(
             args.source, args.source_dir, args.database_id, notion_token=args.notion_token
         )

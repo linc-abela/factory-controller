@@ -20,6 +20,7 @@ from .model import (
     ExecutionSlot,
     GateDecision,
     GateOutcome,
+    TERMINAL_PRODUCER_STATES,
 )
 from .notion import NotionSourceOfRecord
 from .reconciliation import TurnCadenceReconciler
@@ -74,7 +75,7 @@ class CadenceContinuationCoordinator:
         queued: list[str] = []
         for r in self.required_roles:
             c_task = certifier_tasks.get(r)
-            if c_task and c_task.status != AWEStatus.IN_PROGRESS.value and c_task.status != AWEStatus.DONE.value:
+            if c_task and c_task.status != AWEStatus.IN_PROGRESS.value and c_task.status not in TERMINAL_PRODUCER_STATES:
                 # Update certifier notes with exact frozen head
                 if self.source_of_record:
                     notes = f"Exact-head certification for {task_id} candidate {head_sha[:7]} (PR #{candidate.pr_number or 'N/A'})."

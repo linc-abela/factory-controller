@@ -12,8 +12,30 @@ class AWEStatus(str, Enum):
     QUEUE = "Queue"
     IN_PROGRESS = "In Progress"
     BLOCKED = "Blocked"
-    DONE = "Done"
+    REVIEW = "Review"
     PROCESSED = "Processed"
+    DONE = "Done"  # legacy alias for Review; never write this on new transitions
+
+
+CANONICAL_ACTIVE_STATES = (
+    AWEStatus.QUEUE.value,
+    AWEStatus.IN_PROGRESS.value,
+    AWEStatus.BLOCKED.value,
+    AWEStatus.REVIEW.value,
+    AWEStatus.PROCESSED.value,
+)
+TERMINAL_PRODUCER_STATES = (AWEStatus.REVIEW.value, AWEStatus.DONE.value)
+
+
+def canonical_lifecycle_status(raw: str | None) -> str:
+    """Map any observed lifecycle label onto the canonical vocabulary.
+
+    New writes use Review. Legacy Done is accepted as Review during migration.
+    """
+    value = (raw or "").strip()
+    if value == AWEStatus.DONE.value:
+        return AWEStatus.REVIEW.value
+    return value
 
 
 class CertificationVerdict(str, Enum):
@@ -46,11 +68,16 @@ class ExecutionSlot:
         if isinstance(raw, ExecutionSlot):
             return raw
         if isinstance(raw, Mapping):
-            return cls(
+            slot = cls(
                 harness=str(raw.get("harness", "")).strip().lower(),
                 model=cls._normalize_model(str(raw.get("model", ""))),
                 effort=str(raw.get("effort", "")).strip().lower(),
             )
+            if not (slot.harness and slot.model and slot.effort):
+                raise ValueError(
+                    "EXECUTION_PROFILE_UNKNOWN: exact (harness, model, effort) is required"
+                )
+            return slot
         raw_str = str(raw).strip().replace("→", "->")
         if "->" in raw_str:
             harness_part, rest = raw_str.split("->", 1)
@@ -60,22 +87,15 @@ class ExecutionSlot:
         else:
             parts = [raw_str]
 
-        if len(parts) >= 3:
-            return cls(
-                harness=parts[0].lower(),
-                model=cls._normalize_model(parts[1]),
-                effort=parts[2].lower(),
-            )
-        if len(parts) == 2:
-            return cls(
-                harness=parts[0].lower(),
-                model=cls._normalize_model(parts[1]),
-                effort="medium",
+        if len(parts) < 3 or not all(parts[:3]):
+            raise ValueError(
+                "EXECUTION_PROFILE_UNKNOWN: exact (harness, model, effort) is required; "
+                "do not default effort to medium"
             )
         return cls(
-            harness=parts[0].lower() if parts else "unknown",
-            model="unknown",
-            effort="medium",
+            harness=parts[0].lower(),
+            model=cls._normalize_model(parts[1]),
+            effort=parts[2].lower(),
         )
 
     @staticmethod

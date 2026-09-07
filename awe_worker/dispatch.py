@@ -56,7 +56,13 @@ class DispatchPointer:
 
     @property
     def slot(self) -> ExecutionSlot:
-        return ExecutionSlot.parse(self.execution_profile or self.harness)
+        try:
+            if self.execution_profile:
+                return ExecutionSlot.parse(self.execution_profile)
+        except ValueError:
+            pass
+        harness = (self.harness or "").strip().lower()
+        return ExecutionSlot(harness=harness or "unknown", model="unparsed", effort="unparsed")
 
 
 @dataclass(frozen=True)
@@ -103,7 +109,7 @@ def parse_pointers(text: str, harness: str = "") -> list[DispatchPointer]:
                 task_id=_field(chunk, r"Task ID:\s*`?([^`\n]+)`?"),
                 execution_profile=_field(chunk, r"Execution profile:\s*`?([^`\n]+)`?"),
                 expected_lifecycle_state=_field(chunk, r"Expected lifecycle state:\s*`?([^`\n]+)`?"),
-                task_page_url=_field(chunk, r"Task page:\s*`?(\S+)`?"),
+                task_page_url=_task_page_url(chunk),
                 dispatch_state=_field(chunk, r"Dispatch state:\s*`?([^`\n]+)`?") or EXECUTABLE,
                 frozen_head=_field(chunk, r"Frozen head:\s*`?([^`\n]+)`?"),
                 harness=harness,
@@ -112,11 +118,33 @@ def parse_pointers(text: str, harness: str = "") -> list[DispatchPointer]:
     return pointers
 
 
+def _task_page_url(chunk: str) -> str:
+    mention = re.search(
+        r'<mention-page\s+url="([^"]+)"',
+        chunk,
+        flags=re.IGNORECASE,
+    )
+    if mention:
+        return mention.group(1).strip()
+    href = re.search(
+        r"Task page:\s*(?:\[.*?\]\()?(https?://[^\s)<>]+)",
+        chunk,
+        flags=re.IGNORECASE,
+    )
+    if href:
+        return href.group(1).strip().rstrip(").,")
+    raw = _field(chunk, r"Task page:\s*`?(\S+)`?")
+    if raw.lower().startswith("<mention-page"):
+        return ""
+    return raw
+
+
 def _field(text: str, pattern: str) -> str:
     match = re.search(pattern, text, flags=re.IGNORECASE)
     if not match:
         return ""
     value = match.group(1).strip().rstrip(".")
+    value = value.strip("*").strip()
     if value.lower() in {"none", "n/a", "<mention-page/>"}:
         return ""
     return value
@@ -134,8 +162,21 @@ def _block_plain_text(block: Mapping[str, Any]) -> str:
         return ""
     parts: list[str] = []
     for item in rich:
-        if isinstance(item, Mapping):
-            parts.append(str(item.get("plain_text") or item.get("text", {}).get("content") or ""))
+        if not isinstance(item, Mapping):
+            continue
+        mention = item.get("mention")
+        if isinstance(mention, Mapping):
+            href = str(item.get("href") or "")
+            page = mention.get("page") if mention.get("type") == "page" else None
+            page_id = ""
+            if isinstance(page, Mapping):
+                page_id = str(page.get("id") or "")
+            if href:
+                parts.append(href)
+            elif page_id:
+                parts.append(f"https://app.notion.com/p/{page_id.replace('-', '')}")
+            continue
+        parts.append(str(item.get("plain_text") or item.get("text", {}).get("content") or ""))
     return "".join(parts)
 
 
@@ -181,8 +222,11 @@ class DispatchMaintainer:
                 if block_id:
                     try:
                         self.client.delete_block(str(block_id))
-                    except NotionAPIError:
-                        continue
+                    except NotionAPIError as exc:
+                        return (
+                            f"{DISPATCH_STALE}: stale-pointer deletion failed for "
+                            f"block {block_id}: {exc}"
+                        )
         try:
             self.client.append_block_children(
                 page_id,
@@ -263,9 +307,25 @@ class HeadlessDispatchResolver:
             return DispatchResolveResult(False, DISPATCH_STALE, pointer=selected, detail=str(exc))
         parent = page.get("parent") if isinstance(page, dict) else {}
         parent_id = parent.get("page_id", "") if isinstance(parent, Mapping) else ""
-        physical = resolve_physical_folder_status(parent_id, lane=harness) if parent_id else None
+        if not parent_id:
+            return DispatchResolveResult(
+                False,
+                DISPATCH_STALE,
+                pointer=selected,
+                detail="UNKNOWN_PHYSICAL_ANCESTRY: Task Page parent missing",
+            )
+        physical = resolve_physical_folder_status(parent_id, lane=harness)
+        if physical is None:
+            return DispatchResolveResult(
+                False,
+                DISPATCH_STALE,
+                pointer=selected,
+                detail=f"UNKNOWN_PHYSICAL_ANCESTRY: parent {parent_id}",
+            )
         expected = selected.expected_lifecycle_state
-        if expected and physical and physical.lower() != expected.lower():
+        from .model import canonical_lifecycle_status
+        expected_canonical = canonical_lifecycle_status(expected)
+        if expected_canonical and physical.lower() != expected_canonical.lower():
             return DispatchResolveResult(
                 False,
                 DISPATCH_STALE,

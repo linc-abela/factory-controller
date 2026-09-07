@@ -121,14 +121,7 @@ class AWEObservationService:
         all_tasks = list(tasks if tasks is not None else self.source.fetch_tasks())
 
         if slot is None:
-            # Return all non-owner Queue or In Progress tasks sorted
-            eligible = [
-                t for t in all_tasks
-                if t.status in (AWEStatus.QUEUE.value, AWEStatus.IN_PROGRESS.value)
-                and not t.owner_only
-            ]
-            eligible.sort(key=lambda x: (0 if x.status == AWEStatus.IN_PROGRESS.value else 1, x.sequence, x.task_id))
-            return eligible
+            return []
 
         # Slot specified: exact matching
         matching_in_progress = [
@@ -138,10 +131,8 @@ class AWEObservationService:
             and not t.owner_only
         ]
         if matching_in_progress:
-            # Priority to resuming existing in-progress task for this slot
             return matching_in_progress
 
-        # Matching queue tasks
         matching_queue = [
             t for t in all_tasks
             if t.status == AWEStatus.QUEUE.value

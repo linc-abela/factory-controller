@@ -95,6 +95,21 @@ class AWEAutonomousWorker:
         ts = time.time() if now is None else now
         cycle_id = f"cyc_{uuid.uuid4().hex[:12]}"
 
+        if target_slot is None:
+            return CycleSummary(
+                worker_id=worker_id,
+                cycle_id=cycle_id,
+                observed_tasks=0,
+                claimed_task=None,
+                grounding_source=None,
+                wake_receipt=None,
+                completion_report=None,
+                gate_decision=None,
+                escalation=None,
+                health="refused",
+                detail="TARGET_SLOT_REQUIRED: exact (harness, model, effort) is mandatory for execution",
+            )
+
         # 1. Clean up expired leases to recover stale tasks
         self.ledger.clean_expired_leases(now=ts)
 
@@ -118,6 +133,33 @@ class AWEAutonomousWorker:
             )
 
         task = eligible_tasks[0]
+
+        if dry_run:
+            grounding = self.grounder.ground_task(repo_path=self.target_repo, task=task)
+            adapter = self.adapters.get(task.slot.harness.lower())
+            if adapter is None:
+                wake_receipt = WakeReceipt(
+                    success=False,
+                    harness=task.slot.harness,
+                    slot_key=task.slot.key,
+                    error_code=f"HARNESS_WAKE_PATH_UNAVAILABLE:{task.slot.harness}",
+                    detail=f"No harness adapter configured for '{task.slot.harness}'",
+                )
+            else:
+                wake_receipt = adapter.wake(task, grounding=grounding, dry_run=True)
+            return CycleSummary(
+                worker_id=worker_id,
+                cycle_id=cycle_id,
+                observed_tasks=len(all_tasks),
+                claimed_task=None,
+                grounding_source=grounding.source,
+                wake_receipt=wake_receipt,
+                completion_report=None,
+                gate_decision=None,
+                escalation=None,
+                health="dry_run",
+                detail=f"DRY_RUN: observed {task.task_id} for slot {target_slot.key}; no claim/lifecycle mutation",
+            )
 
         # 3. Check Owner escalation triggers
         escalation = self.escalation.check_escalation(task)
