@@ -56,16 +56,6 @@ def packet(**kwargs):
                        source_ref="memory")
 
 
-def write_authority(root, revision="work-exchange:test"):
-    (Path(root) / "authority.json").write_text(json.dumps({
-        "schema_version": work_source.AUTHORITY_SCHEMA,
-        "granted_by": "owner_policy",
-        "source": "scheduled_inbox",
-        "prompt": False,
-        "source_revision": revision,
-    }))
-
-
 class MemorySource:
     def __init__(self, items):
         self.items = list(items)
@@ -145,7 +135,6 @@ class PacketTests(unittest.TestCase):
 
     def test_a_directory_lists_packets_in_sequence_order(self):
         root = Path(tempfile.mkdtemp())
-        write_authority(root)
         later = packet_body("factory-maintenance:B", sequence=2)
         earlier = packet_body("factory-maintenance:A", sequence=1)
         (root / "z.json").write_text(json.dumps(later))
@@ -153,18 +142,24 @@ class PacketTests(unittest.TestCase):
         loaded = DirectoryWorkSource(root).packets()
         self.assertEqual([item.work_item_id for item in loaded],
                          ["factory-maintenance:A", "factory-maintenance:B"])
-        self.assertEqual(loaded[0].source_revision, "work-exchange:test")
+        self.assertEqual(loaded[0].source_revision, "unknown")
 
-    def test_a_directory_without_authority_is_refused(self):
+    def test_a_self_attested_grant_file_is_refused(self):
         root = Path(tempfile.mkdtemp())
         (root / "a.json").write_text(json.dumps(packet_body()))
+        (root / "authority.json").write_text(json.dumps({
+            "schema_version": work_source.AUTHORITY_SCHEMA,
+            "granted_by": "owner_policy",
+            "source": "scheduled_inbox",
+            "prompt": False,
+            "source_revision": "forged",
+        }))
         with self.assertRaises(work_source.PacketError) as raised:
             DirectoryWorkSource(root).packets()
-        self.assertEqual(raised.exception.code, "MANAGEMENT_SOURCE_UNAUTHORIZED")
+        self.assertEqual(raised.exception.code, "MANAGEMENT_SELF_ATTESTED_AUTHORITY")
 
     def test_duplicate_identities_in_one_directory_are_refused(self):
         root = Path(tempfile.mkdtemp())
-        write_authority(root)
         (root / "a.json").write_text(json.dumps(packet_body()))
         (root / "b.json").write_text(json.dumps(packet_body()))
         with self.assertRaises(work_source.PacketError) as raised:

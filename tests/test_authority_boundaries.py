@@ -23,8 +23,9 @@ from factory_controller import context, routing
 PACKAGE = Path(__file__).resolve().parent.parent / "factory_controller"
 
 #: The seam files. Only these may start a process, and each starts exactly one
-#: kind: a JSON step adapter, or a command the *mission* declared.
-ADAPTER_SEAM = {"adapter.py", "stage1_adapter.py", "context_adapter.py"}
+#: kind: a JSON step adapter, a command the mission declared, or the scheduled
+#: manager argv.
+ADAPTER_SEAM = {"adapter.py", "stage1_adapter.py", "context_adapter.py", "advisor.py"}
 
 #: The Controller's own runtime. Nothing here may execute anything.
 CORE = {"engine.py", "store.py", "routing.py", "cli.py", "context.py", "__init__.py"}
