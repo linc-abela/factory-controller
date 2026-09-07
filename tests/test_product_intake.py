@@ -186,7 +186,7 @@ class SharedMaterializationTests(unittest.TestCase):
         mission = product.mission_for(value, intake)
         arguments = dict(
             portfolio_ref=value.run_ref, run_ref=value.run_ref,
-            registry=REGISTRY, registry_digest="d" * 16,
+            registry=REGISTRY, registry_digest="d" * 64,
             provider_profiles=list(value.provider_profiles),
             corpus_identity="package://%s@%s" % (intake.mission["source_pcp"],
                                                  intake.package_digest),
@@ -246,11 +246,16 @@ class SharedMaterializationTests(unittest.TestCase):
         with self.assertRaises(dogfood_intake.IntakeError) as caught:
             dogfood_intake.build(
                 forked, portfolio_ref=value.run_ref, run_ref=value.run_ref,
-                registry=REGISTRY, registry_digest="d" * 16,
+                registry=REGISTRY, registry_digest="d" * 64,
                 provider_profiles=list(value.provider_profiles),
                 corpus_identity="package://x@y", owner="o", approval_ref="r",
                 granted_at=0.0, expires_at=1.0, now=1.0, stage1={})
         self.assertEqual(caught.exception.code, "ACCEPTANCE_GATE_SOURCE_MISMATCH")
+
+    def test_a_short_registry_digest_is_refused_before_admission(self):
+        with self.assertRaises(dogfood_intake.IntakeError) as caught:
+            self.build(registry_digest="d" * 16)
+        self.assertEqual(caught.exception.code, "PROJECT_REGISTRY_UNIDENTIFIED")
 
 
 if __name__ == "__main__":

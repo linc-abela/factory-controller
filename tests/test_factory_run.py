@@ -109,6 +109,10 @@ class FactoryRunTests(unittest.TestCase):
         self.assertIs(stage1["operator_opt_in"], True)
         self.assertEqual(stage1["command"][1:],
                          ["-m", "src.cli.first_live"])
+        self.assertEqual(
+            stage1["admission"],
+            str(self.config.mission_dir / "df-1-admission.json"))
+        self.assertTrue(Path(stage1["admission"]).is_file())
         self.assertEqual(stage1["repository"], "/labs/factory-prototype-lab")
         self.assertEqual(stage1["gate_commands"], {
             "dev-check": ["/labs/factory-prototype-lab/dev", "check"],

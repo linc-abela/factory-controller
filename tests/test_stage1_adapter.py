@@ -52,6 +52,58 @@ class Stage1AdapterTest(unittest.TestCase):
         return execute({"step": step, "operation_key": f"m:{step}",
                         "input": {"mission": mission, **rest}})
 
+    def _live_identity(self, **overrides):
+        work = "DF-3"
+        manifest = "c" * 64
+        identity = {
+            "work_item_id": work,
+            "capability": "bug",
+            "repository_remote_url":
+                "https://github.com/linc-abela/factory-bug-lab.git",
+            "baseline_sha": "b" * 40,
+            "context_manifest_hash": manifest,
+            "acceptance_gate_ids": ["dev-check"],
+            "idempotency_key": "%s:%s" % (work, manifest),
+        }
+        identity.update(overrides)
+        return identity
+
+    def _write_admission(self, identity, **request_overrides):
+        request = {
+            "schema_version": "1.0",
+            "work_item_id": identity["work_item_id"],
+            "capability": identity.get("capability", "bug"),
+            "repository_remote_url": identity["repository_remote_url"],
+            "baseline_sha": identity["baseline_sha"],
+            "context_manifest_hash": identity["context_manifest_hash"],
+            "acceptance_gate_ids": list(identity["acceptance_gate_ids"]),
+            "idempotency_key": identity["idempotency_key"],
+        }
+        request.update(request_overrides)
+        path = self.root / "admission.json"
+        path.write_text(json.dumps({
+            "request": request,
+            "admission_evidence": {
+                "schema_version": "1.0",
+                "admitted_baseline_sha": identity["baseline_sha"],
+                "context_manifest": {
+                    "manifest_hash": identity["context_manifest_hash"]},
+            },
+        }))
+        return str(path)
+
+    def _live_config(self, **extra):
+        identity = self._live_identity()
+        config = dict(
+            self.config,
+            mode="real",
+            operator_opt_in=True,
+            admission=self._write_admission(identity),
+            repository=str(self.root / "checkout"),
+            **extra,
+        )
+        return identity, config
+
     def test_real_mode_refuses_without_explicit_operator_authority(self):
         request = {"step": "dispatch", "operation_key": "m:dispatch",
                    "input": {"mission": {"mission": {"stage1": {"command": ["unused"], "mode": "real"}}}}}
@@ -455,14 +507,100 @@ class Stage1AdapterTest(unittest.TestCase):
             "'execution_mode':'real','idempotency_key':'k-1'},"
             "'transport_invocations':1},open(p,'w'))\n"
         )
-        mission = {"stage1": dict(self.config, command=[sys.executable, str(script)], mode="real", operator_opt_in=True)}
-        dispatch = self._run("dispatch", {"mission": mission})
+        mission = {"stage1": dict(self.config, command=[sys.executable, str(script)],
+                                  mode="real", operator_opt_in=True,
+                                  admission=self._write_admission(self._live_identity()),
+                                  repository=str(self.root / "checkout")),
+                   **self._live_identity()}
+        dispatch = self._run("dispatch", mission)
         self.assertEqual(dispatch["status"], "refused")
         self.assertIsNone(dispatch["candidate_sha"])
         self.assertIsNone(dispatch["candidate_workspace"])
         self.assertEqual(dispatch["receipt"]["refusal_code"], "CANDIDATE_WORKSPACE_MISMATCH")
         self.assertEqual(dispatch["receipt"]["idempotency_key"], "k-1")
         self.assertEqual(dispatch["receipt"]["execution_mode"], "real")
+
+    def test_real_dispatch_passes_the_bound_admitted_request(self):
+        script = self.root / "argv_stage1.py"
+        script.write_text(
+            "import json,sys\n"
+            "p=sys.argv[sys.argv.index('--output')+1]\n"
+            "json.dump({'status':'completed','fixture_only':False,'argv':sys.argv,"
+            "'execution_envelope':{'candidate_sha':'a'*40,'execution_id':'e-bind',"
+            "'execution_mode':'real','idempotency_key':'DF-3:'+'c'*64},"
+            "'execution_binding':{'work_item_id':'DF-3',"
+            "'context_manifest_hash':'c'*64,'execution_mode':'real',"
+            "'idempotency_key':'DF-3:'+'c'*64},"
+            "'transport_invocations':0},open(p,'w'))\n"
+        )
+        identity, config = self._live_config(command=[sys.executable, str(script)])
+        dispatch = self._run("dispatch", {**identity, "stage1": config})
+        argv = dispatch["stage1_result"]["argv"]
+        admission = Path(argv[argv.index("--admission") + 1])
+        self.assertTrue(admission.is_absolute())
+        self.assertEqual(admission, Path(config["admission"]).resolve())
+        self.assertEqual(argv[argv.index("--repository") + 1], config["repository"])
+        self.assertIn("--operator-opt-in", argv)
+        self.assertIn("--real", argv)
+        self.assertNotIn("--dry-run", argv)
+
+    def test_missing_admission_never_starts_first_live(self):
+        identity, config = self._live_config()
+        del config["admission"]
+        with patch("factory_controller.stage1_adapter.subprocess.run") as runner:
+            result = self._run("dispatch", {**identity, "stage1": config})
+        runner.assert_not_called()
+        self.assertEqual(result["diagnostic"], "MISSING_ADMITTED_REQUEST")
+        self.assertIs(result["receipt"]["process_started"], False)
+        self.assertFalse(Path(config["output"]).exists())
+
+    def test_malformed_admission_never_starts_first_live(self):
+        identity, config = self._live_config()
+        Path(config["admission"]).write_text("{not-json")
+        with patch("factory_controller.stage1_adapter.subprocess.run") as runner:
+            result = self._run("dispatch", {**identity, "stage1": config})
+        runner.assert_not_called()
+        self.assertEqual(result["diagnostic"], "MISSING_ADMITTED_REQUEST")
+        self.assertIs(result["receipt"]["process_started"], False)
+
+    def test_mismatched_admission_never_starts_first_live(self):
+        identity, config = self._live_config()
+        Path(config["admission"]).write_text(json.dumps({
+            "request": {
+                "work_item_id": identity["work_item_id"],
+                "baseline_sha": identity["baseline_sha"],
+                "context_manifest_hash": "a" * 64,
+                "repository_remote_url": identity["repository_remote_url"],
+                "idempotency_key": identity["idempotency_key"],
+                "acceptance_gate_ids": list(identity["acceptance_gate_ids"]),
+            },
+            "admission_evidence": {
+                "admitted_baseline_sha": identity["baseline_sha"],
+                "context_manifest": {"manifest_hash": "a" * 64},
+            },
+        }))
+        with patch("factory_controller.stage1_adapter.subprocess.run") as runner:
+            result = self._run("dispatch", {**identity, "stage1": config})
+        runner.assert_not_called()
+        self.assertEqual(result["diagnostic"], "ADMITTED_REQUEST_BINDING_MISMATCH")
+        self.assertIs(result["receipt"]["process_started"], False)
+
+    def test_preflight_refusal_is_projected_when_first_live_omits_top_level_code(self):
+        script = self.root / "preflight_stage1.py"
+        script.write_text(
+            "import json,sys\n"
+            "p=sys.argv[sys.argv.index('--output')+1]\n"
+            "json.dump({'status':'refused','fixture_only':False,"
+            "'preflight':{'refusal_code':'MISSING_ADMITTED_REQUEST',"
+            "'transport_invocation_permitted':False},"
+            "'transport_invocations':0},open(p,'w'))\n"
+        )
+        identity, config = self._live_config(command=[sys.executable, str(script)])
+        dispatch = self._run("dispatch", {**identity, "stage1": config})
+        self.assertEqual(dispatch["status"], "refused")
+        self.assertEqual(dispatch["diagnostic"], "MISSING_ADMITTED_REQUEST")
+        self.assertEqual(dispatch["receipt"]["refusal_code"], "MISSING_ADMITTED_REQUEST")
+        self.assertIs(dispatch["receipt"]["process_started"], False)
 
     @staticmethod
     def _git(repository: Path, *arguments: str) -> str:

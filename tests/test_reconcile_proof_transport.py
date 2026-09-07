@@ -50,10 +50,38 @@ class ReconcileProofTransportTest(unittest.TestCase):
         self.root = Path(self.temp.name)
         script = self.root / "fake_stage1.py"
         script.write_text(FAKE_STAGE1)
+        identity = {
+            "work_item_id": "SF-169-T",
+            "baseline_sha": "b" * 40,
+            "context_manifest_hash": "c" * 64,
+            "repository_remote_url":
+                "https://github.com/linc-abela/factory-bug-lab.git",
+            "acceptance_gate_ids": ["dev-check"],
+            "idempotency_key": "SF-169-T:" + "c" * 64,
+        }
+        admission = self.root / "admission.json"
+        admission.write_text(json.dumps({
+            "request": {
+                "work_item_id": identity["work_item_id"],
+                "baseline_sha": identity["baseline_sha"],
+                "context_manifest_hash": identity["context_manifest_hash"],
+                "repository_remote_url": identity["repository_remote_url"],
+                "acceptance_gate_ids": identity["acceptance_gate_ids"],
+                "idempotency_key": identity["idempotency_key"],
+            },
+            "admission_evidence": {
+                "admitted_baseline_sha": identity["baseline_sha"],
+                "context_manifest": {
+                    "manifest_hash": identity["context_manifest_hash"]},
+            },
+        }))
+        self.identity = identity
         self.config = {
             "command": [sys.executable, str(script)],
             "mode": "real",
             "operator_opt_in": True,
+            "admission": str(admission),
+            "repository": str(self.root / "checkout"),
             "output": str(self.root / "result.json"),
         }
         self.proof = {"schema_version": "factory.bridge.revision_reconciliation.v1",
@@ -63,7 +91,7 @@ class ReconcileProofTransportTest(unittest.TestCase):
     def _reconcile(self, route):
         return execute({"step": "dispatch-reconcile",
                         "operation_key": "m:dispatch-reconcile",
-                        "input": {"mission": {"stage1": self.config},
+                        "input": {"mission": {**self.identity, "stage1": self.config},
                                   "route": route}})
 
     def test_the_proof_body_is_handed_to_the_runner_beside_its_digest(self):
