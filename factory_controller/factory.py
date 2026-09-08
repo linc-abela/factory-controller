@@ -823,13 +823,23 @@ class FactoryLifecycle:
         if not self._factory_is_running():
             return None
         try:
-            return self.product(str(package_path))
+            result = self.product(str(package_path))
         except FactoryRefusal as refusal:
-            return FactoryResult(
+            result = FactoryResult(
                 action="product", ok=False, state="blocked",
                 lines=("BLOCKED: " + refusal.detail,),
                 details={"code": refusal.code},
             )
+        owner_app.write_status(mission_dir / "status.json", {
+            "owner_state": "Working" if result.ok else "Blocked",
+            "stage": "provider" if result.ok else "admission blocked",
+            "freshness": "current",
+            "next_action": (result.lines[0] if result.lines
+                            else "The Factory owns the next action."),
+            "package_id": mission_dir.name,
+            "review_url": envelope_scaffold.firebase_review_url(mission_dir.name),
+        })
+        return result
 
     def _continue_fast_path_waiting_brief(self) -> FactoryResult | None:
         """Admit a derived brief once the Factory is actually running."""
@@ -3012,6 +3022,8 @@ class FactoryLifecycle:
                 "block this product." % portfolio_mission.mission_ref)
 
     def _owner_brief_status_lines(self) -> tuple[str, ...]:
+        if self._product_reading() is not None:
+            return ()
         root = self.config.state_dir / "owner-missions"
         if not root.is_dir():
             return ()
