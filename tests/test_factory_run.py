@@ -413,7 +413,9 @@ class RetryClassificationTests(unittest.TestCase):
                        "NO_ADMISSIBLE_PROVIDER: considered 1 candidate(s)",
                        "PROVIDER_ROUTE_EXHAUSTED: considered 2 candidate(s)",
                        "CONTEXT_BROKER_UNAVAILABLE",
-                       "RETRIES_EXHAUSTED"):
+                       "RETRIES_EXHAUSTED",
+                       "MISSING_ADMITTED_REQUEST",
+                       "STALE_TRUSTED_DISPATCH_READINESS"):
             with self.subTest(reason=reason):
                 self.assertEqual(
                     shift_plane.retry_classification("refused", reason, 1),

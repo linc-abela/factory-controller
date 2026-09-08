@@ -78,6 +78,11 @@ INFRASTRUCTURE_REASON_PREFIXES = (
     "PROJECT_REPOSITORY_UNRESOLVED",
     "REPOSITORY_REMOTE_MISMATCH",
     "BASELINE_SHA_UNKNOWN",
+    # SF-217: first-live reported MISSING_ADMITTED_REQUEST for a readable
+    # Controller document whose live admission was STALE_TRUSTED_DISPATCH_READINESS.
+    # Neither served a provider; a new grant writes a new document.
+    "MISSING_ADMITTED_REQUEST",
+    "STALE_TRUSTED_DISPATCH_READINESS",
 )
 
 #: What a mission stopped on when its candidate exists but could not be proved
