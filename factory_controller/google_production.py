@@ -507,6 +507,13 @@ DEFAULT_TARGET_CONFIGS: Mapping[str, GoogleTargetConfig] = {
         plan=ZERO_COST_PLAN,
         identity_site_id="lodus-casino-production",
     ),
+    "household-inventory-review": GoogleTargetConfig(
+        project_id="astral-dogfood",
+        site_id="household-inventory-review",
+        channel_id="live",
+        plan=ZERO_COST_PLAN,
+        identity_channel_id="review",
+    ),
 }
 
 

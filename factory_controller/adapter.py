@@ -87,3 +87,32 @@ def run_host_command(command: Sequence[str], *, cwd: str | None = None,
         return HostCommandResult(127, "", str(exc))
     return HostCommandResult(completed.returncode, completed.stdout,
                              completed.stderr)
+
+
+def commit_new_repository(root: str, message: str) -> str:
+    """Create one local commit so a derived product has a baseline identity.
+
+    Git object resolution stays outside this package; this only records files
+    the Factory itself just wrote.
+    """
+
+    from pathlib import Path
+    target = Path(root)
+    commands = (
+        ("git", "init", "-q", "-b", "main"),
+        ("git", "config", "user.email", "factory@software-factory.invalid"),
+        ("git", "config", "user.name", "Software Factory"),
+        ("git", "add", "-A"),
+        ("git", "commit", "-q", "-m", message),
+        ("git", "log", "-1", "--format=%H"),
+    )
+    sha = ""
+    for command in commands:
+        result = run_host_command(command, cwd=str(target))
+        if result.returncode != 0:
+            raise RuntimeError(result.stderr.strip() or result.stdout.strip()
+                               or "git %s failed" % command[1])
+        sha = result.stdout.strip()
+    if len(sha) != 40:
+        raise RuntimeError("bootstrap commit is not a full SHA")
+    return sha
