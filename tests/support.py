@@ -66,7 +66,12 @@ class LayerAdapter:
             return {"verified": self.verified, "diagnostic": None if self.verified else "ANCESTRY_FAILED"}
         if step == "evaluate":
             declared = value["mission"].get("acceptance_gate_ids") or ["G"]
+            dispatch = value.get("dispatch") or {}
+            receipt = dispatch.get("receipt") or {}
+            producer = receipt.get("provider_profile")
+            evaluator = BETA if producer == ALPHA else ALPHA
             return {"passed": self.gates_pass,
+                    "evaluator_profile": evaluator,
                     "gate_outcomes": [{"gate_id": gate, "passed": self.gates_pass, "detail": "layer"}
                                       for gate in declared]}
         if step == "evidence":

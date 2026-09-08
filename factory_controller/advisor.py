@@ -13,26 +13,41 @@ row and the Factory schedules deterministically without it.  That is checked by
 running the same missions with an advisor, with a broken advisor, and with none
 at all, and comparing the schedules.
 
-Hermes is present on this host and is *not* usable without an Owner credential;
-see :class:`HermesAdvisor` for the measured facts.
+The local advisory HTTP session is Factory-owned. Inference behind that
+runtime is a fleet adapter, not a portal login; see :class:`HermesAdvisor`.
 """
 
 from __future__ import annotations
 
 import dataclasses
+import hashlib
 import json
+import shutil
+import subprocess
+import sys
+import tempfile
 import urllib.error
 import urllib.request
+import uuid
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Mapping, Protocol, Sequence
+from typing import Any, Callable, Mapping, Protocol, Sequence
 
 from . import portfolio
+from .store import payload_hash
+
+
+FROZEN_BRIDGE_DEPENDENCY_SHA = "d4fb19bdaa153bd220f346be657657c2749cfed8"
+FLEET_BLOCKED = "HERMES_MANAGER_PROVIDER_ADAPTER_BLOCKED"
+FLEET_TURN = Path(__file__).resolve().parent.parent / "validation" / "hermes_fleet_turn.py"
 
 
 #: Where the advisory service answers on this host.  An address, not a
 #: dependency: nothing fails if it is absent.
 DEFAULT_ENDPOINT = "http://127.0.0.1:9119"
+MAX_MANAGER_STDIN = 64_000
+MAX_MANAGER_STDOUT = 64_000
+MANAGER_ENV = {"LC_ALL": "C", "PATH": "/usr/bin:/bin:/usr/local/bin"}
 
 PROPOSAL_KINDS = ("decompose", "dependency_edge", "project_priority",
                   "specialist_profile", "next_mission")
@@ -423,34 +438,373 @@ def endpoint_advisor(base_url: str | None = None, *, token: str | None = None):
     return HermesAdvisor(base_url or DEFAULT_ENDPOINT, token=token)
 
 
+def scheduled_manager(*, command: Sequence[str] | None = None,
+                      requested_profile: str = "advisory-process",
+                      requested_effort: str = "unknown",
+                      bridge_root: str | Path | None = None,
+                      fleet_profile_id: str = "codex-luna-max",
+                      expected_bridge_sha: str = FROZEN_BRIDGE_DEPENDENCY_SHA,
+                      ) -> "ManagerLike":
+    """Hermes is the manager front door; inference is a frozen Bridge fleet profile."""
+
+    if command:
+        raise ValueError("ADVISOR_ARGV_NOT_ALLOWLISTED")
+    executable = shutil.which("hermes")
+    if executable:
+        return HermesProcessAdvisor(
+            executable, requested_profile=requested_profile,
+            requested_effort=requested_effort,
+            bridge_root=bridge_root, fleet_profile_id=fleet_profile_id,
+            expected_bridge_sha=expected_bridge_sha)
+    return BlockedAdvisor(requested_profile, requested_effort)
+
+
+class ManagerLike(Protocol):
+    def judge(self, snapshot: dict[str, Any]) -> dict[str, Any]: ...
+    def observed_identity(self, body: Mapping[str, Any] | None = None) -> dict[str, Any]: ...
+
+
+class BlockedAdvisor:
+    """No governed manager process is installed. Judgment is absent."""
+
+    def __init__(self, requested_profile: str, requested_effort: str) -> None:
+        self.requested_profile = requested_profile
+        self.requested_effort = requested_effort
+
+    def judge(self, snapshot: dict[str, Any]) -> dict[str, Any]:
+        raise PermissionError("ADVISOR_MODEL_ABSENT")
+
+    def observed_identity(self, body: Mapping[str, Any] | None = None) -> dict[str, Any]:
+        return {
+            "requested_profile": self.requested_profile,
+            "requested_effort": self.requested_effort,
+            "observed_profile": "unknown",
+            "observed_effort": "unknown",
+            "present": False,
+            "credential_held": False,
+            "process_started": False,
+        }
+
+
+class ProcessAdvisor:
+    """Judgment through a Factory-owned argv. Response identity is ignored."""
+
+    def __init__(self, command: Sequence[str], *, requested_profile: str,
+                 requested_effort: str = "recorded", timeout: float = 300.0) -> None:
+        if not command or not all(isinstance(item, str) and item for item in command):
+            raise ValueError("manager command is a non-empty argument array")
+        self.command = tuple(command)
+        self.requested_profile = requested_profile
+        self.requested_effort = requested_effort
+        self.timeout = timeout
+        self._receipt: dict[str, Any] = {
+            "process_started": False,
+            "returncode": None,
+            "observed_executable": command[0],
+        }
+
+    def judge(self, snapshot: dict[str, Any]) -> dict[str, Any]:
+        payload = json.dumps({"snapshot": snapshot}, default=str)
+        if len(payload.encode("utf-8")) > MAX_MANAGER_STDIN:
+            raise ValueError("ADVISOR_INPUT_TOO_LARGE")
+        try:
+            completed = subprocess.run(
+                self.command, input=payload, text=True, capture_output=True,
+                timeout=self.timeout, check=False, env=MANAGER_ENV)
+        except (OSError, subprocess.TimeoutExpired) as exc:
+            self._receipt = {
+                "process_started": False,
+                "returncode": None,
+                "observed_executable": self.command[0],
+                "transport": "subprocess",
+                "error": type(exc).__name__,
+            }
+            raise PermissionError("ADVISOR_MODEL_ABSENT") from exc
+        stdout = completed.stdout or ""
+        stderr = completed.stderr or ""
+        if len(stdout) > MAX_MANAGER_STDOUT or len(stderr) > MAX_MANAGER_STDOUT:
+            self._receipt = {
+                "process_started": True,
+                "returncode": completed.returncode,
+                "observed_executable": self.command[0],
+                "transport": "subprocess",
+                "error": "ADVISOR_OUTPUT_TOO_LARGE",
+            }
+            raise PermissionError("ADVISOR_MODEL_ABSENT")
+        self._receipt = {
+            "process_started": True,
+            "returncode": completed.returncode,
+            "observed_executable": self.command[0],
+            "transport": "subprocess",
+            "stdout_digest": payload_hash(stdout),
+        }
+        if completed.returncode != 0:
+            raise PermissionError("ADVISOR_MODEL_ABSENT")
+        try:
+            body = json.loads(stdout)
+        except json.JSONDecodeError as exc:
+            raise ValueError("ADVISOR_MALFORMED_RESPONSE") from exc
+        if not isinstance(body, dict):
+            raise ValueError("ADVISOR_MALFORMED_RESPONSE")
+        reasoning = body.get("reasoning")
+        if not isinstance(reasoning, str) or not reasoning.strip():
+            raise ValueError("ADVISOR_REASONING_ABSENT")
+        if "proposals" not in body:
+            raise ValueError("ADVISOR_PROPOSALS_ABSENT")
+        return {"reasoning": reasoning.strip(), "proposals": body["proposals"]}
+
+    def observed_identity(self, body: Mapping[str, Any] | None = None) -> dict[str, Any]:
+        started = bool(self._receipt.get("process_started"))
+        code = self._receipt.get("returncode")
+        executable = self._receipt.get("observed_executable") or self.command[0]
+        return {
+            "requested_profile": self.requested_profile,
+            "requested_effort": self.requested_effort,
+            "observed_profile": "unknown",
+            "observed_effort": "unknown",
+            "observed_executable": executable,
+            "transport": self._receipt.get("transport") or "subprocess",
+            "process_started": started,
+            "present": started and code == 0,
+            "credential_held": False,
+            "stdout_digest": self._receipt.get("stdout_digest"),
+            "returncode": code,
+        }
+
+
+class HermesProcessAdvisor:
+    """Hermes 0.21 manager identity; inference is a frozen Bridge fleet profile."""
+
+    def __init__(self, executable: str, *, requested_profile: str,
+                 requested_effort: str = "unknown", timeout: float = 120.0,
+                 bridge_root: str | Path | None = None,
+                 fleet_profile_id: str = "codex-luna-max",
+                 expected_bridge_sha: str = FROZEN_BRIDGE_DEPENDENCY_SHA,
+                 fleet_runner: Callable[..., dict[str, Any]] | None = None,
+                 ) -> None:
+        self.executable = executable
+        self.requested_profile = requested_profile
+        self.requested_effort = requested_effort
+        self.timeout = timeout
+        self.bridge_root = Path(bridge_root) if bridge_root else None
+        self.fleet_profile_id = fleet_profile_id
+        self.expected_bridge_sha = expected_bridge_sha
+        self._fleet_runner = fleet_runner
+        self._receipt: dict[str, Any] = {
+            "process_started": False,
+            "returncode": None,
+            "observed_executable": executable,
+            "transport": "hermes-to-bridge-fleet",
+            "error": FLEET_BLOCKED,
+        }
+
+    def _pin_hermes(self) -> dict[str, Any]:
+        path = Path(self.executable)
+        if not path.is_file():
+            raise PermissionError("ADVISOR_MODEL_ABSENT")
+        digest = hashlib.sha256(path.read_bytes()).hexdigest()
+        try:
+            completed = subprocess.run(
+                [self.executable, "--version"], text=True, capture_output=True,
+                timeout=10, check=False, env=MANAGER_ENV)
+        except (OSError, subprocess.TimeoutExpired) as exc:
+            raise PermissionError("ADVISOR_MODEL_ABSENT") from exc
+        version = (completed.stdout or completed.stderr or "").strip()[:240]
+        if "0.21" not in version:
+            self._receipt["error"] = FLEET_BLOCKED
+            self._receipt["detail"] = "hermes version is not 0.21"
+            raise PermissionError("ADVISOR_MODEL_ABSENT")
+        return {"digest": digest, "version": version}
+
+    def _bind_fleet(self) -> dict[str, Any]:
+        if self.bridge_root is None:
+            self._receipt["detail"] = "FACTORY_BRIDGE_ROOT/--bridge-root is required"
+            raise PermissionError("ADVISOR_MODEL_ABSENT")
+        completed = subprocess.run(
+            ["git", "-C", str(self.bridge_root), "log", "-1", "--format=%H"],
+            capture_output=True, text=True, check=False, env=MANAGER_ENV)
+        sha = (completed.stdout or "").strip()
+        if completed.returncode != 0 or sha != self.expected_bridge_sha:
+            self._receipt["detail"] = "bridge SHA mismatch or unreadable"
+            self._receipt["observed_bridge_sha"] = sha or "unknown"
+            raise PermissionError("ADVISOR_MODEL_ABSENT")
+        registry_path = self.bridge_root / "providers.json"
+        try:
+            body = json.loads(registry_path.read_text(encoding="utf-8"))
+        except (OSError, ValueError) as exc:
+            self._receipt["detail"] = "frozen registry unreadable"
+            raise PermissionError("ADVISOR_MODEL_ABSENT") from exc
+        profiles = body.get("profiles") if isinstance(body, dict) else None
+        raw = profiles.get(self.fleet_profile_id) if isinstance(profiles, dict) else None
+        if not isinstance(raw, dict):
+            self._receipt["detail"] = "fleet profile %s missing" % self.fleet_profile_id
+            raise PermissionError("ADVISOR_MODEL_ABSENT")
+        model = raw.get("model") if isinstance(raw.get("model"), str) else "unknown"
+        effort = raw.get("effort") if isinstance(raw.get("effort"), str) else "unknown"
+        return {
+            "bridge_sha": sha,
+            "profile_id": self.fleet_profile_id,
+            "model": model,
+            "effort": effort,
+            "provider": raw.get("provider") if isinstance(raw.get("provider"), str) else "unknown",
+            "harness": raw.get("harness") if isinstance(raw.get("harness"), str) else "unknown",
+            "registry_digest": payload_hash(body),
+        }
+
+    def _default_runner(self, snapshot: dict[str, Any], operation_id: str) -> dict[str, Any]:
+        snapshot_path = Path(tempfile.mkdtemp(prefix="sf-hermes-snap-")) / "snapshot.json"
+        snapshot_path.write_text(json.dumps(snapshot, default=str), encoding="utf-8")
+        command = [
+            sys.executable, str(FLEET_TURN),
+            "--bridge-root", str(self.bridge_root),
+            "--profile", self.fleet_profile_id,
+            "--snapshot-file", str(snapshot_path),
+            "--operation-id", operation_id,
+            "--timeout", str(int(self.timeout)),
+            "--expected-sha", self.expected_bridge_sha,
+        ]
+        env = dict(MANAGER_ENV)
+        env["PYTHONPATH"] = str(self.bridge_root / "src")
+        completed = subprocess.run(
+            command, text=True, capture_output=True,
+            timeout=self.timeout + 30, check=False, env=env)
+        stdout = completed.stdout or ""
+        if len(stdout) > MAX_MANAGER_STDOUT:
+            raise PermissionError("ADVISOR_MODEL_ABSENT")
+        body = _first_json_object(stdout)
+        if not isinstance(body, dict):
+            raise PermissionError("ADVISOR_MODEL_ABSENT")
+        if body.get("error") == FLEET_BLOCKED or completed.returncode != 0:
+            self._receipt["detail"] = body.get("detail") or "fleet turn refused"
+            raise PermissionError("ADVISOR_MODEL_ABSENT")
+        return body
+
+    def judge(self, snapshot: dict[str, Any]) -> dict[str, Any]:
+        operation_id = "hop_%s" % uuid.uuid4().hex
+        hermes = self._pin_hermes()
+        fleet = self._bind_fleet()
+        self._receipt = {
+            "process_started": False,
+            "returncode": None,
+            "observed_executable": self.executable,
+            "transport": "hermes-to-bridge-fleet",
+            "operation_id": operation_id,
+            "hermes_digest": hermes["digest"],
+            "hermes_version": hermes["version"],
+            "bridge_sha": fleet["bridge_sha"],
+            "registry_digest": fleet["registry_digest"],
+            "requested_model": fleet["model"],
+            "requested_effort": fleet["effort"],
+            "observed_profile": "unknown",
+            "observed_effort": "unknown",
+            "observed_model": "unknown",
+            "error": FLEET_BLOCKED,
+        }
+        try:
+            runner = self._fleet_runner or self._default_runner
+            raw = runner(snapshot, operation_id)
+        except (OSError, subprocess.TimeoutExpired, PermissionError) as exc:
+            if isinstance(exc, PermissionError) and str(exc) == "ADVISOR_MODEL_ABSENT":
+                raise
+            self._receipt["error"] = type(exc).__name__
+            raise PermissionError("ADVISOR_MODEL_ABSENT") from exc
+        stdout = raw.get("stdout") if isinstance(raw.get("stdout"), str) else ""
+        self._receipt.update({
+            "process_started": True,
+            "returncode": raw.get("returncode"),
+            "stdout_digest": payload_hash(stdout),
+            "observed_executable": raw.get("observed_executable") or self.executable,
+            "observed_profile": fleet["profile_id"],
+            "observed_effort": fleet["effort"],
+            "observed_model": fleet["model"],
+            "observed_provider": fleet["provider"],
+            "observed_harness": fleet["harness"],
+            "request_digest": payload_hash(snapshot),
+            "error": None,
+        })
+        if raw.get("returncode") not in (0, None):
+            raise PermissionError("ADVISOR_MODEL_ABSENT")
+        text = stdout.strip()
+        body = _first_json_object(text) if text else None
+        if body is None and isinstance(raw.get("reasoning"), str):
+            body = {"reasoning": raw["reasoning"], "proposals": raw.get("proposals") or []}
+        if body is None:
+            if not text:
+                raise ValueError("ADVISOR_REASONING_ABSENT")
+            return {"reasoning": text, "proposals": []}
+        reasoning = body.get("reasoning")
+        if not isinstance(reasoning, str) or not reasoning.strip():
+            reasoning = text
+        if not isinstance(reasoning, str) or not reasoning.strip():
+            raise ValueError("ADVISOR_REASONING_ABSENT")
+        proposals = body.get("proposals")
+        if not isinstance(proposals, list):
+            proposals = []
+        return {"reasoning": reasoning.strip(), "proposals": proposals}
+
+    def observed_identity(self, body: Mapping[str, Any] | None = None) -> dict[str, Any]:
+        started = bool(self._receipt.get("process_started"))
+        code = self._receipt.get("returncode")
+        return {
+            "requested_profile": self.requested_profile,
+            "requested_effort": self.requested_effort,
+            "observed_profile": self._receipt.get("observed_profile") or "unknown",
+            "observed_effort": self._receipt.get("observed_effort") or "unknown",
+            "observed_model": self._receipt.get("observed_model") or "unknown",
+            "observed_provider": self._receipt.get("observed_provider") or "unknown",
+            "observed_harness": self._receipt.get("observed_harness") or "unknown",
+            "observed_executable": self._receipt.get("observed_executable") or self.executable,
+            "transport": self._receipt.get("transport") or "hermes-to-bridge-fleet",
+            "process_started": started,
+            "present": started and code in (0, None) and not self._receipt.get("error"),
+            "credential_held": False,
+            "stdout_digest": self._receipt.get("stdout_digest"),
+            "returncode": code,
+            "operation_id": self._receipt.get("operation_id"),
+            "bridge_sha": self._receipt.get("bridge_sha"),
+            "hermes_digest": self._receipt.get("hermes_digest"),
+            "registry_digest": self._receipt.get("registry_digest"),
+            "request_digest": self._receipt.get("request_digest"),
+        }
+
+
+def _first_json_object(text: str) -> dict[str, Any] | None:
+    start = text.find("{")
+    end = text.rfind("}")
+    if start < 0 or end <= start:
+        return None
+    try:
+        raw = json.loads(text[start:end + 1])
+    except json.JSONDecodeError:
+        return None
+    return raw if isinstance(raw, dict) else None
+
+
 class HermesAdvisor:
     """The narrowest real adapter for the Hermes surface on this host.
 
-    Hermes 0.19.0 is running here (``127.0.0.1:9119``) and its kanban
-    orchestration plugin exposes exactly the advisory verbs this port names --
-    ``/api/plugins/kanban/tasks/{id}/decompose``, ``/specify``, ``/reassign``,
-    and ``/api/plugins/kanban/orchestration``.  It is not usable from the
-    Controller as it stands: **every** ``/api`` route answers
-    ``401 {"detail":"Unauthorized"}``, including the ones its own unauthenticated
-    ``/api/status`` describes, and ``/api/status`` reports ``auth_required:
-    false`` while gating them anyway.  So the missing thing is not an executable
-    or an interface -- both exist and are measured below -- it is an Owner
-    session credential, which stays outside Controller durable state.
+    Hermes 0.21.0 on this host serves ``GET /api/status`` without a session and
+    gates every other ``/api`` route.  ``/api/plugins/kanban/orchestration`` is
+    dashboard settings (GET/PUT), not a management judgment.  A real judgment
+    is: create a triage kanban task, then ``POST .../tasks/{id}/decompose``.
+    Presence or a settings document is not treated as reasoning.
 
-    This adapter therefore does the half that is real today: it probes the
-    unauthenticated ``/api/status`` to establish presence and version, and
-    fails closed with ``ADVISOR_CREDENTIAL_ABSENT`` rather than inventing a
-    Hermes runtime.  Given a token it POSTs one bounded request and returns the
-    body for :func:`review` to adjudicate like any other advisor's -- Hermes
-    gets no more authority than the deterministic fake does.
+    The session grant stays outside Controller durable state.  Missing session
+    is ``ADVISOR_CREDENTIAL_ABSENT``.  A decompose that does not produce a
+    usable LLM judgment is ``ADVISOR_MODEL_ABSENT``.  Returned proposals still
+    go through :func:`review` like any other advisor.
     """
 
-    #: Measured on this host, 2026-08-26.
+    #: Measured on this host, 2026-09-05 (Hermes 0.21.0).
     PROBE_PATH = "/api/status"
+    TASKS_PATH = "/api/plugins/kanban/tasks"
+    DECOMPOSE_PATH = "/api/plugins/kanban/tasks/{task_id}/decompose"
     ORCHESTRATION_PATH = "/api/plugins/kanban/orchestration"
     ADVISORY_PATHS = ("/api/plugins/kanban/tasks/{task_id}/decompose",
                       "/api/plugins/kanban/tasks/{task_id}/specify",
                       "/api/plugins/kanban/tasks/{task_id}/reassign")
+    JUDGE_TIMEOUT = 300.0
+    SNAPSHOT_BODY_LIMIT = 8000
 
     def __init__(self, base_url: str = "http://127.0.0.1:9119", *, token: str | None = None,
                  timeout: float = 5.0, opener=urllib.request.urlopen) -> None:
@@ -475,29 +829,59 @@ class HermesAdvisor:
                 "orchestration_path": self.ORCHESTRATION_PATH}
 
     def advise(self, request: dict[str, Any]) -> Any:
-        if self.token is None:
-            raise PermissionError("ADVISOR_CREDENTIAL_ABSENT")
-        return self._post(self.ORCHESTRATION_PATH, request)
+        return self.judge(request if isinstance(request, dict) else {})
 
     def judge(self, snapshot: dict[str, Any]) -> dict[str, Any]:
         """Ask for a management judgment.  Presence/status is not this method.
 
-        The body must carry a non-empty ``reasoning`` string plus ``proposals``.
-        Probe-shaped answers (version, gateway_running, HTTP status) are
-        refused here so a later plane cannot treat liveness as judgment.
+        Hermes 0.21 has no ``POST /orchestration`` manage verb.  Judgment is a
+        triage task plus decompose.  The mapped body must carry a non-empty
+        ``reasoning`` string plus ``proposals``.
         """
 
         if self.token is None:
             raise PermissionError("ADVISOR_CREDENTIAL_ABSENT")
-        body = self._post(self.ORCHESTRATION_PATH, {"kind": "manage", "snapshot": snapshot})
+        created = self._post(self.TASKS_PATH, {
+            "title": _snapshot_title(snapshot),
+            "body": json.dumps(snapshot, default=str)[:self.SNAPSHOT_BODY_LIMIT],
+            "triage": True,
+        })
+        task = created.get("task") if isinstance(created, dict) else None
+        task_id = task.get("id") if isinstance(task, dict) else None
+        if not isinstance(task_id, str) or not task_id.strip():
+            raise ValueError("ADVISOR_MALFORMED_RESPONSE")
+        body = self._post(
+            self.DECOMPOSE_PATH.format(task_id=task_id.strip()),
+            {},
+            timeout=self.JUDGE_TIMEOUT,
+        )
         if not isinstance(body, dict):
             raise ValueError("ADVISOR_MALFORMED_RESPONSE")
-        reasoning = body.get("reasoning")
+        if not body.get("ok"):
+            raise PermissionError("ADVISOR_MODEL_ABSENT")
+        reasoning = body.get("reason")
+        if not isinstance(reasoning, str) or not reasoning.strip():
+            reasoning = body.get("new_title")
         if not isinstance(reasoning, str) or not reasoning.strip():
             raise ValueError("ADVISOR_REASONING_ABSENT")
-        if "proposals" not in body:
-            raise ValueError("ADVISOR_PROPOSALS_ABSENT")
-        return body
+        children = body.get("child_ids") if isinstance(body.get("child_ids"), list) else []
+        proposals = []
+        child_ids = [child for child in children if isinstance(child, str) and child.strip()]
+        if child_ids:
+            proposals.append({
+                "kind": "decompose",
+                "children": [{"work_item_id": child} for child in child_ids],
+            })
+        return {
+            "reasoning": reasoning.strip(),
+            "proposals": proposals,
+            "observed_identity": {
+                "profile": "advisory-endpoint",
+                "effort": "unknown",
+                "kanban_task_id": task_id.strip(),
+                "fanout": bool(body.get("fanout")),
+            },
+        }
 
     def observed_identity(self, body: Mapping[str, Any] | None = None) -> dict[str, Any]:
         """What this adapter can honestly say about who answered."""
@@ -525,12 +909,27 @@ class HermesAdvisor:
         with self.opener(req, timeout=self.timeout) as response:
             return json.loads(response.read().decode())
 
-    def _post(self, path: str, body: dict[str, Any]) -> dict[str, Any]:
+    def _post(self, path: str, body: dict[str, Any], *, timeout: float | None = None) -> dict[str, Any]:
         data = json.dumps(body).encode()
         headers = {**self._headers(), "Content-Type": "application/json"}
         req = urllib.request.Request(self.base_url + path, data=data, headers=headers)
         try:
-            with self.opener(req, timeout=self.timeout) as response:
+            with self.opener(req, timeout=self.timeout if timeout is None else timeout) as response:
                 return json.loads(response.read().decode())
         except urllib.error.HTTPError as exc:
             raise PermissionError("ADVISOR_HTTP_%d" % exc.code) from exc
+
+
+def _snapshot_title(snapshot: dict[str, Any]) -> str:
+    items = snapshot.get("work_items") if isinstance(snapshot, dict) else None
+    if isinstance(items, list) and items:
+        first = items[0]
+        if isinstance(first, dict):
+            for key in ("work_item_id", "id", "title"):
+                value = first.get(key)
+                if isinstance(value, str) and value.strip():
+                    return value.strip()[:200]
+    mission = snapshot.get("mission_id") if isinstance(snapshot, dict) else None
+    if isinstance(mission, str) and mission.strip():
+        return mission.strip()[:200]
+    return "factory-maintenance"

@@ -6,6 +6,7 @@ case "${1:-}" in
   # is: the ledger it has to reach is a host path, and the containerised
   # fall-through below would silently open a different one.
   factory|release) exec python3 -m factory_controller.cli "$@" ;;
+  awe-worker) shift || true; exec python3 -m awe_worker.cli "$@" ;;
   review)
     # The Owner review surface. `./dev factory review` seals the
     # Release Candidate and unpacks its bytes; this only serves them.

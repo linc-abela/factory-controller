@@ -30,6 +30,7 @@ mission identity.  That is what makes ``./dev factory run`` idempotent.
 
 from __future__ import annotations
 
+import re
 import time
 from dataclasses import dataclass
 from typing import Any, Callable, Mapping, Sequence
@@ -55,6 +56,7 @@ NATIVE_RECEIPT = "foundation_native_receipt"
 OWNER_RATIFICATION = "owner_ratification"
 NATIVE_REGISTRY = "foundation_project_registry"
 LIVE_ACTION = "live_provider_dispatch"
+_SHA256 = re.compile(r"^[0-9a-f]{64}$")
 
 # The first dogfood path asks for a useful but finite repository picture.  The
 # Broker owns classification and selection; these names are only the request
@@ -220,6 +222,11 @@ def build(mission, *, portfolio_ref: str, run_ref: str,
     under it.
     """
 
+    if not isinstance(registry_digest, str) or _SHA256.fullmatch(registry_digest) is None:
+        raise IntakeError(
+            "PROJECT_REGISTRY_UNIDENTIFIED",
+            "The execution layer's project registry has no identity the "
+            "mission could be bound to.")
     row = registry_row(registry, mission.project_id)
     if row.get("resolution") not in (None, "resolved"):
         raise IntakeError(

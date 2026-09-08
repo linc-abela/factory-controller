@@ -155,6 +155,100 @@ def _revision_argv(config: dict[str, Any]) -> list[str]:
     return argv
 
 
+_SHA256 = re.compile(r"^[0-9a-f]{64}$")
+_LIVE_IDENTITY = (
+    "work_item_id", "baseline_sha", "context_manifest_hash",
+    "repository_remote_url", "idempotency_key",
+)
+
+
+def _live_refusal(receipt: dict[str, Any], code: str) -> dict[str, Any]:
+    return {"status": "refused", "diagnostic": code,
+            "receipt": {**receipt, "process_started": False,
+                        "execution_mode": "not_applicable",
+                        "refusal_code": code}}
+
+
+def _first_live_refusal(result: dict[str, Any]) -> Any:
+    """Prefer the runner's typed refusal, including a preflight-only one.
+
+    first-live writes ``MISSING_ADMITTED_REQUEST`` on the preflight report
+    and omits a top-level ``refusal_code`` when transport never starts.
+    """
+
+    preflight = result.get("preflight")
+    nested = preflight.get("refusal_code") if isinstance(preflight, dict) else None
+    return result.get("refusal_code") or nested or result.get("status")
+
+
+def _bind_live_admission(mission: dict[str, Any],
+                         config: dict[str, Any]) -> tuple[list[str], str | None]:
+    """Bind the Controller's already-admitted request for first-live --real.
+
+    Optional ``--admission`` / ``--repository`` made the live Stage-1 path
+    able to invoke Evidence Core with neither, which first-live reports as
+    ``MISSING_ADMITTED_REQUEST`` and never as a Bridge transport.  Missing,
+    unreadable, or identity-mismatched documents refuse here instead, with
+    ``process_started=False``.
+    """
+
+    admission = config.get("admission")
+    if not isinstance(admission, str) or not admission:
+        return [], "MISSING_ADMITTED_REQUEST"
+    path = Path(admission)
+    if not path.is_absolute() or not path.is_file():
+        return [], "MISSING_ADMITTED_REQUEST"
+    try:
+        body = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, json.JSONDecodeError, ValueError):
+        return [], "MISSING_ADMITTED_REQUEST"
+    request = body.get("request") if isinstance(body, dict) else None
+    evidence = body.get("admission_evidence") if isinstance(body, dict) else None
+    if not isinstance(request, dict) or not isinstance(evidence, dict):
+        return [], "MISSING_ADMITTED_REQUEST"
+
+    expected_key = mission.get("idempotency_key")
+    work_item = mission.get("work_item_id")
+    manifest_hash = mission.get("context_manifest_hash")
+    if not isinstance(expected_key, str) or not expected_key:
+        if isinstance(work_item, str) and isinstance(manifest_hash, str) \
+                and _SHA256.fullmatch(manifest_hash):
+            expected_key = "%s:%s" % (work_item, manifest_hash)
+        else:
+            expected_key = None
+    expected = {
+        "work_item_id": work_item,
+        "baseline_sha": mission.get("baseline_sha"),
+        "context_manifest_hash": manifest_hash,
+        "repository_remote_url": mission.get("repository_remote_url"),
+        "idempotency_key": expected_key,
+    }
+    if any(not isinstance(expected[name], str) or not expected[name]
+           for name in _LIVE_IDENTITY):
+        return [], "MISSING_ADMITTED_REQUEST"
+    gates = mission.get("acceptance_gate_ids")
+    if not isinstance(gates, (list, tuple)) or not gates:
+        return [], "MISSING_ADMITTED_REQUEST"
+    if any(request.get(name) != expected[name] for name in _LIVE_IDENTITY) \
+            or list(request.get("acceptance_gate_ids") or ()) != list(gates):
+        return [], "ADMITTED_REQUEST_BINDING_MISMATCH"
+    manifest = evidence.get("context_manifest")
+    if (not isinstance(manifest, dict)
+            or manifest.get("manifest_hash") != expected["context_manifest_hash"]
+            or evidence.get("admitted_baseline_sha") != expected["baseline_sha"]):
+        return [], "ADMITTED_REQUEST_BINDING_MISMATCH"
+
+    repository = config.get("repository")
+    if not isinstance(repository, str) or not Path(repository).is_absolute():
+        return [], "MISSING_TARGET_REPOSITORY"
+    argv = ["--admission", str(path.resolve()),
+            "--repository", repository]
+    brief = config.get("mission_brief")
+    if isinstance(brief, str) and brief:
+        argv.extend(("--mission-brief", brief))
+    return argv, None
+
+
 def _reconcile(request: dict[str, Any], config: dict[str, Any]) -> dict[str, Any]:
     """Look one already-sealed provider result up.  Never produce a new one.
 
@@ -216,11 +310,10 @@ def _dispatch(request: dict[str, Any], config: dict[str, Any], *,
     output = Path(config.get("output", f"/tmp/factory-stage1-{request['operation_key'].replace(':', '-')}.json"))
     argv = [*command, "--dry-run" if mode == "dry_run" else "--real", "--output", str(output)]
     if mode == "real":
-        for key, flag in (("admission", "--admission"),
-                          ("repository", "--repository"),
-                          ("mission_brief", "--mission-brief")):
-            if config.get(key):
-                argv.extend((flag, str(config[key])))
+        bound, refusal = _bind_live_admission(_mission(request), config)
+        if refusal:
+            return _live_refusal(receipt, refusal)
+        argv.extend(bound)
         argv.extend(_revision_argv(config))
         if reconcile_proof is not None:
             # The whole instruction of a reconciliation: answer from the sealed
@@ -261,6 +354,7 @@ def _dispatch(request: dict[str, Any], config: dict[str, Any], *,
     candidate = envelope.get("candidate_sha") or binding.get("candidate_sha")
     workspace = _candidate_workspace(result)
     status = result.get("status")
+    refusal = _first_live_refusal(result)
     if completed.returncode == 0 and status in {"completed", "passed"} and candidate:
         mapped = "completed"
     elif status in {"blocked", "refused", "no_candidate"}:
@@ -272,7 +366,7 @@ def _dispatch(request: dict[str, Any], config: dict[str, Any], *,
         "candidate_sha": candidate if mapped == "completed" else None,
         "candidate_workspace": workspace if mapped == "completed" else None,
         "execution_id": envelope.get("execution_id"),
-        "diagnostic": result.get("refusal_code") or result.get("status"),
+        "diagnostic": refusal,
         "stage1_result": result,
         "receipt": {
             **receipt,
@@ -281,7 +375,7 @@ def _dispatch(request: dict[str, Any], config: dict[str, Any], *,
             "duration_ms": duration_ms,
             "execution_mode": _execution_mode(result),
             "idempotency_key": _bound_idempotency_key(result),
-            "refusal_code": result.get("refusal_code"),
+            "refusal_code": None if mapped == "completed" else refusal,
         },
     }
 
