@@ -3,9 +3,11 @@
 from __future__ import annotations
 
 import json
+import os
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 from factory_controller import owner_app, pcp
 from factory_controller.factory import FactoryConfig, FactoryLifecycle, OwnerIdentity
@@ -167,6 +169,32 @@ class EnvelopeScaffoldTests(unittest.TestCase):
         legacy, legacy_url = lifecycle._review_port(lodus)
         self.assertEqual(legacy_url, lifecycle.config.review_url)
         self.assertNotEqual(getattr(legacy, "name", ""), google_production.ADAPTER_NAME)
+
+    def test_envelope_review_without_a_token_refuses_before_network(self):
+        from factory_controller.factory import FactoryRefusal
+        from factory_controller import envelope_scaffold, product
+        temp = tempfile.TemporaryDirectory()
+        self.addCleanup(temp.cleanup)
+        root = Path(temp.name)
+        accepted = owner_app.accept_brief(
+            INVENTORY_BRIEF, created_at="2026-09-08T00:00:00Z")
+        body = owner_app.derived_contract(
+            accepted.package_id, baseline_sha="a" * 40,
+            run_ref="owner-brief-household-inventory-1",
+            remote=envelope_scaffold.remote_url(accepted.package_id),
+            provider_profiles=product.ProductContract.load(
+                Path(__file__).resolve().parents[1] / "contracts" /
+                "lodus-casino-product-run-contract.json").provider_profiles)
+        path = root / "contract.json"
+        path.write_text(json.dumps(body), encoding="utf-8")
+        contract = product.ProductContract.load(path)
+        lifecycle = FactoryLifecycle(
+            Controller(MissionStore(root / "missions.sqlite"), NoopAdapter()),
+            config=FactoryConfig.default())
+        with mock.patch.dict(os.environ, {"FACTORY_FIREBASE_TOKEN": ""}, clear=False):
+            with self.assertRaises(FactoryRefusal) as refused:
+                lifecycle._review_port(contract)
+        self.assertEqual(refused.exception.code, "REVIEW_DEPLOY_AUTH_UNAVAILABLE")
 
 
 if __name__ == "__main__":

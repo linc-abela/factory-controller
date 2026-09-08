@@ -107,6 +107,10 @@ AUTOPILOT_WORKER_ID = "factory-autopilot"
 #: tripping it.
 STEP_STALE_AFTER_SECONDS = 900.0
 
+#: Release-deployment states that mean the Owner can open the REVIEW URL.
+#: A failed or uncertain Firebase publish is not a reviewable surface.
+REVIEW_SERVING_STATES = frozenset({"healthy", "health_pending", "verifying"})
+
 # SF-179 A: which payload differences prove nothing about the work.
 #
 # A revision's idempotency key binds only the mission identity fields and the
@@ -1886,6 +1890,11 @@ class FactoryLifecycle:
                 review_environment_id=contract.review_environment_id,
                 requested_by=self.owner.username,  # type: ignore[union-attr]
                 review_url=review_url)
+            if deployed.get("state") not in REVIEW_SERVING_STATES:
+                raise FactoryRefusal(
+                    "REVIEW_NOT_PREPARED",
+                    "Exact-artifact REVIEW did not reach the hosting surface "
+                    "(deployment state %s)." % deployed.get("state"))
         except (release.ReleaseRefusal, production.ProductionRefusal) as refusal:
             raise FactoryRefusal(
                 getattr(refusal, "code", "REVIEW_NOT_PREPARED"),
@@ -1936,6 +1945,12 @@ class FactoryLifecycle:
         transport = self.review_transport
         if transport is None:
             token = os.environ.get("FACTORY_FIREBASE_TOKEN")
+            if not isinstance(token, str) or not token.strip():
+                raise FactoryRefusal(
+                    "REVIEW_DEPLOY_AUTH_UNAVAILABLE",
+                    "FACTORY_FIREBASE_TOKEN is not set on the Factory "
+                    "supervisor, so the exact-artifact REVIEW cannot be "
+                    "published.")
             transport = google_production.FirebaseHostingRestTransport(token=token)
         adapter = google_production.FirebaseHostingDeploymentAdapter(
             targets, transport=transport, store=self.store)
@@ -2004,11 +2019,60 @@ class FactoryLifecycle:
         except product.ProductRefusal as refusal:
             raise FactoryRefusal(refusal.code, refusal.detail) from None
 
+    def _with_fast_path_review(self, result: FactoryResult) -> FactoryResult:
+        """Keep historical dogfood attention from stranding envelope REVIEW."""
+
+        continued = self._continue_fast_path_review()
+        if continued is None:
+            return result
+        return FactoryResult(
+            action=result.action, ok=continued.ok,
+            state=continued.state if continued.ok else "attention",
+            lines=continued.lines,
+            details={**(result.details or {}), "review": continued.details},
+        )
+
+    def _write_fast_path_owner_status(self, result: FactoryResult) -> None:
+        package_id = self._bound_envelope_package_id()
+        if not package_id:
+            return
+        mission_dir = self.config.state_dir / "owner-missions" / package_id
+        if not mission_dir.is_dir():
+            return
+        if result.ok and result.state == "review-ready":
+            owner_state = "Ready for validation"
+            stage = "review"
+        elif result.ok:
+            owner_state = "Working"
+            stage = "review"
+        else:
+            owner_state = "Blocked"
+            stage = "review"
+        owner_app.write_status(mission_dir / "status.json", {
+            "owner_state": owner_state,
+            "stage": stage,
+            "freshness": "current",
+            "next_action": (result.lines[0] if result.lines
+                            else "The Factory owns the next action."),
+            "package_id": package_id,
+            "review_url": (result.details or {}).get("review_url")
+            or envelope_scaffold.firebase_review_url(package_id),
+            "rc_id": (result.details or {}).get("rc_id"),
+            "candidate_sha": (result.details or {}).get("candidate_sha"),
+            "code": (result.details or {}).get("code"),
+        })
+
     def _continue_fast_path_review(self) -> FactoryResult | None:
         """Advance completed fast-path work to REVIEW without Owner relay."""
 
         root = self.config.state_dir / "owner-missions"
         if not root.is_dir():
+            return None
+        try:
+            contract = self._product_contract()
+        except FactoryRefusal:
+            return None
+        if not owner_app.is_envelope_run(contract.run_ref):
             return None
         mission = self._product_reading()
         if mission is None or mission["state"] != "completed":
@@ -2016,14 +2080,23 @@ class FactoryLifecycle:
         review_lines = self._review_lines(mission, "completed")
         if any("ready at" in line for line in review_lines):
             return None
+        preparing = FactoryResult(
+            action="review", ok=True, state="working",
+            lines=("Preparing the exact-artifact REVIEW; "
+                   "no Owner command is required.",),
+            details={"package_id": contract.package_id},
+        )
+        self._write_fast_path_owner_status(preparing)
         try:
-            return self.review()
+            result = self.review()
         except FactoryRefusal as refusal:
-            return FactoryResult(
+            result = FactoryResult(
                 action="review", ok=False, state="blocked",
                 lines=("BLOCKED: " + refusal.detail,),
                 details={"code": refusal.code},
             )
+        self._write_fast_path_owner_status(result)
+        return result
 
     def _build_artifact(self, contract, candidate_sha: str) -> dict[str, Any]:
         """Ask the execution layer for the candidate's immutable identity.
@@ -2340,7 +2413,7 @@ class FactoryLifecycle:
         queued = self._queue_next(contract, entry, doctor, grant,
                                   owner_action=False)
         if queued.state == "complete":
-            return queued
+            return self._with_fast_path_review(queued)
         # An attention on an earlier slot stops *submission*, not execution.
         # Returning here left every already-admitted mission admitted forever:
         # the Owner's own `./dev factory run` had authorized DF-3 before the
@@ -2349,6 +2422,10 @@ class FactoryLifecycle:
         # and reconciling it is the one thing that must not wait for a person.
         # So the cycle still runs, nothing new is handed off, and the blocker
         # is what the Owner is told.
+        #
+        # Envelope REVIEW is already-admitted product work, not a new dogfood
+        # handoff.  A historical DF-1 attention must not skip it: that left a
+        # finished inventory candidate with no exact-artifact REVIEW.
         blocked = None if queued.ok else queued
         try:
             report = self.supervisor.cycle(AUTOPILOT_WORKER_ID)
@@ -2375,29 +2452,20 @@ class FactoryLifecycle:
                 cycle=report)
 
         settled = self._settle_improvement(contract, grant)
-        if blocked is not None:
-            return FactoryResult(
-                action="cycle", ok=False, state="attention",
-                lines=blocked.lines,
-                details={**dict(blocked.details), "cycle": report,
-                         **({} if settled is None else {"improvement": settled})})
-        advanced = self._queue_next(contract, entry, doctor, grant,
-                                    owner_action=False)
         extra = {"cycle": report}
         if settled is not None:
             extra["improvement"] = settled
-        continued = self._continue_fast_path_review()
-        if continued is not None:
-            extra["review"] = continued.details
-            if not continued.ok:
-                return FactoryResult(
-                    action="cycle", ok=False, state="attention",
-                    lines=continued.lines,
-                    details={**(advanced.details or {}), **extra})
-        return FactoryResult(
+        if blocked is not None:
+            return self._with_fast_path_review(FactoryResult(
+                action="cycle", ok=False, state="attention",
+                lines=blocked.lines,
+                details={**dict(blocked.details), **extra}))
+        advanced = self._queue_next(contract, entry, doctor, grant,
+                                    owner_action=False)
+        return self._with_fast_path_review(FactoryResult(
             action="cycle", ok=advanced.ok, state=advanced.state,
             lines=advanced.lines,
-            details={**(advanced.details or {}), **extra})
+            details={**(advanced.details or {}), **extra}))
 
     def _queue_next(self, contract, entry, doctor, grant, *,
                     owner_action: bool) -> FactoryResult:
@@ -3086,25 +3154,57 @@ class FactoryLifecycle:
                 "Owner act is required."
                 % (work_item, mission["terminal_reason"]
                    or "it did not settle successfully"))
+            review_lines = ()
+            review_block = None
         elif state == "completed":
             review_lines = self._review_lines(mission, state)
             review_ready = any("ready at" in line for line in review_lines)
-            summary_state = "complete" if review_ready else "pending"
+            review_block = None if review_ready else self._fast_path_review_block()
+            summary_state = ("complete" if review_ready
+                             else "attention" if review_block else "pending")
         else:
             summary_state = "pending"
+            review_lines = ()
+            review_block = None
         facing = owner_app.owner_state_for(
             mission_state=state,
             review_ready=summary_state == "complete" and state == "completed",
-            blocked=state in shift_plane.UNSUCCESSFUL_MISSION_STATES,
+            blocked=(state in shift_plane.UNSUCCESSFUL_MISSION_STATES
+                     or bool(review_block)),
             stale=stale,
         )
         lines = [facing["owner_state"], facing["next_action"]] + lines
-        lines.extend(self._review_lines(mission, state))
+        if review_block:
+            lines.append(review_block)
+        else:
+            lines.extend(review_lines)
         lines.extend(self._lineage_lines(mission))
         history = self._dogfood_history_note()
         if history is not None:
             lines.append(history)
         return tuple(lines), summary_state
+
+    def _fast_path_review_block(self) -> str | None:
+        """Durable envelope REVIEW refusal, when one is already recorded."""
+
+        package_id = self._bound_envelope_package_id()
+        if not package_id:
+            return None
+        path = (self.config.state_dir / "owner-missions" / package_id
+                / "status.json")
+        try:
+            row = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            return None
+        if not isinstance(row, dict):
+            return None
+        if row.get("code") != "REVIEW_DEPLOY_AUTH_UNAVAILABLE":
+            return None
+        detail = row.get("next_action")
+        if isinstance(detail, str) and detail.strip():
+            return detail
+        return ("BLOCKED: FACTORY_FIREBASE_TOKEN is not set on the Factory "
+                "supervisor, so the exact-artifact REVIEW cannot be published.")
 
     def _lineage_lines(self, mission) -> tuple[str, ...]:
         """What the Owner already decided about this product, and about what.
@@ -3172,7 +3272,7 @@ class FactoryLifecycle:
         try:
             with self.store.transaction() as db:
                 row = db.execute(
-                    "SELECT validation_surface, artifact_digest FROM"
+                    "SELECT validation_surface, artifact_digest, state FROM"
                     " release_deployments WHERE rc_id=?", (rc_id,)).fetchone()
         except Exception:  # noqa: BLE001
             # The release plane owns that table and creates it on first use, so
@@ -3180,7 +3280,11 @@ class FactoryLifecycle:
             # Reading is all this does: a status that created a schema would be
             # a status that writes.
             row = None
-        if row is None:
+        if row is None or row["state"] not in REVIEW_SERVING_STATES:
+            if row is not None:
+                return ("Next: exact-artifact REVIEW did not reach the hosting "
+                        "surface (%s); the Factory owns recovery."
+                        % row["state"],)
             return ("Next: the Factory is preparing exact-artifact REVIEW; "
                     "no Owner command is required.",)
         return ("Review: %s is ready at %s" % (rc_id, row["validation_surface"]),

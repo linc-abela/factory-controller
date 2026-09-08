@@ -523,6 +523,25 @@ class ProductStatusTests(unittest.TestCase):
 
         self.assertEqual([dict(row) for row in self.missions()], before)
 
+    def test_cycle_still_attempts_envelope_review_when_df1_needs_attention(self):
+        """Historical DF-1 attention must not skip already-finished product REVIEW."""
+
+        self.ready()
+        self.escalate_the_first_internal_slot()
+        (self.config.state_dir / "owner-missions").mkdir()
+        seen = []
+        inner = self.lifecycle._continue_fast_path_review
+
+        def spy():
+            seen.append(True)
+            return inner()
+
+        self.lifecycle._continue_fast_path_review = spy
+        result = self.lifecycle.dispatch("cycle")
+        self.assertEqual(seen, [True])
+        self.assertFalse(result.ok)
+        self.assertIn("DF-1", result.render())
+
 
 class ProductReviewTests(unittest.TestCase):
     """SF-158: what a finished product mission becomes.
