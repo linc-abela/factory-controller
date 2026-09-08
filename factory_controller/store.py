@@ -78,6 +78,14 @@ INFRASTRUCTURE_REASON_PREFIXES = (
     "PROJECT_REPOSITORY_UNRESOLVED",
     "REPOSITORY_REMOTE_MISMATCH",
     "BASELINE_SHA_UNKNOWN",
+    # SF-217: first-live reported MISSING_ADMITTED_REQUEST for a readable
+    # Controller document whose live admission was STALE_TRUSTED_DISPATCH_READINESS.
+    # Neither served a provider; a new grant writes a new document.
+    "MISSING_ADMITTED_REQUEST",
+    "STALE_TRUSTED_DISPATCH_READINESS",
+    # A fixture context adapter answering a real mission binds a different
+    # selection than intake's Broker preflight (DF-4 attempt 2).
+    "CONTEXT_HASH_MISMATCH",
 )
 
 #: What a mission stopped on when its candidate exists but could not be proved

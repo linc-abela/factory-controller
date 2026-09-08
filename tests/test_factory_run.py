@@ -338,6 +338,23 @@ class IntakeRefusalTests(unittest.TestCase):
         self.assertEqual(first.idempotency_key, later.idempotency_key)
         self.assertEqual(first.payload, later.payload)
 
+    def test_an_expired_grant_is_refused_before_a_live_document_is_written(self):
+        """Live DF-4 wrote evaluated_at outside the grant window; first-live
+        then reported MISSING_ADMITTED_REQUEST for STALE_TRUSTED_DISPATCH_READINESS."""
+
+        with self.assertRaises(dogfood_intake.IntakeError) as raised:
+            self.build(self.mission("DF-4"), now=101.0, granted_at=0.0,
+                       expires_at=100.0)
+
+        self.assertEqual(raised.exception.code, "STALE_TRUSTED_DISPATCH_READINESS")
+
+    def test_a_grant_that_has_not_started_is_refused_the_same_way(self):
+        with self.assertRaises(dogfood_intake.IntakeError) as raised:
+            self.build(self.mission("DF-4"), now=0.0, granted_at=10.0,
+                       expires_at=100.0)
+
+        self.assertEqual(raised.exception.code, "STALE_TRUSTED_DISPATCH_READINESS")
+
 
 class AdapterSeamTests(unittest.TestCase):
     """One seam now serves both paths, so neither mission kind loses its own."""
@@ -396,7 +413,10 @@ class RetryClassificationTests(unittest.TestCase):
                        "NO_ADMISSIBLE_PROVIDER: considered 1 candidate(s)",
                        "PROVIDER_ROUTE_EXHAUSTED: considered 2 candidate(s)",
                        "CONTEXT_BROKER_UNAVAILABLE",
-                       "RETRIES_EXHAUSTED"):
+                       "RETRIES_EXHAUSTED",
+                       "MISSING_ADMITTED_REQUEST",
+                       "STALE_TRUSTED_DISPATCH_READINESS",
+                       "CONTEXT_HASH_MISMATCH"):
             with self.subTest(reason=reason):
                 self.assertEqual(
                     shift_plane.retry_classification("refused", reason, 1),
