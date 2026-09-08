@@ -227,6 +227,20 @@ def build(mission, *, portfolio_ref: str, run_ref: str,
             "PROJECT_REGISTRY_UNIDENTIFIED",
             "The execution layer's project registry has no identity the "
             "mission could be bound to.")
+    # Evidence Core re-evaluates this document at first-live and refuses
+    # STALE_TRUSTED_DISPATCH_READINESS when evaluated_at is outside the
+    # grant window.  Writing that document anyway is what made the live
+    # DF-4 / DF-3 smokes look like MISSING_ADMITTED_REQUEST.
+    if not isinstance(granted_at, (int, float)) \
+            or not isinstance(expires_at, (int, float)) \
+            or not isinstance(now, (int, float)) \
+            or isinstance(granted_at, bool) or isinstance(expires_at, bool) \
+            or isinstance(now, bool) \
+            or granted_at > expires_at or not granted_at <= now <= expires_at:
+        raise IntakeError(
+            "STALE_TRUSTED_DISPATCH_READINESS",
+            "The shift grant is not valid at admission time, so the live "
+            "execution layer would refuse STALE_TRUSTED_DISPATCH_READINESS.")
     row = registry_row(registry, mission.project_id)
     if row.get("resolution") not in (None, "resolved"):
         raise IntakeError(
