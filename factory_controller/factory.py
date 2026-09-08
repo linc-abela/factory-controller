@@ -4167,6 +4167,14 @@ class FactoryLifecycle:
                     (line.split() for line in result.stdout.splitlines())
                     if result.returncode == 0 and len(fields) >= 2
                 }
+                checkout = row.get("checkout")
+                if isinstance(checkout, str) and checkout:
+                    local = self._run(
+                        ("git", "-C", checkout, "log", "--format=%H"))
+                    if local.returncode == 0:
+                        advertised[remote].update(
+                            line.strip() for line in local.stdout.splitlines()
+                            if len(line.strip()) == 40)
             for sha in shas & advertised[remote]:
                 found.setdefault(mission.project_id, []).append(sha)
         return {name: tuple(sorted(set(values))) for name, values in found.items()}
