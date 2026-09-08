@@ -1,0 +1,53 @@
+name: Branch hygiene
+
+on:
+  pull_request:
+    types: [closed]
+  push:
+    branches: [main]
+
+permissions:
+  contents: write
+
+jobs:
+  delete-merged-head:
+    if: >-
+      github.event_name == 'pull_request' &&
+      github.event.pull_request.merged == true &&
+      github.event.pull_request.head.repo.full_name == github.repository &&
+      github.event.pull_request.head.ref != github.event.repository.default_branch
+    runs-on: ubuntu-latest
+    steps:
+      - name: Delete merged head branch
+        env:
+          GH_TOKEN: ${{ github.token }}
+          BRANCH: ${{ github.event.pull_request.head.ref }}
+        run: gh api --method DELETE "repos/${GITHUB_REPOSITORY}/git/refs/heads/${BRANCH}"
+
+  initial-cleanup:
+    if: >-
+      github.event_name == 'push' &&
+      contains(github.event.head_commit.message, '[branch-hygiene-bootstrap]')
+    runs-on: ubuntu-latest
+    steps:
+      - name: Delete stale branches
+        env:
+          GH_TOKEN: ${{ github.token }}
+          STALE_BRANCHES: |
+            checkpoint/cursor-dispatch-bootstrap-v1
+            checkpoint/hardcoded-agent-bootstrap-v1
+            codex/sf-147
+            experiment/sf-140-self-target-generation-1
+            recovery/phase1-pre-sf172
+            sf/SF-217/autonomous-awe-worker
+            sf-202/hermes-021-kanban-judge
+        shell: bash
+        run: |
+          set -euo pipefail
+          while IFS= read -r branch; do
+            [ -z "$branch" ] && continue
+            if gh api "repos/${GITHUB_REPOSITORY}/git/ref/heads/${branch}" >/dev/null 2>&1; then
+              gh api --method DELETE "repos/${GITHUB_REPOSITORY}/git/refs/heads/${branch}"
+              echo "deleted: $branch"
+            fi
+          done <<< "$STALE_BRANCHES"
