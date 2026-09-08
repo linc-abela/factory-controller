@@ -83,6 +83,9 @@ INFRASTRUCTURE_REASON_PREFIXES = (
     # Neither served a provider; a new grant writes a new document.
     "MISSING_ADMITTED_REQUEST",
     "STALE_TRUSTED_DISPATCH_READINESS",
+    # A fixture context adapter answering a real mission binds a different
+    # selection than intake's Broker preflight (DF-4 attempt 2).
+    "CONTEXT_HASH_MISMATCH",
 )
 
 #: What a mission stopped on when its candidate exists but could not be proved

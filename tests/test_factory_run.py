@@ -415,7 +415,8 @@ class RetryClassificationTests(unittest.TestCase):
                        "CONTEXT_BROKER_UNAVAILABLE",
                        "RETRIES_EXHAUSTED",
                        "MISSING_ADMITTED_REQUEST",
-                       "STALE_TRUSTED_DISPATCH_READINESS"):
+                       "STALE_TRUSTED_DISPATCH_READINESS",
+                       "CONTEXT_HASH_MISMATCH"):
             with self.subTest(reason=reason):
                 self.assertEqual(
                     shift_plane.retry_classification("refused", reason, 1),
