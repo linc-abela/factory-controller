@@ -116,3 +116,36 @@ def commit_new_repository(root: str, message: str) -> str:
     if len(sha) != 40:
         raise RuntimeError("bootstrap commit is not a full SHA")
     return sha
+
+
+def publish_new_repository(root: str, name: str) -> None:
+    """Host the Factory-derived bootstrap so Bridge can resolve the project.
+
+    The application is still unimplemented; this only publishes the stub tree.
+    """
+
+    viewed = run_host_command(("gh", "repo", "view", name, "--json", "name"))
+    if viewed.returncode != 0:
+        created = run_host_command(
+            ("gh", "repo", "create", name, "--private", "--source", root,
+             "--remote", "origin", "--push"),
+            cwd=root,
+        )
+        if created.returncode != 0:
+            raise RuntimeError(created.stderr.strip() or created.stdout.strip()
+                               or "hosted repository create failed")
+        return
+    origin = run_host_command(
+        ("git", "config", "--get", "remote.origin.url"), cwd=root)
+    if origin.returncode != 0 or not origin.stdout.strip():
+        added = run_host_command(
+            ("git", "remote", "add", "origin",
+             "https://github.com/%s.git" % name),
+            cwd=root)
+        if added.returncode != 0:
+            raise RuntimeError(added.stderr.strip() or added.stdout.strip()
+                               or "origin could not be recorded")
+    pushed = run_host_command(("git", "push", "-u", "origin", "HEAD"), cwd=root)
+    if pushed.returncode != 0:
+        raise RuntimeError(pushed.stderr.strip() or pushed.stdout.strip()
+                           or "hosted repository push failed")

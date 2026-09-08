@@ -48,7 +48,7 @@ from . import shift_runtime
 from . import stage1_adapter
 from . import store as store_mod
 from . import supervisor
-from .adapter import HostCommandResult, run_host_command
+from .adapter import HostCommandResult, publish_new_repository, run_host_command
 
 
 SURFACES = {
@@ -229,6 +229,7 @@ class FactoryConfig:
     #: would be promoted.
     review_url: str = "http://127.0.0.1:8787"
     python_path: Path | None = None
+    product_checkout_root: Path = Path("/Users/Shared/Projects/software-factory")
 
     @property
     def bridge_plist(self) -> Path:
@@ -264,12 +265,13 @@ class FactoryConfig:
     @classmethod
     def default(cls, db_path: str | Path | None = None) -> "FactoryConfig":
         controller_root = Path(__file__).resolve().parents[1]
-        bridge_root = controller_root.parent / "factory-bridge"
-        vault_root = controller_root.parent / "factory-vault"
+        bridge_root = _peer_dir(controller_root, "factory-bridge")
+        vault_root = _peer_dir(controller_root, "factory-vault")
         return cls(
             controller_root=controller_root,
             bridge_root=bridge_root,
             vault_root=vault_root,
+            product_checkout_root=envelope_scaffold.CHECKOUT_ROOT,
             contract_path=controller_root / "contracts" /
             "internal-dogfood-run-contract.json",
             portfolio_path=controller_root / "contracts" /
@@ -304,6 +306,21 @@ HEALTH_CHECKS = {
     "EVIDENCE_CORE_HEALTH": "Evidence Core",
     "CONTEXT_BROKER_HEALTH": "Context Broker",
 }
+
+
+def _peer_dir(controller_root: Path, name: str) -> Path:
+    """Resolve a sibling checkout, including task worktrees."""
+
+    parent = controller_root.parent
+    stem = controller_root.name
+    prefix = "factory-controller"
+    if stem.startswith(prefix):
+        suffix = stem[len(prefix):]
+        if suffix:
+            candidate = parent / (name + suffix)
+            if candidate.is_dir():
+                return candidate
+    return parent / name
 
 
 class FactoryLifecycle:
@@ -524,7 +541,7 @@ class FactoryLifecycle:
                     evidence_ref=approval_ref,
                     policy_version=contract.run_ref,
                 )
-            if not self._service_loaded(self.config.supervisor_label):
+            if not self._service_running(self.config.supervisor_label):
                 raise FactoryRefusal(
                     "SUPERVISOR_NOT_RUNNING",
                     "The Factory supervisor could not be started. Retry the command.")
@@ -545,17 +562,23 @@ class FactoryLifecycle:
                 "SUPERVISOR_NOT_RUNNING",
                 "The Factory supervisor could not be started. Retry the command.")
 
+        continued = self._continue_fast_path_waiting_brief()
+        extra = ()
+        if recovered:
+            extra = ("READY TO RESUME EXISTING REVISION",
+                     "Existing revision mission rebound and queued for resume.")
+        if continued is not None:
+            extra = extra + continued.lines
         return FactoryResult(
-            action="start", ok=True, state="ready",
+            action="start", ok=True if continued is None or continued.ok else False,
+            state="ready" if continued is None or continued.ok else "blocked",
             lines=("FACTORY READY",
-                   "Shift active. Supervisor running.",
-                   *(("READY TO RESUME EXISTING REVISION",
-                      "Existing revision mission rebound and queued for resume.")
-                     if recovered else ())),
+                   "Shift active. Supervisor running.") + extra,
             details={"grant": applied, "gate": gate_preview,
                      "bridge": doctor, "readiness": readiness,
                      "supervisor": service_doctor,
-                     "pre_provider_recovery": recovered},
+                     "pre_provider_recovery": recovered,
+                     **({} if continued is None else dict(continued.details))},
         )
 
     def stop(self) -> FactoryResult:
@@ -609,7 +632,7 @@ class FactoryLifecycle:
         grant = self.shift.grant()
         control = self.supervisor.control()
         if grant is None or control.get("state") != "running" \
-                or not self._service_loaded(self.config.supervisor_label):
+                or not self._service_running(self.config.supervisor_label):
             raise FactoryRefusal(
                 "FACTORY_NOT_READY",
                 "The Factory is not running. Run './dev factory start' first.")
@@ -674,9 +697,13 @@ class FactoryLifecycle:
             accepted.original_brief + "\n", encoding="utf-8")
         (mission_dir / "MISSION.md").write_text(
             owner_app.mission_statement(accepted), encoding="utf-8")
-        bootstrap = mission_dir / "bootstrap"
+        bootstrap = self.config.product_checkout_root / accepted.package_id
         try:
             baseline_sha = envelope_scaffold.write_bootstrap(accepted, bootstrap)
+            if self.config.product_checkout_root == envelope_scaffold.CHECKOUT_ROOT:
+                publish_new_repository(
+                    str(bootstrap),
+                    "%s/%s" % (envelope_scaffold.GITHUB_ORG, accepted.package_id))
         except (OSError, RuntimeError) as exc:
             raise FactoryRefusal(
                 "OWNER_BRIEF_BOOTSTRAP_FAILED",
@@ -782,7 +809,7 @@ class FactoryLifecycle:
         grant = self.shift.grant()
         control = self.supervisor.control()
         return (grant is not None and control.get("state") == "running"
-                and self._service_loaded(self.config.supervisor_label))
+                and self._service_running(self.config.supervisor_label))
 
     def _capability_request_path(self, contract) -> Path:
         derived = (self.config.state_dir / "owner-missions" / contract.package_id
@@ -803,6 +830,20 @@ class FactoryLifecycle:
                 lines=("BLOCKED: " + refusal.detail,),
                 details={"code": refusal.code},
             )
+
+    def _continue_fast_path_waiting_brief(self) -> FactoryResult | None:
+        """Admit a derived brief once the Factory is actually running."""
+
+        package_id = self._bound_envelope_package_id()
+        if not package_id:
+            return None
+        mission_dir = self.config.state_dir / "owner-missions" / package_id
+        package_path = mission_dir / "package.json"
+        if not package_path.is_file():
+            return None
+        if self._product_reading() is not None:
+            return None
+        return self._continue_fast_path_admit(package_path, mission_dir)
 
     def _brief_revision(self, text: str, package_id: str, *,
                         created_at: str) -> FactoryResult:
@@ -916,7 +957,7 @@ class FactoryLifecycle:
         grant = self.shift.grant()
         control = self.supervisor.control()
         if grant is None or control.get("state") != "running" \
-                or not self._service_loaded(self.config.supervisor_label):
+                or not self._service_running(self.config.supervisor_label):
             raise FactoryRefusal(
                 "FACTORY_NOT_READY",
                 "The Factory is not running. Run './dev factory start' first.")
@@ -1057,7 +1098,7 @@ class FactoryLifecycle:
         grant = self.shift.grant()
         control = self.supervisor.control()
         if grant is None or control.get("state") != "running" \
-                or not self._service_loaded(self.config.supervisor_label):
+                or not self._service_running(self.config.supervisor_label):
             raise FactoryRefusal(
                 "FACTORY_NOT_READY",
                 "The Factory is not running. Run './dev factory start' first.")
@@ -2271,7 +2312,7 @@ class FactoryLifecycle:
         grant = self.shift.grant()
         control = self.supervisor.control()
         if grant is None or control.get("state") != "running" \
-                or not self._service_loaded(self.config.supervisor_label):
+                or not self._service_running(self.config.supervisor_label):
             raise FactoryRefusal(
                 "FACTORY_NOT_READY",
                 "The Factory is not running. Run './dev factory start' first.")
@@ -3236,6 +3277,7 @@ class FactoryLifecycle:
         live = self.shift.grant()
         control = self.supervisor.control()
         supervisor_loaded = self._service_loaded(self.config.supervisor_label)
+        supervisor_running = self._service_running(self.config.supervisor_label)
         bridge_loaded = self._service_loaded(self.config.bridge_label)
         try:
             doctor = self._bridge_doctor()
@@ -3250,7 +3292,7 @@ class FactoryLifecycle:
 
         inconsistent = (
             (live is not None and control.get("state") != "running")
-            or (live is not None and not supervisor_loaded)
+            or (live is not None and not supervisor_running)
             or (live is not None and not bridge_loaded)
             or (live is None and control.get("state") in {"running", "paused", "draining"})
             or (live is None and supervisor_loaded)
@@ -3266,11 +3308,11 @@ class FactoryLifecycle:
                          "control": control, "bridge": doctor},
             )
         ready = live is not None and control.get("state") == "running" \
-            and supervisor_loaded and bridge_loaded and bridge_healthy
+            and supervisor_running and bridge_loaded and bridge_healthy
         state = "ready" if ready else "off"
         label = "FACTORY READY" if ready else "FACTORY OFF"
         shift_summary = "Active" if live is not None else "Off"
-        supervisor_summary = "Running" if supervisor_loaded else "Stopped"
+        supervisor_summary = "Running" if supervisor_running else "Stopped"
         work, work_state = self._product_summary() or self._work_summary()
         management_lines, management_reading = self._management_summary()
         status_attention = self._status_attention(
@@ -3407,6 +3449,16 @@ class FactoryLifecycle:
                 "macOS service control is unavailable on this host.")
         return result.returncode == 0
 
+    def _service_running(self, label: str) -> bool:
+        result = self._run(("launchctl", "print", self._service_domain(label)))
+        if result.returncode == 127:
+            raise FactoryRefusal(
+                "HOST_CONTROL_UNAVAILABLE",
+                "macOS service control is unavailable on this host.")
+        if result.returncode != 0:
+            return False
+        return "state = running" in (result.stdout or "")
+
     def _bootout_if_loaded(self, label: str) -> bool:
         if not self._service_loaded(label):
             return False
@@ -3418,11 +3470,19 @@ class FactoryLifecycle:
         return True
 
     def _bootstrap(self, label: str, plist: Path) -> None:
+        if self._service_running(label):
+            return
         if self._service_loaded(label):
+            result = self._run(
+                ("launchctl", "kickstart", "-k", self._service_domain(label)))
+            if result.returncode != 0 or not self._service_running(label):
+                raise FactoryRefusal(
+                    "SERVICE_START_FAILED",
+                    "The Factory could not start a required host service safely.")
             return
         result = self._run(("launchctl", "bootstrap", "gui/%d" % self.owner.uid,
                             str(plist)))  # type: ignore[union-attr]
-        if result.returncode != 0 or not self._service_loaded(label):
+        if result.returncode != 0 or not self._service_running(label):
             raise FactoryRefusal(
                 "SERVICE_START_FAILED",
                 "The Factory could not start a required host service safely.")

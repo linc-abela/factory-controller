@@ -47,6 +47,7 @@ class FactoryProductTests(unittest.TestCase):
             bridge_prefix=root / "bridge",
             bridge_root=bridge_root,
             capability_request_path=root / "dogfood-capability.json",
+            product_checkout_root=root / "apps",
         )
         self.config.capability_request_path.write_text(json.dumps({
             "accepted_unknowns": [], "capability": "bug",

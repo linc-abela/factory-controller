@@ -69,6 +69,7 @@ class OwnerAppFastPathTests(unittest.TestCase):
             state_dir=root / "state",
             bridge_prefix=root / "bridge",
             bridge_root=root / "bridge-source",
+            product_checkout_root=root / "apps",
         )
         (config.bridge_root / "contracts").mkdir(parents=True)
         host = FakeHost(config)
@@ -99,6 +100,7 @@ class OwnerAppFastPathTests(unittest.TestCase):
         self.assertTrue(loaded.run_ref.startswith("owner-brief-"))
         self.assertEqual(len(result.details["baseline_sha"]), 40)
         bootstrap = Path(result.details["bootstrap_path"])
+        self.assertEqual(bootstrap, root / "apps" / "household-inventory")
         self.assertTrue((bootstrap / "evaluate.mjs").is_file())
         self.assertIn("NOT_IMPLEMENTED", (bootstrap / "public/inventory.mjs").read_text())
         self.assertTrue((bootstrap / "capability-admission-request.json").exists()
