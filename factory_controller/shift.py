@@ -190,9 +190,10 @@ UNSUCCESSFUL_MISSION_STATES = TERMINAL_MISSION_STATES - {"completed"}
 #: How many missions one portfolio slot may consume, counting the first.
 #: Bounded for the same reason ``MAX_MISSION_CEILING`` is: what is being
 #: repeated is a *dispatch*, and a repeat rule with no ceiling is an unattended
-#: loop.  Three matches the ledger's own ``max_attempts`` default, so a slot
-#: cannot outlive more rounds than the engine already allows inside one.
-MAX_SLOT_ATTEMPTS = 3
+#: loop.  The bound is one more than the ledger's per-mission ``max_attempts``
+#: default so a slot can survive one extra host-path defect (a dirty
+#: registered checkout, a fixture adapter) without becoming an unattended loop.
+MAX_SLOT_ATTEMPTS = 4
 
 #: Why a portfolio slot may or may not be attempted again.  Exactly one of
 #: these describes a slot, and only the first admits a retry.
