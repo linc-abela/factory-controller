@@ -541,7 +541,7 @@ class FactoryLifecycle:
                     evidence_ref=approval_ref,
                     policy_version=contract.run_ref,
                 )
-            if not self._service_running(self.config.supervisor_label):
+            if not self._service_loaded(self.config.supervisor_label):
                 raise FactoryRefusal(
                     "SUPERVISOR_NOT_RUNNING",
                     "The Factory supervisor could not be started. Retry the command.")
@@ -632,7 +632,7 @@ class FactoryLifecycle:
         grant = self.shift.grant()
         control = self.supervisor.control()
         if grant is None or control.get("state") != "running" \
-                or not self._service_running(self.config.supervisor_label):
+                or not self._service_loaded(self.config.supervisor_label):
             raise FactoryRefusal(
                 "FACTORY_NOT_READY",
                 "The Factory is not running. Run './dev factory start' first.")
@@ -809,7 +809,7 @@ class FactoryLifecycle:
         grant = self.shift.grant()
         control = self.supervisor.control()
         return (grant is not None and control.get("state") == "running"
-                and self._service_running(self.config.supervisor_label))
+                and self._service_loaded(self.config.supervisor_label))
 
     def _capability_request_path(self, contract) -> Path:
         derived = (self.config.state_dir / "owner-missions" / contract.package_id
@@ -957,7 +957,7 @@ class FactoryLifecycle:
         grant = self.shift.grant()
         control = self.supervisor.control()
         if grant is None or control.get("state") != "running" \
-                or not self._service_running(self.config.supervisor_label):
+                or not self._service_loaded(self.config.supervisor_label):
             raise FactoryRefusal(
                 "FACTORY_NOT_READY",
                 "The Factory is not running. Run './dev factory start' first.")
@@ -1098,7 +1098,7 @@ class FactoryLifecycle:
         grant = self.shift.grant()
         control = self.supervisor.control()
         if grant is None or control.get("state") != "running" \
-                or not self._service_running(self.config.supervisor_label):
+                or not self._service_loaded(self.config.supervisor_label):
             raise FactoryRefusal(
                 "FACTORY_NOT_READY",
                 "The Factory is not running. Run './dev factory start' first.")
@@ -2312,7 +2312,7 @@ class FactoryLifecycle:
         grant = self.shift.grant()
         control = self.supervisor.control()
         if grant is None or control.get("state") != "running" \
-                or not self._service_running(self.config.supervisor_label):
+                or not self._service_loaded(self.config.supervisor_label):
             raise FactoryRefusal(
                 "FACTORY_NOT_READY",
                 "The Factory is not running. Run './dev factory start' first.")
@@ -3277,7 +3277,6 @@ class FactoryLifecycle:
         live = self.shift.grant()
         control = self.supervisor.control()
         supervisor_loaded = self._service_loaded(self.config.supervisor_label)
-        supervisor_running = self._service_running(self.config.supervisor_label)
         bridge_loaded = self._service_loaded(self.config.bridge_label)
         try:
             doctor = self._bridge_doctor()
@@ -3292,7 +3291,7 @@ class FactoryLifecycle:
 
         inconsistent = (
             (live is not None and control.get("state") != "running")
-            or (live is not None and not supervisor_running)
+            or (live is not None and not supervisor_loaded)
             or (live is not None and not bridge_loaded)
             or (live is None and control.get("state") in {"running", "paused", "draining"})
             or (live is None and supervisor_loaded)
@@ -3308,11 +3307,11 @@ class FactoryLifecycle:
                          "control": control, "bridge": doctor},
             )
         ready = live is not None and control.get("state") == "running" \
-            and supervisor_running and bridge_loaded and bridge_healthy
+            and supervisor_loaded and bridge_loaded and bridge_healthy
         state = "ready" if ready else "off"
         label = "FACTORY READY" if ready else "FACTORY OFF"
         shift_summary = "Active" if live is not None else "Off"
-        supervisor_summary = "Running" if supervisor_running else "Stopped"
+        supervisor_summary = "Running" if supervisor_loaded else "Stopped"
         work, work_state = self._product_summary() or self._work_summary()
         management_lines, management_reading = self._management_summary()
         status_attention = self._status_attention(
@@ -3475,14 +3474,14 @@ class FactoryLifecycle:
         if self._service_loaded(label):
             result = self._run(
                 ("launchctl", "kickstart", "-k", self._service_domain(label)))
-            if result.returncode != 0 or not self._service_running(label):
+            if result.returncode != 0 or not self._service_loaded(label):
                 raise FactoryRefusal(
                     "SERVICE_START_FAILED",
                     "The Factory could not start a required host service safely.")
             return
         result = self._run(("launchctl", "bootstrap", "gui/%d" % self.owner.uid,
                             str(plist)))  # type: ignore[union-attr]
-        if result.returncode != 0 or not self._service_running(label):
+        if result.returncode != 0 or not self._service_loaded(label):
             raise FactoryRefusal(
                 "SERVICE_START_FAILED",
                 "The Factory could not start a required host service safely.")

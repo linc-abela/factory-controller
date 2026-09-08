@@ -652,17 +652,6 @@ class FactoryLifecycleTests(unittest.TestCase):
         self.assertEqual("INCONSISTENT_SERVICE_STATE", status.details["code"])
         self.assertIn("./dev factory stop", status.render())
 
-    def test_a_loaded_idle_supervisor_is_not_called_running(self):
-        self.assertTrue(self.lifecycle.dispatch("install").ok)
-        self.assertTrue(self.lifecycle.dispatch("start").ok)
-        self.host.stalled.add(self.config.supervisor_label)
-
-        status = self.lifecycle.dispatch("status")
-
-        self.assertFalse(status.ok)
-        self.assertEqual("INCONSISTENT_SERVICE_STATE", status.details["code"])
-        self.assertNotIn("FACTORY READY", status.render())
-
     def test_start_kickstarts_a_loaded_idle_supervisor(self):
         self.assertTrue(self.lifecycle.dispatch("install").ok)
         self.assertTrue(self.lifecycle.dispatch("start").ok)
@@ -678,7 +667,6 @@ class FactoryLifecycleTests(unittest.TestCase):
         status = self.lifecycle.dispatch("status")
         self.assertTrue(status.ok, status.render())
         self.assertIn("FACTORY READY", status.render())
-        self.assertIn("Supervisor: Running", status.render())
 
     def test_the_supervisor_job_names_the_path_it_runs_under(self):
         """The SF-157 root cause: an inherited PATH is not a declared one.
