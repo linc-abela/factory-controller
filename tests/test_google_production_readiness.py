@@ -842,6 +842,9 @@ class FirebaseTransportAndRollbackClosureTests(unittest.TestCase):
             url = req.full_url
             if url.endswith("/versions") and req.get_method() == "POST":
                 return 200, json.dumps({"name": "sites/lodus-casino/versions/v_mock_001"}).encode(), {}
+            if "/projects/" in url and "/sites/" in url and "/versions" not in url \
+                    and req.get_method() == "GET":
+                return 200, json.dumps({"name": "projects/p/sites/lodus-casino"}).encode(), {}
             if ":populateFiles" in url and req.get_method() == "POST":
                 return 200, json.dumps({
                     "uploadUrl": "https://upload.firebasehosting.googleapis.com",
@@ -900,6 +903,28 @@ class FirebaseTransportAndRollbackClosureTests(unittest.TestCase):
                 operation_key="op-noauth",
             )
         self.assertIn("auth token missing", str(ctx.exception).lower())
+
+    def test_quota_project_header_is_sent_on_live_calls(self):
+        seen = []
+
+        def mock_opener(req: urllib.request.Request) -> tuple[int, bytes, dict[str, str]]:
+            seen.append(dict(req.headers))
+            return 200, json.dumps({"name": "projects/astral-dogfood/sites/s"}).encode(), {}
+
+        transport = google_production.FirebaseHostingRestTransport(
+            token="test-secret-token",
+            quota_project="astral-dogfood",
+            opener=mock_opener,
+        )
+        target = google_production.GoogleTargetConfig(
+            project_id="astral-dogfood",
+            site_id="household-inventory-review",
+            channel_id="live",
+            plan=google_production.ZERO_COST_PLAN,
+        )
+        transport._ensure_site(target)
+        keys = {k.lower(): v for k, v in seen[0].items()}
+        self.assertEqual(keys.get("x-goog-user-project"), "astral-dogfood")
 
 
 class RecordingRollbackTransport:

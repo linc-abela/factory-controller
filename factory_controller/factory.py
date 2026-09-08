@@ -1874,6 +1874,10 @@ class FactoryLifecycle:
         bundle = production.ReleaseBundle.from_payload(payload)
         rc_id = product.rc_id_for(contract, candidate)
         lifecycle = release.ReleaseLifecycle(self.store, clock=self.clock)
+        # Write the sealed bytes before the hosting adapter resolves them.
+        # Firebase Hosting looks up the digest on disk; materialising after
+        # deploy left envelope REVIEW as EMPTY_OR_MISSING_ARTIFACT.
+        root = self._materialize_review(deployable, artifact["artifact"]["identity"])
         adapter, review_url = self._review_port(contract)
         try:
             sealed = self._already_sealed(
@@ -1901,7 +1905,6 @@ class FactoryLifecycle:
                 getattr(refusal, "detail", "The review could not be prepared."),
             ) from None
 
-        root = self._materialize_review(deployable, sealed.artifact_digest)
         self._record_owner_act("review", sealed.rc_id, {
             "rc_id": sealed.rc_id, "candidate_sha": candidate,
             "artifact_digest": sealed.artifact_digest,
@@ -1951,7 +1954,8 @@ class FactoryLifecycle:
                     "FACTORY_FIREBASE_TOKEN is not set on the Factory "
                     "supervisor, so the exact-artifact REVIEW cannot be "
                     "published.")
-            transport = google_production.FirebaseHostingRestTransport(token=token)
+            transport = google_production.FirebaseHostingRestTransport(
+                token=token, quota_project=target.project_id)
         adapter = google_production.FirebaseHostingDeploymentAdapter(
             targets, transport=transport, store=self.store)
         return adapter, target.default_url

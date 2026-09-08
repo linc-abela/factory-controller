@@ -168,11 +168,13 @@ class FirebaseHostingRestTransport:
         token_provider: Callable[[], str | None] | None = None,
         opener: Callable[[urllib.request.Request], tuple[int, bytes, Mapping[str, str]]] | None = None,
         timeout_seconds: float = 30.0,
+        quota_project: str | None = None,
     ) -> None:
         self._token = token
         self._token_provider = token_provider
         self._opener = opener
         self._timeout = timeout_seconds
+        self._quota_project = quota_project.strip() if isinstance(quota_project, str) else None
 
     def _resolve_token(self) -> str:
         if self._token is not None and self._token.strip():
@@ -198,6 +200,8 @@ class FirebaseHostingRestTransport:
         if _AUTH_HEADER_KEY not in req_headers:
             token = self._resolve_token()
             req_headers[_AUTH_HEADER_KEY] = f"{_AUTH_SCHEME}{token}"
+        if self._quota_project and "X-Goog-User-Project" not in req_headers:
+            req_headers["X-Goog-User-Project"] = self._quota_project
 
         req = urllib.request.Request(
             url,
@@ -241,6 +245,7 @@ class FirebaseHostingRestTransport:
         files: Mapping[str, bytes],
         operation_key: str,
     ) -> dict[str, Any]:
+        self._ensure_site(config)
         base_api = f"https://firebasehosting.googleapis.com/v1beta1/sites/{config.site_id}"
 
         # 1. Create version
@@ -314,6 +319,28 @@ class FirebaseHostingRestTransport:
             "operation_key": operation_key,
             "created_at": time.time(),
         }
+
+    def _ensure_site(self, config: GoogleTargetConfig) -> None:
+        """Create the Spark Hosting site when this envelope has not used it yet."""
+
+        get_url = (
+            "https://firebasehosting.googleapis.com/v1beta1/projects/"
+            "%s/sites/%s" % (config.project_id, config.site_id)
+        )
+        try:
+            self._http_call(get_url, method="GET")
+            return
+        except RuntimeError as exc:
+            if "(404)" not in str(exc):
+                raise
+        create_url = (
+            "https://firebasehosting.googleapis.com/v1beta1/projects/"
+            "%s/sites?siteId=%s" % (config.project_id, config.site_id)
+        )
+        self._http_call(
+            create_url, method="POST", data=b"{}",
+            headers={"Content-Type": "application/json"},
+        )
 
     def rollback_release(
         self,

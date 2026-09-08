@@ -60,6 +60,7 @@ CREATE UNIQUE INDEX IF NOT EXISTS release_deployments_identity
   ON release_deployments(rc_id, environment_id);
 CREATE TRIGGER IF NOT EXISTS release_deployments_no_update
 BEFORE UPDATE ON release_deployments
+WHEN OLD.state NOT IN ('failed', 'uncertain')
 BEGIN SELECT RAISE(ABORT, 'release deployment records are immutable'); END;
 CREATE TRIGGER IF NOT EXISTS release_deployments_no_delete
 BEFORE DELETE ON release_deployments
@@ -297,6 +298,15 @@ class ReleaseLifecycle:
         self._clock = clock
         with store.transaction() as db:
             db.executescript(SCHEMA)
+            # A failed unpublished REVIEW is not an Owner-validated surface.
+            # Existing hosts still have the unconditional no-update trigger.
+            db.execute("DROP TRIGGER IF EXISTS release_deployments_no_update")
+            db.execute(
+                "CREATE TRIGGER release_deployments_no_update "
+                "BEFORE UPDATE ON release_deployments "
+                "WHEN OLD.state NOT IN ('failed', 'uncertain') "
+                "BEGIN SELECT RAISE(ABORT, "
+                "'release deployment records are immutable'); END;")
 
     def seal(self, rc_id: str, bundle: production.ReleaseBundle,
              *, verification_refs: Any, qa_refs: Any) -> ReleaseCandidate:
@@ -368,8 +378,18 @@ class ReleaseLifecycle:
             raise ReleaseRefusal("REVIEW_ENVIRONMENT_REQUIRED",
                                  "the Owner surface must be a staging environment")
         _proven_health(health, surface, "REVIEW")
-        deployment_id = ledger.admit_release(bundle, review_environment_id, requested_by)
-        state = ledger.deployment(deployment_id)["state"]
+        attempt = 1
+        while True:
+            deployment_id = ledger.admit_release(
+                bundle, review_environment_id, requested_by, attempt=attempt)
+            state = ledger.deployment(deployment_id)["state"]
+            if state != "failed":
+                break
+            attempt += 1
+            if attempt > 8:
+                raise ReleaseRefusal(
+                    "REVIEW_DEPLOY_FAILED",
+                    "the review deployment did not reach the hosting surface")
         if state == "approved":
             state = ledger.deploy(deployment_id, port)
         if state == "verifying" and health is not None:
@@ -645,6 +665,13 @@ class ReleaseLifecycle:
             existing = db.execute("SELECT * FROM release_deployments WHERE deployment_ref=?",
                                   (row["deployment_ref"],)).fetchone()
             if existing is not None:
+                if existing["state"] in ("failed", "uncertain"):
+                    db.execute(
+                        "UPDATE release_deployments SET deployment_id=?, state=?, "
+                        "created_at=? WHERE deployment_ref=?",
+                        (row["deployment_id"], row["state"], row["created_at"],
+                         row["deployment_ref"]))
+                    return
                 fields = ("rc_id", "deployment_id", "environment_id", "candidate_sha",
                           "artifact_digest", "bundle_digest", "validation_surface")
                 if any(existing[field] != row[field] for field in fields):
