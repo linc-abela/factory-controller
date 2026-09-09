@@ -861,6 +861,10 @@ class FactoryLifecycle:
 
     def _brief_revision(self, text: str, package_id: str, *,
                         created_at: str) -> FactoryResult:
+        try:
+            owner_app.inspect_supported_envelope(text)
+        except owner_app.BriefRefusal as refusal:
+            raise FactoryRefusal(refusal.code, refusal.detail) from None
         mission_dir = self.config.state_dir / "owner-missions" / package_id
         previous_path = mission_dir / "package.json"
         try:

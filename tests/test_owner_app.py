@@ -10,7 +10,9 @@ from pathlib import Path
 from unittest import mock
 
 from factory_controller import owner_app, pcp
-from factory_controller.factory import FactoryConfig, FactoryLifecycle, OwnerIdentity
+from factory_controller.factory import (
+    FactoryConfig, FactoryLifecycle, FactoryRefusal, OwnerIdentity,
+)
 from factory_controller.engine import Controller
 from factory_controller.store import MissionStore
 from tests.test_factory_lifecycle import FakeHost, NoopAdapter, fake_context
@@ -43,6 +45,42 @@ class OwnerAppFastPathTests(unittest.TestCase):
                 "can pay and share one inventory.",
                 created_at="2026-09-08T00:00:00Z")
         self.assertEqual(raised.exception.code, "OWNER_BRIEF_UNSUPPORTED")
+
+    def test_unsupported_revision_broadening_is_refused_by_the_shared_envelope(self):
+        requests = (
+            "Add user authentication before anyone can view inventory.",
+            "Add Stripe payments for inventory orders.",
+            "Add a shared backend so several people can edit inventory.",
+            "Connect inventory to a new paid service for forecasting.",
+        )
+        for request in requests:
+            with self.subTest(request=request):
+                with self.assertRaises(owner_app.BriefRefusal) as raised:
+                    owner_app.inspect_supported_envelope(request)
+                self.assertEqual(raised.exception.code, "OWNER_BRIEF_UNSUPPORTED")
+
+    def test_low_stock_revision_remains_inside_the_supported_envelope(self):
+        owner_app.inspect_supported_envelope(
+            "Add a low-stock threshold to each item and a Low Stock filter "
+            "so I can quickly see what needs restocking.")
+
+    def test_revision_envelope_refuses_before_reading_or_admitting_a_package(self):
+        temp = tempfile.TemporaryDirectory()
+        self.addCleanup(temp.cleanup)
+        root = Path(temp.name)
+        from dataclasses import replace
+        config = replace(FactoryConfig.default(), state_dir=root / "state")
+        lifecycle = FactoryLifecycle(
+            Controller(MissionStore(root / "missions.sqlite"), NoopAdapter()),
+            config=config, owner=OwnerIdentity(501, "owner"))
+        with mock.patch.object(
+                lifecycle, "_bound_envelope_package_id",
+                return_value="missing-package"):
+            with self.assertRaises(FactoryRefusal) as raised:
+                lifecycle.brief("Add Stripe payments and user login.")
+        self.assertEqual(raised.exception.code, "OWNER_BRIEF_UNSUPPORTED")
+        self.assertIn("supported Phase-2.1 envelope", raised.exception.detail)
+        self.assertFalse((config.state_dir / "owner-missions").exists())
 
     def test_owner_states_do_not_call_review_ready_released(self):
         working = owner_app.owner_state_for(mission_state="dispatching")

@@ -39,6 +39,7 @@ UNSUPPORTED_MARKERS = (
     ("sign-in", "authentication"),
     ("auth0", "authentication"),
     ("oauth", "authentication"),
+    ("authentication", "authentication"),
     ("multi-user", "shared multi-user backend"),
     ("multi user", "shared multi-user backend"),
     ("shared account", "shared multi-user backend"),
@@ -46,8 +47,10 @@ UNSUPPORTED_MARKERS = (
     ("mysql", "shared multi-user backend"),
     ("mongodb", "shared multi-user backend"),
     ("websocket server", "shared multi-user backend"),
+    ("shared backend", "shared multi-user backend"),
     ("privileged migration", "privileged data migration"),
     ("migrate production data", "privileged data migration"),
+    ("paid service", "new external paid service"),
 )
 
 ACTIVE_CONTRACT_NAME = "active-product-contract.json"
@@ -104,6 +107,17 @@ def unsupported_reasons(text: str) -> tuple[str, ...]:
     return tuple(found)
 
 
+def inspect_supported_envelope(text: str) -> None:
+    blocked = unsupported_reasons(_normalize(text))
+    if blocked:
+        raise BriefRefusal(
+            "OWNER_BRIEF_UNSUPPORTED",
+            "This request is outside the supported Phase-2.1 envelope (%s). "
+            "The Factory will not accept it through the ordinary fast path."
+            % ", ".join(blocked),
+        )
+
+
 def package_id_for(text: str) -> str:
     lowered = text.lower()
     if "inventory" in lowered:
@@ -126,14 +140,7 @@ def inspect_brief(text: str) -> None:
         raise BriefRefusal(
             "OWNER_BRIEF_TOO_LONG",
             "Keep the Owner brief concise; the Factory will derive the rest.")
-    blocked = unsupported_reasons(body)
-    if blocked:
-        raise BriefRefusal(
-            "OWNER_BRIEF_UNSUPPORTED",
-            "This brief is outside the supported Phase-2.1 envelope (%s). "
-            "The Factory will not accept it as an ordinary fast-path app."
-            % ", ".join(blocked),
-        )
+    inspect_supported_envelope(body)
 
 
 def materialize_package(text: str, *, created_at: str,
