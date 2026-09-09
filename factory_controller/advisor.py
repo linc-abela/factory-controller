@@ -34,10 +34,13 @@ from pathlib import Path
 from typing import Any, Callable, Mapping, Protocol, Sequence
 
 from . import portfolio
+from . import runtime_tuple
 from .store import payload_hash
 
 
 FROZEN_BRIDGE_DEPENDENCY_SHA = "d4fb19bdaa153bd220f346be657657c2749cfed8"
+#: Historical leftover Bridge candidate pin.  Scheduled management binds
+#: ``runtime_tuple.admitted_bridge_sha()`` instead.
 FLEET_BLOCKED = "HERMES_MANAGER_PROVIDER_ADAPTER_BLOCKED"
 FLEET_TURN = Path(__file__).resolve().parent.parent / "validation" / "hermes_fleet_turn.py"
 
@@ -443,19 +446,21 @@ def scheduled_manager(*, command: Sequence[str] | None = None,
                       requested_effort: str = "unknown",
                       bridge_root: str | Path | None = None,
                       fleet_profile_id: str = "codex-luna-max",
-                      expected_bridge_sha: str = FROZEN_BRIDGE_DEPENDENCY_SHA,
+                      expected_bridge_sha: str | None = None,
                       ) -> "ManagerLike":
     """Hermes is the manager front door; inference is a frozen Bridge fleet profile."""
 
     if command:
         raise ValueError("ADVISOR_ARGV_NOT_ALLOWLISTED")
+    pin = (expected_bridge_sha if expected_bridge_sha is not None
+           else runtime_tuple.admitted_bridge_sha())
     executable = shutil.which("hermes")
     if executable:
         return HermesProcessAdvisor(
             executable, requested_profile=requested_profile,
             requested_effort=requested_effort,
             bridge_root=bridge_root, fleet_profile_id=fleet_profile_id,
-            expected_bridge_sha=expected_bridge_sha)
+            expected_bridge_sha=pin)
     return BlockedAdvisor(requested_profile, requested_effort)
 
 
@@ -579,7 +584,7 @@ class HermesProcessAdvisor:
                  requested_effort: str = "unknown", timeout: float = 120.0,
                  bridge_root: str | Path | None = None,
                  fleet_profile_id: str = "codex-luna-max",
-                 expected_bridge_sha: str = FROZEN_BRIDGE_DEPENDENCY_SHA,
+                 expected_bridge_sha: str | None = None,
                  fleet_runner: Callable[..., dict[str, Any]] | None = None,
                  ) -> None:
         self.executable = executable
@@ -587,6 +592,8 @@ class HermesProcessAdvisor:
         self.requested_effort = requested_effort
         self.timeout = timeout
         self.bridge_root = Path(bridge_root) if bridge_root else None
+        if expected_bridge_sha is None:
+            expected_bridge_sha = runtime_tuple.admitted_bridge_sha()
         self.fleet_profile_id = fleet_profile_id
         self.expected_bridge_sha = expected_bridge_sha
         self._fleet_runner = fleet_runner

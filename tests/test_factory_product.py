@@ -47,6 +47,7 @@ class FactoryProductTests(unittest.TestCase):
             bridge_prefix=root / "bridge",
             bridge_root=bridge_root,
             capability_request_path=root / "dogfood-capability.json",
+            product_checkout_root=root / "apps",
         )
         self.config.capability_request_path.write_text(json.dumps({
             "accepted_unknowns": [], "capability": "bug",
@@ -487,8 +488,9 @@ class ProductStatusTests(unittest.TestCase):
 
         result = self.status()
         self.assertEqual(result.details["work_state"], "attention")
-        self.assertIn("Attention: lodus-casino:build needs Owner review "
-                      "(PROVIDER_POLICY_VIOLATION: the profile is denied).",
+        self.assertIn("Blocked: lodus-casino:build (PROVIDER_POLICY_VIOLATION: "
+                      "the profile is denied). The Factory owns recovery unless "
+                      "a reserved Owner act is required.",
                       result.render())
 
     def test_a_settled_product_mission_reports_that_it_succeeded(self):
@@ -502,9 +504,11 @@ class ProductStatusTests(unittest.TestCase):
             self.lifecycle.store.transition(mission_id, token, state)
 
         result = self.status()
-        self.assertEqual(result.details["work_state"], "complete")
+        self.assertEqual(result.details["work_state"], "pending")
         self.assertIn("lodus-casino:build in lodus-casino is settled; "
                       "it succeeded", result.render())
+        self.assertIn("Working", result.render())
+        self.assertIn("preparing the exact-artifact review", result.render().lower())
 
     def test_the_status_surface_never_mutates_the_mission_it_reports(self):
         """Status is a reading.  The live run's own safety depends on it."""
@@ -518,6 +522,25 @@ class ProductStatusTests(unittest.TestCase):
             self.status()
 
         self.assertEqual([dict(row) for row in self.missions()], before)
+
+    def test_cycle_still_attempts_envelope_review_when_df1_needs_attention(self):
+        """Historical DF-1 attention must not skip already-finished product REVIEW."""
+
+        self.ready()
+        self.escalate_the_first_internal_slot()
+        (self.config.state_dir / "owner-missions").mkdir()
+        seen = []
+        inner = self.lifecycle._continue_fast_path_review
+
+        def spy():
+            seen.append(True)
+            return inner()
+
+        self.lifecycle._continue_fast_path_review = spy
+        result = self.lifecycle.dispatch("cycle")
+        self.assertEqual(seen, [True])
+        self.assertFalse(result.ok)
+        self.assertIn("DF-1", result.render())
 
 
 class ProductReviewTests(unittest.TestCase):
@@ -834,7 +857,8 @@ class ProductReviewTests(unittest.TestCase):
 
         rendered = self.lifecycle.dispatch("status").render()
         self.assertIn("is settled; it succeeded", rendered)
-        self.assertIn("Next: run './dev factory review'", rendered)
+        self.assertIn("the Factory is preparing exact-artifact REVIEW", rendered)
+        self.assertNotIn("Next: run './dev factory review'", rendered)
 
     def test_status_names_the_sealed_review_and_its_surface(self):
         self.ready()

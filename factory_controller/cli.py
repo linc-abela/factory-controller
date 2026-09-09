@@ -458,7 +458,7 @@ def parser() -> argparse.ArgumentParser:
     factory_parser.add_argument(
         "factory_action",
         choices=("install", "start", "run", "product", "revise", "review",
-                 "cycle", "stop", "status", "attention"))
+                 "brief", "cycle", "stop", "status", "attention"))
     factory_parser.add_argument(
         "--attention-action",
         choices=("status", "test", "check-liveness", "clear"),
@@ -468,6 +468,10 @@ def parser() -> argparse.ArgumentParser:
         "--package", type=Path,
         help="the Product Candidate Package to submit; required by 'product' "
              "and by 'revise', and used by nothing else")
+    factory_parser.add_argument(
+        "--brief", dest="owner_brief",
+        help="concise Owner product brief for 'factory brief'; the Factory "
+             "derives admission internally")
     factory_parser.add_argument(
         "--watch", action="store_true",
         help="keep observing status until completion, attention, or Ctrl+C")
@@ -1610,6 +1614,7 @@ def main(argv: list[str] | None = None) -> int:
         result = lifecycle.dispatch(
             args.factory_action,
             package=args.package,
+            brief=getattr(args, "owner_brief", None),
             attention_action=getattr(args, "attention_action", None),
         )
         print(result.render())

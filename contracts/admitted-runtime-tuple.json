@@ -1,0 +1,8 @@
+{
+  "schema_version": "factory.controller.admitted_runtime_tuple.v1",
+  "source": "SF-230 post-checkpoint admitted tuple for the selected Owner-to-App path",
+  "controller_main": "9becfae5a71fc136a1b9aa4b17864796bf7219fe",
+  "bridge_main": "43358a7024e36eba03327fbec14c5696afb4465e",
+  "evidence_core_main": "2f5275a6958ce8bd8ddae1dbec069b5179bbb6e6",
+  "context_broker_main": "145301b2672291118bbb85fa9181f2ac4e6011ba"
+}

@@ -80,6 +80,17 @@ class HermesFleetTests(Case):
         report = self.cycle(manager=port)
         self.assertEqual(report["reason"], "MANAGER_PROVIDER_ADAPTER_BLOCKED")
 
+    def test_default_process_advisor_pins_admitted_bridge_not_obsolete_candidate(self):
+        root, sha = self.registry()
+        self.assertNotEqual(sha, FROZEN_BRIDGE_DEPENDENCY_SHA)
+        port = advisor.HermesProcessAdvisor(
+            str(self.fake_hermes()), requested_profile="fleet-manager",
+            bridge_root=root)
+        self.assertEqual(
+            port.expected_bridge_sha, advisor.runtime_tuple.admitted_bridge_sha())
+        self.assertNotEqual(
+            port.expected_bridge_sha, FROZEN_BRIDGE_DEPENDENCY_SHA)
+
     def test_fleet_receipt_uses_registry_identity_not_model_json(self):
         root, sha = self.registry()
 

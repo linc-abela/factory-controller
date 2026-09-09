@@ -36,6 +36,8 @@ from . import dogfood_improvement
 from . import dogfood_intake
 from . import improvement
 from . import management
+from . import envelope_scaffold
+from . import owner_app
 from . import pcp
 from . import portfolio
 from . import product
@@ -46,7 +48,7 @@ from . import shift_runtime
 from . import stage1_adapter
 from . import store as store_mod
 from . import supervisor
-from .adapter import HostCommandResult, run_host_command
+from .adapter import HostCommandResult, publish_new_repository, run_host_command
 
 
 SURFACES = {
@@ -104,6 +106,10 @@ AUTOPILOT_WORKER_ID = "factory-autopilot"
 #: per-step budget: ponytail, revisit if a legitimately long step starts
 #: tripping it.
 STEP_STALE_AFTER_SECONDS = 900.0
+
+#: Release-deployment states that mean the Owner can open the REVIEW URL.
+#: A failed or uncertain Firebase publish is not a reviewable surface.
+REVIEW_SERVING_STATES = frozenset({"healthy", "health_pending", "verifying"})
 
 # SF-179 A: which payload differences prove nothing about the work.
 #
@@ -227,6 +233,7 @@ class FactoryConfig:
     #: would be promoted.
     review_url: str = "http://127.0.0.1:8787"
     python_path: Path | None = None
+    product_checkout_root: Path = Path("/Users/Shared/Projects/software-factory")
 
     @property
     def bridge_plist(self) -> Path:
@@ -262,12 +269,13 @@ class FactoryConfig:
     @classmethod
     def default(cls, db_path: str | Path | None = None) -> "FactoryConfig":
         controller_root = Path(__file__).resolve().parents[1]
-        bridge_root = controller_root.parent / "factory-bridge"
-        vault_root = controller_root.parent / "factory-vault"
+        bridge_root = _peer_dir(controller_root, "factory-bridge")
+        vault_root = _peer_dir(controller_root, "factory-vault")
         return cls(
             controller_root=controller_root,
             bridge_root=bridge_root,
             vault_root=vault_root,
+            product_checkout_root=envelope_scaffold.CHECKOUT_ROOT,
             contract_path=controller_root / "contracts" /
             "internal-dogfood-run-contract.json",
             portfolio_path=controller_root / "contracts" /
@@ -304,6 +312,21 @@ HEALTH_CHECKS = {
 }
 
 
+def _peer_dir(controller_root: Path, name: str) -> Path:
+    """Resolve a sibling checkout, including task worktrees."""
+
+    parent = controller_root.parent
+    stem = controller_root.name
+    prefix = "factory-controller"
+    if stem.startswith(prefix):
+        suffix = stem[len(prefix):]
+        if suffix:
+            candidate = parent / (name + suffix)
+            if candidate.is_dir():
+                return candidate
+    return parent / name
+
+
 class FactoryLifecycle:
     """Install, start, stop, and inspect one bounded local Factory."""
 
@@ -315,6 +338,7 @@ class FactoryLifecycle:
                  remote_reachability: Mapping[str, Sequence[str]] | None = None,
                  context_builder: Callable[[dict[str, Any]], Mapping[str, Any]] | None = None,
                  attention_sink: attention.AttentionSink | None = None,
+                 review_transport: Any | None = None,
                  ) -> None:
         self.controller = controller
         self.store = controller.store
@@ -351,6 +375,7 @@ class FactoryLifecycle:
             ledger=self.attention_ledger,
             clock=self.clock,
         )
+        self.review_transport = review_transport
 
     # -- the frozen improvement objective ------------------------------- #
 
@@ -387,6 +412,8 @@ class FactoryLifecycle:
         try:
             if action == "product":
                 return self.product(options.get("package"))
+            if action == "brief":
+                return self.brief(options.get("brief"))
             if action == "revise":
                 return self.revise(options.get("package"))
             if action == "install":
@@ -539,17 +566,23 @@ class FactoryLifecycle:
                 "SUPERVISOR_NOT_RUNNING",
                 "The Factory supervisor could not be started. Retry the command.")
 
+        continued = self._continue_fast_path_waiting_brief()
+        extra = ()
+        if recovered:
+            extra = ("READY TO RESUME EXISTING REVISION",
+                     "Existing revision mission rebound and queued for resume.")
+        if continued is not None:
+            extra = extra + continued.lines
         return FactoryResult(
-            action="start", ok=True, state="ready",
+            action="start", ok=True if continued is None or continued.ok else False,
+            state="ready" if continued is None or continued.ok else "blocked",
             lines=("FACTORY READY",
-                   "Shift active. Supervisor running.",
-                   *(("READY TO RESUME EXISTING REVISION",
-                      "Existing revision mission rebound and queued for resume.")
-                     if recovered else ())),
+                   "Shift active. Supervisor running.") + extra,
             details={"grant": applied, "gate": gate_preview,
                      "bridge": doctor, "readiness": readiness,
                      "supervisor": service_doctor,
-                     "pre_provider_recovery": recovered},
+                     "pre_provider_recovery": recovered,
+                     **({} if continued is None else dict(continued.details))},
         )
 
     def stop(self) -> FactoryResult:
@@ -630,6 +663,284 @@ class FactoryLifecycle:
 
         return self._queue_next(contract, entry, doctor, grant, owner_action=True)
 
+    def brief(self, text: Any) -> FactoryResult:
+        """Accept one concise Owner product brief and derive Factory admission.
+
+        This is the Phase-2.1 Owner-to-App entry: ChatGPT forwards the brief
+        here.  The Owner does not author a package, run contract, MISSION file,
+        or release command.  Unsupported envelope requirements are refused
+        before the brief is called accepted.  When the Factory is already
+        running, this verb continues into the existing product/revise seam
+        so the Owner never has to reconstruct those commands.
+        """
+
+        self._require_owner()
+        if not isinstance(text, str) or not text.strip():
+            raise FactoryRefusal(
+                "OWNER_BRIEF_REQUIRED",
+                "Provide a concise product brief: who it serves, the job, "
+                "essential behavior, and any known constraints.")
+        created_at = dogfood_intake.iso_utc(self.clock())
+        bound_id = self._bound_envelope_package_id()
+        follow_on = envelope_scaffold.follow_on_package_id(text, bound_id)
+        if follow_on:
+            return self._brief_revision(text, follow_on, created_at=created_at)
+
+        try:
+            accepted = owner_app.accept_brief(text, created_at=created_at)
+        except owner_app.BriefRefusal as refusal:
+            raise FactoryRefusal(refusal.code, refusal.detail) from None
+
+        mission_dir = self.config.state_dir / "owner-missions" / accepted.package_id
+        mission_dir.mkdir(parents=True, exist_ok=True)
+        package_path = mission_dir / "package.json"
+        package_path.write_text(
+            json.dumps(accepted.package, indent=2, sort_keys=True) + "\n",
+            encoding="utf-8")
+        (mission_dir / "brief.txt").write_text(
+            accepted.original_brief + "\n", encoding="utf-8")
+        (mission_dir / "MISSION.md").write_text(
+            owner_app.mission_statement(accepted), encoding="utf-8")
+        bootstrap = self.config.product_checkout_root / accepted.package_id
+        try:
+            baseline_sha = envelope_scaffold.write_bootstrap(accepted, bootstrap)
+            if self.config.product_checkout_root == envelope_scaffold.CHECKOUT_ROOT:
+                publish_new_repository(
+                    str(bootstrap),
+                    "%s/%s" % (envelope_scaffold.GITHUB_ORG, accepted.package_id))
+        except (OSError, RuntimeError) as exc:
+            raise FactoryRefusal(
+                "OWNER_BRIEF_BOOTSTRAP_FAILED",
+                "The Factory could not derive the product bootstrap: %s" % exc,
+            ) from None
+        run_ref = "owner-brief-%s-1" % accepted.package_id
+        remote = envelope_scaffold.remote_url(accepted.package_id)
+        profiles = self._envelope_provider_profiles()
+        contract_body = owner_app.derived_contract(
+            accepted.package_id, baseline_sha=baseline_sha,
+            run_ref=run_ref, remote=remote, provider_profiles=profiles)
+        contract_path = mission_dir / "product-run-contract.json"
+        contract_path.write_text(
+            json.dumps(contract_body, indent=2, sort_keys=True) + "\n",
+            encoding="utf-8")
+        request_path = mission_dir / "capability-admission-request.json"
+        request_path.write_text(
+            json.dumps(envelope_scaffold.capability_request(
+                accepted.package_id, run_ref=run_ref, profiles=profiles),
+                indent=2, sort_keys=True) + "\n",
+            encoding="utf-8")
+        (mission_dir / "bridge-project.json").write_text(
+            json.dumps(envelope_scaffold.bridge_project_row(
+                accepted.package_id, checkout=str(bootstrap)),
+                indent=2, sort_keys=True) + "\n",
+            encoding="utf-8")
+        envelope_scaffold.bind_active_contract(self.config.state_dir, contract_path)
+        status_row = {
+            "owner_state": "Accepted / waiting",
+            "stage": "internal admission",
+            "freshness": "current",
+            "next_action": accepted.next_action,
+            "package_id": accepted.package_id,
+            "brief_digest": accepted.brief_digest,
+            "assumptions": list(accepted.assumptions),
+            "known_limitations": "; ".join(accepted.limits),
+            "baseline_sha": baseline_sha,
+            "review_url": envelope_scaffold.firebase_review_url(accepted.package_id),
+        }
+        status_link = owner_app.write_status(mission_dir / "status.json", status_row)
+        scope = accepted.package["problem"]["statement"]
+        lines = [
+            "Accepted: %s" % scope,
+            "Here is your mission/status link: %s" % status_link,
+            "Envelope: %s on %s with %s persistence."
+            % (accepted.envelope.stack, accepted.envelope.hosting,
+               accepted.envelope.persistence),
+            "Assumptions: %s" % accepted.assumptions[0],
+            "Limits: %s" % accepted.limits[0],
+            "Next expected milestone: Working, then an exact-artifact REVIEW URL.",
+        ]
+        details = {
+            "package_id": accepted.package_id,
+            "package_digest": pcp.package_digest(accepted.package),
+            "brief_digest": accepted.brief_digest,
+            "status_link": str(status_link),
+            "owner_state": "Accepted / waiting",
+            "envelope_id": accepted.envelope.envelope_id,
+            "package_path": str(package_path),
+            "contract_path": str(contract_path),
+            "baseline_sha": baseline_sha,
+            "bootstrap_path": str(bootstrap),
+        }
+        continued = self._continue_fast_path_admit(package_path, mission_dir)
+        if continued is None:
+            return FactoryResult(
+                action="brief", ok=True, state="accepted-waiting",
+                lines=tuple(lines), details=details)
+        owner_app.write_status(mission_dir / "status.json", {
+            **status_row,
+            "owner_state": "Working" if continued.ok else "Blocked",
+            "stage": "provider" if continued.ok else "admission blocked",
+            "next_action": (continued.lines[0] if continued.lines
+                            else accepted.next_action),
+        })
+        details.update(continued.details)
+        details["owner_state"] = "Working" if continued.ok else "Blocked"
+        prefix = ("Working. " if continued.ok else "Blocked. ")
+        return FactoryResult(
+            action="brief", ok=continued.ok,
+            state="working" if continued.ok else "blocked",
+            lines=(prefix + lines[0], lines[1]) + continued.lines,
+            details=details,
+        )
+
+    def _envelope_provider_profiles(self) -> tuple[str, ...]:
+        try:
+            return product.ProductContract.load(
+                self.config.product_contract_path).provider_profiles
+        except product.ProductRefusal:
+            return ()
+
+    def _bound_envelope_package_id(self) -> str | None:
+        try:
+            contract = product.ProductContract.load(self._active_product_contract_path())
+        except product.ProductRefusal:
+            return None
+        if not owner_app.is_envelope_run(contract.run_ref):
+            return None
+        return contract.package_id
+
+    def _factory_is_running(self) -> bool:
+        grant = self.shift.grant()
+        control = self.supervisor.control()
+        return (grant is not None and control.get("state") == "running"
+                and self._service_loaded(self.config.supervisor_label))
+
+    def _capability_request_path(self, contract) -> Path:
+        derived = (self.config.state_dir / "owner-missions" / contract.package_id
+                   / "capability-admission-request.json")
+        if derived.is_file():
+            return derived
+        return self.config.bridge_root / "contracts" / contract.capability_request
+
+    def _continue_fast_path_admit(self, package_path: Path,
+                                  mission_dir: Path) -> FactoryResult | None:
+        if not self._factory_is_running():
+            return None
+        try:
+            result = self.product(str(package_path))
+        except FactoryRefusal as refusal:
+            result = FactoryResult(
+                action="product", ok=False, state="blocked",
+                lines=("BLOCKED: " + refusal.detail,),
+                details={"code": refusal.code},
+            )
+        owner_app.write_status(mission_dir / "status.json", {
+            "owner_state": "Working" if result.ok else "Blocked",
+            "stage": "provider" if result.ok else "admission blocked",
+            "freshness": "current",
+            "next_action": (result.lines[0] if result.lines
+                            else "The Factory owns the next action."),
+            "package_id": mission_dir.name,
+            "review_url": envelope_scaffold.firebase_review_url(mission_dir.name),
+        })
+        return result
+
+    def _continue_fast_path_waiting_brief(self) -> FactoryResult | None:
+        """Admit a derived brief once the Factory is actually running."""
+
+        package_id = self._bound_envelope_package_id()
+        if not package_id:
+            return None
+        mission_dir = self.config.state_dir / "owner-missions" / package_id
+        package_path = mission_dir / "package.json"
+        if not package_path.is_file():
+            return None
+        if self._product_reading() is not None:
+            return None
+        return self._continue_fast_path_admit(package_path, mission_dir)
+
+    def _brief_revision(self, text: str, package_id: str, *,
+                        created_at: str) -> FactoryResult:
+        try:
+            owner_app.inspect_supported_envelope(text)
+        except owner_app.BriefRefusal as refusal:
+            raise FactoryRefusal(refusal.code, refusal.detail) from None
+        mission_dir = self.config.state_dir / "owner-missions" / package_id
+        previous_path = mission_dir / "package.json"
+        try:
+            previous = json.loads(previous_path.read_text(encoding="utf-8"))
+        except (OSError, ValueError) as exc:
+            raise FactoryRefusal(
+                "OWNER_BRIEF_REVISION_UNGROUNDED",
+                "A follow-on change was received, but the original admitted "
+                "package is unavailable: %s" % exc) from None
+        mission = self._product_reading()
+        if mission is None or mission["state"] != "completed":
+            raise FactoryRefusal(
+                "OWNER_BRIEF_REVISION_TOO_EARLY",
+                "A change request can start only after the current exact-artifact "
+                "REVIEW exists. Watch the status link.")
+        try:
+            contract = self._product_contract()
+            result = mission.get("result") or {}
+            candidate = ((result.get("verification") or {}).get("verification")
+                         or {}).get("candidate_sha")
+            if not isinstance(candidate, str):
+                raise FactoryRefusal(
+                    "OWNER_BRIEF_REVISION_UNGROUNDED",
+                    "The finished mission recorded no candidate to revise.")
+            rc_id = product.rc_id_for(contract, candidate)
+            lifecycle = release.ReleaseLifecycle(self.store, clock=self.clock)
+            sealed = lifecycle.candidate(rc_id)
+        except (product.ProductRefusal, release.ReleaseRefusal, FactoryRefusal) as refusal:
+            raise FactoryRefusal(
+                getattr(refusal, "code", "OWNER_BRIEF_REVISION_UNGROUNDED"),
+                getattr(refusal, "detail", str(refusal)),
+            ) from None
+        validation_id = "ov-%s-%s" % (package_id, previous.get("package_version", 1) + 1)
+        package = envelope_scaffold.revision_package(
+            previous, text, created_at=created_at, predecessor_rc=sealed.rc_id,
+            predecessor_candidate_sha=sealed.candidate_sha,
+            owner_validation_id=validation_id)
+        package_path = mission_dir / "package.json"
+        package_path.write_text(
+            json.dumps(package, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+        (mission_dir / "brief.txt").write_text(
+            owner_app._normalize(text) + "\n", encoding="utf-8")
+        owner_app.write_status(mission_dir / "status.json", {
+            "owner_state": "Working",
+            "stage": "revision",
+            "freshness": "current",
+            "next_action": "The Factory is revising from the reviewed candidate.",
+            "package_id": package_id,
+            "predecessor_rc": sealed.rc_id,
+        })
+        if not self._factory_is_running():
+            return FactoryResult(
+                action="brief", ok=True, state="accepted-waiting",
+                lines=("Accepted: %s" % owner_app._normalize(text),
+                       "The revision is derived; the Factory will admit it when running."),
+                details={"package_id": package_id, "package_path": str(package_path),
+                         "owner_state": "Accepted / waiting",
+                         "predecessor_rc": sealed.rc_id},
+            )
+        try:
+            continued = self.revise(str(package_path))
+        except FactoryRefusal as refusal:
+            continued = FactoryResult(
+                action="revise", ok=False, state="blocked",
+                lines=("BLOCKED: " + refusal.detail,),
+                details={"code": refusal.code},
+            )
+        return FactoryResult(
+            action="brief", ok=continued.ok,
+            state="working" if continued.ok else "blocked",
+            lines=("Working. Accepted revision: %s" % owner_app._normalize(text),)
+            + continued.lines,
+            details={"package_id": package_id, "owner_state":
+                     "Working" if continued.ok else "Blocked", **continued.details},
+        )
+
     def product(self, package_path: Any) -> FactoryResult:
         """Submit one Product Candidate Package the Owner named.
 
@@ -654,7 +965,7 @@ class FactoryLifecycle:
                 "Name the Product Candidate Package to submit: "
                 "'./dev factory product --package <path>'.")
         try:
-            contract = product.ProductContract.load(self.config.product_contract_path)
+            contract = product.ProductContract.load(self._active_product_contract_path())
             _, accepted = product.package_from(package_path)
             mission = product.mission_for(contract, accepted)
             brief = product.brief(contract, accepted)
@@ -691,7 +1002,7 @@ class FactoryLifecycle:
 
         self._refresh_capacity(contract)
         doctor, _ = self._admit_capability(
-            self.config.bridge_root / "contracts" / contract.capability_request,
+            self._capability_request_path(contract),
             contract, doctor, approval_ref)
         self._provision_product_store(contract, doctor)
         self._bootstrap_service(self._install_supervisor_definition())
@@ -872,7 +1183,7 @@ class FactoryLifecycle:
 
         self._refresh_capacity(contract)
         doctor, _ = self._admit_capability(
-            self.config.bridge_root / "contracts" / contract.capability_request,
+            self._capability_request_path(contract),
             contract, doctor, approval_ref)
         self._provision_product_store(contract, doctor)
         self._bootstrap_service(self._install_supervisor_definition())
@@ -1041,11 +1352,23 @@ class FactoryLifecycle:
                 "the repository grounding could be read from.")
         return report
 
+    def _active_product_contract_path(self) -> Path:
+        pointer = owner_app.active_contract_pointer(self.config.state_dir)
+        if pointer.is_file():
+            try:
+                body = json.loads(pointer.read_text(encoding="utf-8"))
+            except (OSError, ValueError):
+                body = {}
+            path = body.get("path") if isinstance(body, dict) else None
+            if isinstance(path, str) and Path(path).is_file():
+                return Path(path)
+        return self.config.product_contract_path
+
     def _product_contract_or_none(self):
         """Load the product contract only when a product recovery is possible."""
 
         try:
-            return product.ProductContract.load(self.config.product_contract_path)
+            return product.ProductContract.load(self._active_product_contract_path())
         except product.ProductRefusal:
             return None
 
@@ -1555,6 +1878,11 @@ class FactoryLifecycle:
         bundle = production.ReleaseBundle.from_payload(payload)
         rc_id = product.rc_id_for(contract, candidate)
         lifecycle = release.ReleaseLifecycle(self.store, clock=self.clock)
+        # Write the sealed bytes before the hosting adapter resolves them.
+        # Firebase Hosting looks up the digest on disk; materialising after
+        # deploy left envelope REVIEW as EMPTY_OR_MISSING_ARTIFACT.
+        root = self._materialize_review(deployable, artifact["artifact"]["identity"])
+        adapter, review_url = self._review_port(contract)
         try:
             sealed = self._already_sealed(
                 lifecycle, rc_id, candidate, sealed_digest=bundle.artifact["identity"])
@@ -1566,41 +1894,104 @@ class FactoryLifecycle:
                     qa_refs=["qa://%s/decision-boundary" % mission["id"]])
             deployed = lifecycle.deploy_review(
                 rc_id, self.production,
-                production.DeterministicDeploymentAdapter(),
+                adapter,
                 review_environment_id=contract.review_environment_id,
                 requested_by=self.owner.username,  # type: ignore[union-attr]
-                review_url=self.config.review_url)
+                review_url=review_url)
+            if deployed.get("state") not in REVIEW_SERVING_STATES:
+                raise FactoryRefusal(
+                    "REVIEW_NOT_PREPARED",
+                    "Exact-artifact REVIEW did not reach the hosting surface "
+                    "(deployment state %s)." % deployed.get("state"))
         except (release.ReleaseRefusal, production.ProductionRefusal) as refusal:
             raise FactoryRefusal(
                 getattr(refusal, "code", "REVIEW_NOT_PREPARED"),
                 getattr(refusal, "detail", "The review could not be prepared."),
             ) from None
 
-        root = self._materialize_review(deployable, sealed.artifact_digest)
         self._record_owner_act("review", sealed.rc_id, {
             "rc_id": sealed.rc_id, "candidate_sha": candidate,
             "artifact_digest": sealed.artifact_digest,
             "deployment_ref": deployed["deployment_ref"]})
+        lines = self._review_ready_lines(
+            contract, sealed=sealed, artifact=artifact,
+            review_url=review_url, work_item=work_item)
         return FactoryResult(
             action="review", ok=True, state="review-ready",
-            lines=("PRODUCT READY FOR REVIEW",
-                   "Release Candidate: %s" % sealed.rc_id,
-                   "Artifact: %s (%d files)"
-                   % (sealed.artifact_digest, artifact["file_count"]),
-                   "Review it at %s" % self.config.review_url,
-                   "Start the review surface with './dev review up', and stop "
-                   "it with './dev review down'.",
-                   "Nothing is promoted until you record a decision."),
+            lines=lines,
             details={"rc_id": sealed.rc_id, "work_item_id": work_item,
                      "candidate_sha": candidate,
                      "artifact_digest": sealed.artifact_digest,
                      "bundle_digest": sealed.bundle_digest,
                      "deployment_ref": deployed["deployment_ref"],
                      "deployment_state": deployed["state"],
-                     "review_url": self.config.review_url,
+                     "review_url": review_url,
                      "review_root": str(root),
                      "decision_boundary": boundary["outcome"],
                      "files": artifact["file_count"]},
+        )
+
+    def _review_port(self, contract):
+        """Deterministic loopback for legacy products; Firebase for envelope apps."""
+
+        if not owner_app.is_envelope_run(contract.run_ref):
+            return production.DeterministicDeploymentAdapter(), self.config.review_url
+        from . import google_production
+        site_id = contract.review_environment_id
+        target = google_production.DEFAULT_TARGET_CONFIGS.get(site_id)
+        if target is None:
+            target = google_production.GoogleTargetConfig(
+                project_id="astral-dogfood",
+                site_id=site_id,
+                channel_id="live",
+                plan=google_production.ZERO_COST_PLAN,
+                identity_channel_id="review",
+            )
+        targets = dict(google_production.DEFAULT_TARGET_CONFIGS)
+        targets[site_id] = target
+        transport = self.review_transport
+        if transport is None:
+            token = os.environ.get("FACTORY_FIREBASE_TOKEN")
+            if not isinstance(token, str) or not token.strip():
+                raise FactoryRefusal(
+                    "REVIEW_DEPLOY_AUTH_UNAVAILABLE",
+                    "FACTORY_FIREBASE_TOKEN is not set on the Factory "
+                    "supervisor, so the exact-artifact REVIEW cannot be "
+                    "published.")
+            transport = google_production.FirebaseHostingRestTransport(
+                token=token, quota_project=target.project_id)
+        adapter = google_production.FirebaseHostingDeploymentAdapter(
+            targets, transport=transport, store=self.store)
+        return adapter, target.default_url
+
+    def _review_ready_lines(self, contract, *, sealed, artifact, review_url,
+                            work_item) -> tuple[str, ...]:
+        identity = (
+            "Release Candidate: %s" % sealed.rc_id,
+            "Artifact: %s (%d files)" % (sealed.artifact_digest, artifact["file_count"]),
+            "Work item: %s" % work_item,
+        )
+        if owner_app.is_envelope_run(contract.run_ref):
+            return (
+                "Ready for validation",
+                "Built: a single-user browser app from the Owner brief, "
+                "on Firebase Hosting with browser-local persistence.",
+                "REVIEW: %s" % review_url,
+                "Check: add, edit, delete, and search an item.",
+                "Check: refresh the page and confirm the item is still there.",
+                "Check: open the same URL on a narrow viewport.",
+                "Limits: no account, no sync across devices, not released.",
+                "Independent QA: decision boundary held for this exact candidate.",
+            ) + identity + (
+                "Say 'change X' to revise. Nothing is promoted until you validate.",
+            )
+        return (
+            "PRODUCT READY FOR REVIEW",
+        ) + identity + (
+            "Review it at %s" % review_url,
+            "Start the review surface with './dev review up', and stop "
+            "it with './dev review down'.",
+            "Nothing is promoted until you record a decision.",
         )
 
     @staticmethod
@@ -1632,9 +2023,88 @@ class FactoryLifecycle:
 
     def _product_contract(self):
         try:
-            return product.ProductContract.load(self.config.product_contract_path)
+            return product.ProductContract.load(self._active_product_contract_path())
         except product.ProductRefusal as refusal:
             raise FactoryRefusal(refusal.code, refusal.detail) from None
+
+    def _with_fast_path_review(self, result: FactoryResult) -> FactoryResult:
+        """Keep historical dogfood attention from stranding envelope REVIEW."""
+
+        continued = self._continue_fast_path_review()
+        if continued is None:
+            return result
+        return FactoryResult(
+            action=result.action, ok=continued.ok,
+            state=continued.state if continued.ok else "attention",
+            lines=continued.lines,
+            details={**(result.details or {}), "review": continued.details},
+        )
+
+    def _write_fast_path_owner_status(self, result: FactoryResult) -> None:
+        package_id = self._bound_envelope_package_id()
+        if not package_id:
+            return
+        mission_dir = self.config.state_dir / "owner-missions" / package_id
+        if not mission_dir.is_dir():
+            return
+        if result.ok and result.state == "review-ready":
+            owner_state = "Ready for validation"
+            stage = "review"
+        elif result.ok:
+            owner_state = "Working"
+            stage = "review"
+        else:
+            owner_state = "Blocked"
+            stage = "review"
+        owner_app.write_status(mission_dir / "status.json", {
+            "owner_state": owner_state,
+            "stage": stage,
+            "freshness": "current",
+            "next_action": (result.lines[0] if result.lines
+                            else "The Factory owns the next action."),
+            "package_id": package_id,
+            "review_url": (result.details or {}).get("review_url")
+            or envelope_scaffold.firebase_review_url(package_id),
+            "rc_id": (result.details or {}).get("rc_id"),
+            "candidate_sha": (result.details or {}).get("candidate_sha"),
+            "code": (result.details or {}).get("code"),
+        })
+
+    def _continue_fast_path_review(self) -> FactoryResult | None:
+        """Advance completed fast-path work to REVIEW without Owner relay."""
+
+        root = self.config.state_dir / "owner-missions"
+        if not root.is_dir():
+            return None
+        try:
+            contract = self._product_contract()
+        except FactoryRefusal:
+            return None
+        if not owner_app.is_envelope_run(contract.run_ref):
+            return None
+        mission = self._product_reading()
+        if mission is None or mission["state"] != "completed":
+            return None
+        review_lines = self._review_lines(mission, "completed")
+        if any("ready at" in line for line in review_lines):
+            return None
+        preparing = FactoryResult(
+            action="review", ok=True, state="working",
+            lines=("Preparing the exact-artifact REVIEW; "
+                   "no Owner command is required.",),
+            details={"package_id": contract.package_id},
+        )
+        self._write_fast_path_owner_status(preparing)
+        try:
+            result = self.review()
+        except FactoryRefusal as refusal:
+            result = FactoryResult(
+                action="review", ok=False, state="blocked",
+                lines=("BLOCKED: " + refusal.detail,),
+                details={"code": refusal.code},
+            )
+        self._write_fast_path_owner_status(result)
+        return result
 
     def _build_artifact(self, contract, candidate_sha: str) -> dict[str, Any]:
         """Ask the execution layer for the candidate's immutable identity.
@@ -1833,9 +2303,12 @@ class FactoryLifecycle:
         except (urllib.error.URLError, OSError, ValueError):
             raise FactoryRefusal(
                 "REVIEW_SURFACE_UNREACHABLE",
-                "The review surface is not running, so the Factory cannot "
-                "confirm what you looked at. Start it with './dev review up' "
-                "and run this command again.") from None
+                "The review surface is not reachable, so the Factory cannot "
+                "confirm what you looked at."
+                + (" Start it with './dev review up' and run this command again."
+                   if surface.startswith("http://") else
+                   " The Factory owns recovery of the REVIEW surface."),
+            ) from None
         if status != 200 or observed != expected:
             raise FactoryRefusal(
                 "REVIEW_SURFACE_MISMATCH",
@@ -1948,7 +2421,7 @@ class FactoryLifecycle:
         queued = self._queue_next(contract, entry, doctor, grant,
                                   owner_action=False)
         if queued.state == "complete":
-            return queued
+            return self._with_fast_path_review(queued)
         # An attention on an earlier slot stops *submission*, not execution.
         # Returning here left every already-admitted mission admitted forever:
         # the Owner's own `./dev factory run` had authorized DF-3 before the
@@ -1957,6 +2430,10 @@ class FactoryLifecycle:
         # and reconciling it is the one thing that must not wait for a person.
         # So the cycle still runs, nothing new is handed off, and the blocker
         # is what the Owner is told.
+        #
+        # Envelope REVIEW is already-admitted product work, not a new dogfood
+        # handoff.  A historical DF-1 attention must not skip it: that left a
+        # finished inventory candidate with no exact-artifact REVIEW.
         blocked = None if queued.ok else queued
         try:
             report = self.supervisor.cycle(AUTOPILOT_WORKER_ID)
@@ -1983,21 +2460,20 @@ class FactoryLifecycle:
                 cycle=report)
 
         settled = self._settle_improvement(contract, grant)
-        if blocked is not None:
-            return FactoryResult(
-                action="cycle", ok=False, state="attention",
-                lines=blocked.lines,
-                details={**dict(blocked.details), "cycle": report,
-                         **({} if settled is None else {"improvement": settled})})
-        advanced = self._queue_next(contract, entry, doctor, grant,
-                                    owner_action=False)
         extra = {"cycle": report}
         if settled is not None:
             extra["improvement"] = settled
-        return FactoryResult(
+        if blocked is not None:
+            return self._with_fast_path_review(FactoryResult(
+                action="cycle", ok=False, state="attention",
+                lines=blocked.lines,
+                details={**dict(blocked.details), **extra}))
+        advanced = self._queue_next(contract, entry, doctor, grant,
+                                    owner_action=False)
+        return self._with_fast_path_review(FactoryResult(
             action="cycle", ok=advanced.ok, state=advanced.state,
             lines=advanced.lines,
-            details={**(advanced.details or {}), **extra})
+            details={**(advanced.details or {}), **extra}))
 
     def _queue_next(self, contract, entry, doctor, grant, *,
                     owner_action: bool) -> FactoryResult:
@@ -2530,7 +3006,7 @@ class FactoryLifecycle:
 
         try:
             contract = product.ProductContract.load(
-                self.config.product_contract_path)
+                self._active_product_contract_path())
             rows = [row for row in self.store.all_missions()
                     if row.get("project_id") == contract.project_id]
             return None if not rows else self.store.get(rows[-1]["id"])
@@ -2621,6 +3097,25 @@ class FactoryLifecycle:
                 "for Owner review. It is kept in durable history and does not "
                 "block this product." % portfolio_mission.mission_ref)
 
+    def _owner_brief_status_lines(self) -> tuple[str, ...]:
+        if self._product_reading() is not None:
+            return ()
+        root = self.config.state_dir / "owner-missions"
+        if not root.is_dir():
+            return ()
+        latest = None
+        for path in sorted(root.glob("*/STATUS.md")):
+            latest = path
+        if latest is None:
+            return ()
+        try:
+            body = latest.read_text(encoding="utf-8").strip()
+        except OSError:
+            return ()
+        if not body:
+            return ()
+        return ("Mission status (%s):" % latest.parent.name, body)
+
     def _product_summary(self) -> tuple[tuple[str, ...], str] | None:
         """What the Owner needs to know about their product, when one exists.
 
@@ -2651,6 +3146,7 @@ class FactoryLifecycle:
         stage = self._product_stage(mission["id"])
         if stage is not None:
             lines.append("Stage: " + stage)
+        stale = isinstance(stage, str) and "stale" in stage
         try:
             profile = self.store.route_history(
                 mission["id"]).get("selected_provider_profile")
@@ -2662,19 +3158,61 @@ class FactoryLifecycle:
         if state in shift_plane.UNSUCCESSFUL_MISSION_STATES:
             summary_state = "attention"
             lines.append(
-                "Attention: %s needs Owner review (%s)."
+                "Blocked: %s (%s). The Factory owns recovery unless a reserved "
+                "Owner act is required."
                 % (work_item, mission["terminal_reason"]
                    or "it did not settle successfully"))
+            review_lines = ()
+            review_block = None
         elif state == "completed":
-            summary_state = "complete"
+            review_lines = self._review_lines(mission, state)
+            review_ready = any("ready at" in line for line in review_lines)
+            review_block = None if review_ready else self._fast_path_review_block()
+            summary_state = ("complete" if review_ready
+                             else "attention" if review_block else "pending")
         else:
             summary_state = "pending"
-        lines.extend(self._review_lines(mission, state))
+            review_lines = ()
+            review_block = None
+        facing = owner_app.owner_state_for(
+            mission_state=state,
+            review_ready=summary_state == "complete" and state == "completed",
+            blocked=(state in shift_plane.UNSUCCESSFUL_MISSION_STATES
+                     or bool(review_block)),
+            stale=stale,
+        )
+        lines = [facing["owner_state"], facing["next_action"]] + lines
+        if review_block:
+            lines.append(review_block)
+        else:
+            lines.extend(review_lines)
         lines.extend(self._lineage_lines(mission))
         history = self._dogfood_history_note()
         if history is not None:
             lines.append(history)
         return tuple(lines), summary_state
+
+    def _fast_path_review_block(self) -> str | None:
+        """Durable envelope REVIEW refusal, when one is already recorded."""
+
+        package_id = self._bound_envelope_package_id()
+        if not package_id:
+            return None
+        path = (self.config.state_dir / "owner-missions" / package_id
+                / "status.json")
+        try:
+            row = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            return None
+        if not isinstance(row, dict):
+            return None
+        if row.get("code") != "REVIEW_DEPLOY_AUTH_UNAVAILABLE":
+            return None
+        detail = row.get("next_action")
+        if isinstance(detail, str) and detail.strip():
+            return detail
+        return ("BLOCKED: FACTORY_FIREBASE_TOKEN is not set on the Factory "
+                "supervisor, so the exact-artifact REVIEW cannot be published.")
 
     def _lineage_lines(self, mission) -> tuple[str, ...]:
         """What the Owner already decided about this product, and about what.
@@ -2730,7 +3268,7 @@ class FactoryLifecycle:
             return ()
         try:
             contract = product.ProductContract.load(
-                self.config.product_contract_path)
+                self._active_product_contract_path())
             result = mission.get("result") or {}
             candidate = ((result.get("verification") or {}).get("verification")
                          or {}).get("candidate_sha")
@@ -2742,7 +3280,7 @@ class FactoryLifecycle:
         try:
             with self.store.transaction() as db:
                 row = db.execute(
-                    "SELECT validation_surface, artifact_digest FROM"
+                    "SELECT validation_surface, artifact_digest, state FROM"
                     " release_deployments WHERE rc_id=?", (rc_id,)).fetchone()
         except Exception:  # noqa: BLE001
             # The release plane owns that table and creates it on first use, so
@@ -2750,13 +3288,16 @@ class FactoryLifecycle:
             # Reading is all this does: a status that created a schema would be
             # a status that writes.
             row = None
-        if row is None:
-            return ("Next: run './dev factory review' to prepare it for your "
-                    "review.",)
+        if row is None or row["state"] not in REVIEW_SERVING_STATES:
+            if row is not None:
+                return ("Next: exact-artifact REVIEW did not reach the hosting "
+                        "surface (%s); the Factory owns recovery."
+                        % row["state"],)
+            return ("Next: the Factory is preparing exact-artifact REVIEW; "
+                    "no Owner command is required.",)
         return ("Review: %s is ready at %s" % (rc_id, row["validation_surface"]),
                 "Serving artifact %s" % row["artifact_digest"],
-                "Start the surface with './dev review up' if it is not already "
-                "running.")
+                "Ready for Owner Validation of this exact RC.")
 
     def _management_summary(self) -> tuple[tuple[str, ...], dict[str, Any]]:
         """Owner-visible management/reconciliation state.  Vendor-neutral."""
@@ -2903,6 +3444,7 @@ class FactoryLifecycle:
             work_state = "attention"
         if management_reading.get("owner_attention_need"):
             work_state = "attention"
+        owner_lines = self._owner_brief_status_lines()
         return FactoryResult(
             action="status", ok=True, state=state,
             lines=(label,
@@ -2911,11 +3453,13 @@ class FactoryLifecycle:
                    "Bridge: " + bridge_summary,
                    "Primary: " + primary)
             + status_attention
+            + owner_lines
             + work
             + management_lines,
             details={"control": control, "grant": None if live is None else live.as_row(),
                      "bridge": doctor, "work_state": work_state,
-                     "management": management_reading},
+                     "management": management_reading,
+                     "owner_state": owner_lines[0] if owner_lines else None},
         )
 
     def watch(self, interval_seconds: float = DEFAULT_WATCH_INTERVAL_SECONDS,
@@ -3028,6 +3572,16 @@ class FactoryLifecycle:
                 "macOS service control is unavailable on this host.")
         return result.returncode == 0
 
+    def _service_running(self, label: str) -> bool:
+        result = self._run(("launchctl", "print", self._service_domain(label)))
+        if result.returncode == 127:
+            raise FactoryRefusal(
+                "HOST_CONTROL_UNAVAILABLE",
+                "macOS service control is unavailable on this host.")
+        if result.returncode != 0:
+            return False
+        return "state = running" in (result.stdout or "")
+
     def _bootout_if_loaded(self, label: str) -> bool:
         if not self._service_loaded(label):
             return False
@@ -3039,7 +3593,15 @@ class FactoryLifecycle:
         return True
 
     def _bootstrap(self, label: str, plist: Path) -> None:
+        if self._service_running(label):
+            return
         if self._service_loaded(label):
+            result = self._run(
+                ("launchctl", "kickstart", "-k", self._service_domain(label)))
+            if result.returncode != 0 or not self._service_loaded(label):
+                raise FactoryRefusal(
+                    "SERVICE_START_FAILED",
+                    "The Factory could not start a required host service safely.")
             return
         result = self._run(("launchctl", "bootstrap", "gui/%d" % self.owner.uid,
                             str(plist)))  # type: ignore[union-attr]
@@ -3729,6 +4291,14 @@ class FactoryLifecycle:
                     (line.split() for line in result.stdout.splitlines())
                     if result.returncode == 0 and len(fields) >= 2
                 }
+                checkout = row.get("checkout")
+                if isinstance(checkout, str) and checkout:
+                    local = self._run(
+                        ("git", "-C", checkout, "log", "--format=%H"))
+                    if local.returncode == 0:
+                        advertised[remote].update(
+                            line.strip() for line in local.stdout.splitlines()
+                            if len(line.strip()) == 40)
             for sha in shas & advertised[remote]:
                 found.setdefault(mission.project_id, []).append(sha)
         return {name: tuple(sorted(set(values))) for name, values in found.items()}

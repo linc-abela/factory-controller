@@ -73,6 +73,7 @@ class FakeHost:
         self.capability_admissions = []
         self.serving_drift = "none"
         self.loaded = {config.legacy_label}
+        self.stalled = set()
         self.calls = []
         self.capability_admits = 0
         self.health_error = None
@@ -117,6 +118,8 @@ class FakeHost:
             return self._bridge(command[1:], input_text)
         if command[:1] == ("git",):
             return self._git(command)
+        if command[:1] == ("gh",):
+            return HostCommandResult(0, '{"name":"fixture"}')
         if len(command) == 2 and command[1].split("/")[-1] in self.gate_streams \
                 and command[0].endswith("/dev"):
             if not self.baseline_ok:
@@ -146,17 +149,28 @@ class FakeHost:
         action = command[1]
         if action == "print":
             label = command[2].rsplit("/", 1)[-1]
-            return HostCommandResult(0 if label in self.loaded else 1)
+            if label not in self.loaded:
+                return HostCommandResult(1, "", "Could not find service")
+            if label in self.stalled:
+                return HostCommandResult(0, "\tstate = not running\n")
+            return HostCommandResult(0, "\tstate = running\n")
         if action == "bootout":
             self.loaded.discard(command[2].rsplit("/", 1)[-1])
+            self.stalled.discard(command[2].rsplit("/", 1)[-1])
             return HostCommandResult(0)
         if action == "bootstrap":
             label = Path(command[3]).stem
             self.loaded.add(label)
+            self.stalled.discard(label)
             # A restarted Bridge binds the files that are there now, which is
             # the whole point of restarting it.
             if label == self.config.bridge_label:
                 self.serving_drift = "none"
+            return HostCommandResult(0)
+        if action == "kickstart":
+            label = command[-1].rsplit("/", 1)[-1]
+            self.loaded.add(label)
+            self.stalled.discard(label)
             return HostCommandResult(0)
         return HostCommandResult(1, "", "unsupported launchctl action")
 
@@ -427,6 +441,7 @@ class FactoryLifecycleTests(unittest.TestCase):
             state_dir=root / "state",
             bridge_prefix=root / "bridge",
             capability_request_path=root / "first-dogfood-capability-admission-request.json",
+            product_checkout_root=root / "apps",
         )
         self.config.capability_request_path.write_text(json.dumps({
             "accepted_unknowns": [],
@@ -636,6 +651,22 @@ class FactoryLifecycleTests(unittest.TestCase):
         self.assertFalse(status.ok)
         self.assertEqual("INCONSISTENT_SERVICE_STATE", status.details["code"])
         self.assertIn("./dev factory stop", status.render())
+
+    def test_start_kickstarts_a_loaded_idle_supervisor(self):
+        self.assertTrue(self.lifecycle.dispatch("install").ok)
+        self.assertTrue(self.lifecycle.dispatch("start").ok)
+        self.host.stalled.add(self.config.supervisor_label)
+
+        ready = self.lifecycle.dispatch("start")
+
+        self.assertTrue(ready.ok, ready.render())
+        self.assertNotIn(self.config.supervisor_label, self.host.stalled)
+        kickstarts = [command for command, _ in self.host.calls
+                      if command[:2] == ("launchctl", "kickstart")]
+        self.assertTrue(kickstarts)
+        status = self.lifecycle.dispatch("status")
+        self.assertTrue(status.ok, status.render())
+        self.assertIn("FACTORY READY", status.render())
 
     def test_the_supervisor_job_names_the_path_it_runs_under(self):
         """The SF-157 root cause: an inherited PATH is not a declared one.
