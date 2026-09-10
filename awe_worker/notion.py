@@ -497,6 +497,83 @@ class LiveNotionTaskSource:
             current=current,
         )
 
+    def projection_snapshot(self) -> dict[str, Any]:
+        """Read-only Dashboard + physical + Dispatch view. Never claims or writes."""
+        from .dispatch import DISPATCH_PAGE_IDS, HeadlessDispatchResolver
+
+        dashboard: list[dict[str, Any]] = []
+        physical: list[dict[str, Any]] = []
+        if self.client.is_configured:
+            rows: list[dict[str, Any]] = []
+            cursor: str | None = None
+            while True:
+                resp = self.client.query_database(
+                    database_id=self.database_id,
+                    page_size=100,
+                    start_cursor=cursor,
+                )
+                rows.extend(resp.get("results", []))
+                if not resp.get("has_more") or not resp.get("next_cursor"):
+                    break
+                cursor = resp["next_cursor"]
+            for row in rows:
+                try:
+                    item = self._parse_row_to_work_item(row)
+                except Exception:
+                    continue
+                if not item:
+                    continue
+                profile = ""
+                props = row.get("properties", {})
+                model_rich = props.get("Model / Effort", {}).get("rich_text", [])
+                if model_rich:
+                    profile = "".join(t.get("plain_text", "") for t in model_rich).strip()
+                if not profile:
+                    profile = " → ".join(
+                        part for part in (item.lane, " / ".join(p for p in (item.model, item.effort) if p)) if part
+                    )
+                dashboard.append(
+                    {
+                        "task_id": item.task_id,
+                        "status": item.status,
+                        "current": item.current,
+                        "lane": item.lane,
+                        "model_effort": profile,
+                    }
+                )
+                try:
+                    verified = self.verify_physical_status(item)
+                except NotionAPIError:
+                    continue
+                except Exception:
+                    continue
+                physical.append(
+                    {
+                        "task_id": verified.task_id,
+                        "lane": verified.lane,
+                        "status": verified.status,
+                        "execution_profile": profile,
+                    }
+                )
+
+        dispatch_views: list[dict[str, Any]] = []
+        resolver = HeadlessDispatchResolver(client=self.client)
+        for harness in DISPATCH_PAGE_IDS:
+            result = resolver.resolve(harness)
+            pointer = result.pointer
+            if pointer is None:
+                continue
+            dispatch_views.append(
+                {
+                    "harness": harness,
+                    "dispatch_state": pointer.dispatch_state,
+                    "task_id": pointer.task_id,
+                    "expected_lifecycle_state": pointer.expected_lifecycle_state,
+                    "execution_profile": pointer.execution_profile,
+                }
+            )
+        return {"physical": physical, "dashboard": dashboard, "dispatch": dispatch_views}
+
 
 class NotionSourceOfRecord:
     """Manages authoritative task lifecycle transitions and write-back in Notion AWE."""

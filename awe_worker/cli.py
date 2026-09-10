@@ -31,7 +31,7 @@ from .notion import (
     NotionSourceOfRecord,
 )
 from .observation import AWEObservationService, DirectoryTaskSource, NotionTaskSource
-from .projection import diagnose_snapshot, diagnose_snapshot_path
+from .projection import diagnose_snapshot, diagnose_snapshot_path, evaluate_claim_preflight, load_snapshot
 from .reconciliation import TurnCadenceReconciler
 from .scheduler import AWEScheduledRunner
 from .worker import AWEAutonomousWorker
@@ -110,6 +110,11 @@ def main(argv: list[str] | None = None) -> int:
     claim_p.add_argument("--worker-id", default="local-worker-1", help="Worker ID")
     claim_p.add_argument("--slot", default="antigravity/gemini-3.8-flash/high", help="Execution slot")
     claim_p.add_argument("--lease", type=float, default=60.0, help="Lease duration in seconds")
+    claim_p.add_argument(
+        "--snapshot",
+        default=None,
+        help="Projection snapshot JSON path or '-'. Required before claim; omit to fail closed.",
+    )
 
     # wake
     wake_p = subparsers.add_parser("wake", help="Wake/dispatch a harness for a task")
@@ -133,6 +138,11 @@ def main(argv: list[str] | None = None) -> int:
     cycle_p.add_argument("--database-id", default=DEFAULT_AWE_DATABASE_ID)
     cycle_p.add_argument("--repo", default=".")
     _add_dry_run_arguments(cycle_p)
+    cycle_p.add_argument(
+        "--snapshot",
+        default=None,
+        help="Optional projection snapshot JSON path or '-'. Overrides the task source snapshot.",
+    )
 
     # run (scheduled worker service)
     run_p = subparsers.add_parser("run", help="Run bounded or persistent scheduled worker loop")
@@ -146,6 +156,11 @@ def main(argv: list[str] | None = None) -> int:
     run_p.add_argument("--repo", default=".")
     run_p.add_argument("--heartbeat-file", default=None, help="Path to write JSON heartbeat file")
     _add_dry_run_arguments(run_p)
+    run_p.add_argument(
+        "--snapshot",
+        default=None,
+        help="Optional projection snapshot JSON path or '-'. Overrides the task source snapshot.",
+    )
 
     # status
     subparsers.add_parser("status", help="Show worker ledger health, active claims, and liveness")
@@ -181,6 +196,13 @@ def main(argv: list[str] | None = None) -> int:
         return 0
 
     elif args.command == "claim":
+        snapshot = _optional_snapshot(getattr(args, "snapshot", None))
+        preflight = evaluate_claim_preflight(snapshot)
+        if not preflight.ok:
+            json.dump(preflight.as_dict(), sys.stdout, indent=2)
+            print()
+            print(preflight.as_text(), file=sys.stderr)
+            return 1
         slot = ExecutionSlot.parse(args.slot)
         res = ledger.claim(
             task_id=args.task_id,
@@ -256,6 +278,7 @@ def main(argv: list[str] | None = None) -> int:
             source=src,
             target_repo=args.repo,
             source_of_record=sor,
+            projection_snapshot=_optional_snapshot(getattr(args, "snapshot", None)),
         )
         summary = worker.run_cycle(
             worker_id=args.worker_id,
@@ -289,6 +312,7 @@ def main(argv: list[str] | None = None) -> int:
             source=src,
             target_repo=args.repo,
             source_of_record=sor,
+            projection_snapshot=_optional_snapshot(getattr(args, "snapshot", None)),
         )
         runner = AWEScheduledRunner(
             worker=worker,
@@ -345,6 +369,17 @@ def main(argv: list[str] | None = None) -> int:
         return 0
 
     return 0
+
+
+def _optional_snapshot(snapshot: str | None) -> dict | None:
+    if not snapshot:
+        return None
+    if snapshot == "-":
+        payload = json.load(sys.stdin)
+        if not isinstance(payload, dict):
+            raise ValueError("snapshot must be a JSON object")
+        return payload
+    return load_snapshot(snapshot)
 
 
 def _run_diagnose_projection(snapshot: str) -> int:

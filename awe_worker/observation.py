@@ -7,6 +7,7 @@ from pathlib import Path
 from typing import Any, Protocol, Sequence
 
 from .model import AWEStatus, AWEWorkItem, ExecutionSlot
+from .projection import snapshot_from_work_items
 
 
 class TaskSource(Protocol):
@@ -19,11 +20,22 @@ class TaskSource(Protocol):
 class MemoryTaskSource:
     """In-memory task source for testing and local simulation."""
 
-    def __init__(self, tasks: Sequence[AWEWorkItem]) -> None:
+    def __init__(
+        self,
+        tasks: Sequence[AWEWorkItem],
+        projection_snapshot: dict[str, Any] | None = None,
+    ) -> None:
         self._tasks = list(tasks)
+        self._projection_snapshot = projection_snapshot
 
     def fetch_tasks(self) -> Sequence[AWEWorkItem]:
         return list(self._tasks)
+
+    def projection_snapshot(self) -> dict[str, Any]:
+        extra = getattr(self, "_projection_snapshot", None)
+        if extra is not None:
+            return extra
+        return snapshot_from_work_items(self.fetch_tasks())
 
 
 class DirectoryTaskSource:
@@ -68,6 +80,9 @@ class DirectoryTaskSource:
         items.sort(key=lambda x: (x.sequence, x.task_id))
         return items
 
+    def projection_snapshot(self) -> dict[str, Any]:
+        return snapshot_from_work_items(self.fetch_tasks())
+
 
 class NotionTaskSource:
     """Notion AWE task source that reads pages from live AWE database or mock source."""
@@ -90,6 +105,12 @@ class NotionTaskSource:
         db_id = self.database_id or DEFAULT_AWE_DATABASE_ID
         live_src = LiveNotionTaskSource(client=client, database_id=db_id)
         return live_src.fetch_tasks()
+
+    def projection_snapshot(self) -> dict[str, Any]:
+        live = getattr(self.client_or_pages, "projection_snapshot", None)
+        if callable(live):
+            return live()
+        return snapshot_from_work_items(self.fetch_tasks())
 
 
 

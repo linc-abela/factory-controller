@@ -22,6 +22,10 @@ DUPLICATE_DASHBOARD_CURRENT = "DUPLICATE_DASHBOARD_CURRENT"
 DASHBOARD_STATUS_MISMATCH = "DASHBOARD_STATUS_MISMATCH"
 DISPATCH_PHYSICAL_MISMATCH = "DISPATCH_PHYSICAL_MISMATCH"
 DASHBOARD_MODEL_MISMATCH = "DASHBOARD_MODEL_MISMATCH"
+UNKNOWN_PHYSICAL_TRUTH = "UNKNOWN_PHYSICAL_TRUTH"
+UNKNOWN_PROJECTION_SNAPSHOT = "UNKNOWN_PROJECTION_SNAPSHOT"
+
+_ACTIVE_DASHBOARD_CURRENT = frozenset({"Queue", "In Progress", "Blocked", "Review"})
 
 _UNSAFE_FOR_EXECUTABLE = frozenset({"Review", "Processed", "Blocked"})
 
@@ -141,6 +145,7 @@ def diagnose_projection(
     phys_by_id = {item.task_id: item for item in phys if item.task_id}
 
     findings.extend(_duplicate_current_findings(dash))
+    findings.extend(_unknown_physical_findings(phys_by_id, dash, pointers))
     findings.extend(_status_mismatch_findings(phys_by_id, dash))
     findings.extend(_model_mismatch_findings(phys_by_id, dash))
     findings.extend(_dispatch_findings(phys_by_id, pointers))
@@ -167,6 +172,77 @@ def load_snapshot(path: str | Path) -> dict[str, Any]:
 
 def diagnose_snapshot_path(path: str | Path) -> DiagnosticReport:
     return diagnose_snapshot(load_snapshot(path))
+
+
+def evaluate_claim_preflight(snapshot: Mapping[str, Any] | None) -> DiagnosticReport:
+    """Read-only gate used before local ledger or source-of-record claim.
+
+    A missing snapshot is unknown projection truth and must fail closed.
+    This function never claims, moves pages, or writes Dashboard/Dispatch.
+    """
+    if snapshot is None:
+        return DiagnosticReport(
+            verdict=FAIL_CLOSED,
+            findings=(
+                Finding(
+                    code=UNKNOWN_PROJECTION_SNAPSHOT,
+                    detail=(
+                        "No projection snapshot was supplied to the claim/startup path; "
+                        "unknown physical/Dashboard/Dispatch truth must fail closed"
+                    ),
+                ),
+            ),
+        )
+    return diagnose_snapshot(snapshot)
+
+
+def snapshot_from_work_items(
+    tasks: Sequence[Any],
+    dashboard: Sequence[Mapping[str, Any]] | None = None,
+    dispatch: Sequence[Mapping[str, Any]] | Mapping[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Build a diagnostic snapshot from observed work items.
+
+    When dashboard/dispatch are omitted, Dashboard rows are derived from the
+    same physical tasks so in-memory tests stay consistent. Live sources must
+    supply independent Dashboard and Dispatch views.
+    """
+    physical = []
+    derived_dashboard = []
+    for task in tasks:
+        task_id = _norm(str(getattr(task, "task_id", "") or ""))
+        lane = _norm(str(getattr(task, "lane", "") or ""))
+        status = _norm(str(getattr(task, "status", "") or ""))
+        model = _norm(str(getattr(task, "model", "") or ""))
+        effort = _norm(str(getattr(task, "effort", "") or ""))
+        profile = _norm(str(getattr(task, "execution_profile", "") or ""))
+        if not profile and (lane or model or effort):
+            profile = " → ".join(part for part in (lane, " / ".join(p for p in (model, effort) if p)) if part)
+        physical.append(
+            {
+                "task_id": task_id,
+                "lane": lane,
+                "status": status,
+                "execution_profile": profile,
+            }
+        )
+        current = getattr(task, "current", None)
+        if current is None:
+            current = canonical_lifecycle_status(status) in _ACTIVE_DASHBOARD_CURRENT
+        derived_dashboard.append(
+            {
+                "task_id": task_id,
+                "status": status,
+                "current": bool(current),
+                "lane": lane,
+                "model_effort": profile,
+            }
+        )
+    return {
+        "physical": physical,
+        "dashboard": list(dashboard) if dashboard is not None else derived_dashboard,
+        "dispatch": dispatch,
+    }
 
 
 def _as_physical(item: PhysicalTask | Mapping[str, Any]) -> PhysicalTask:
@@ -216,6 +292,66 @@ def _as_dispatch(item: DispatchView | Mapping[str, Any]) -> DispatchView:
         ),
         execution_profile=_norm(str(item.get("execution_profile") or "")),
     )
+
+
+def _physical_known(physical: PhysicalTask | None) -> bool:
+    return physical is not None and bool(physical.task_id) and bool(physical.canonical_status)
+
+
+def _unknown_physical_findings(
+    phys_by_id: Mapping[str, PhysicalTask],
+    dashboard: Sequence[DashboardRow],
+    pointers: Sequence[DispatchView],
+) -> list[Finding]:
+    findings: list[Finding] = []
+    seen: set[tuple[str, str, str]] = set()
+
+    def add(code_task: str, lane: str, detail: str) -> None:
+        key = (code_task, lane, detail)
+        if key in seen:
+            return
+        seen.add(key)
+        findings.append(
+            Finding(
+                code=UNKNOWN_PHYSICAL_TRUTH,
+                task_id=code_task,
+                lane=lane,
+                detail=detail,
+            )
+        )
+
+    for row in dashboard:
+        if not row.current:
+            continue
+        if not row.task_id:
+            add("", row.lane, "Dashboard Current row has no Task ID; physical AWE truth is unknown")
+            continue
+        physical = phys_by_id.get(row.task_id)
+        if not _physical_known(physical):
+            add(
+                row.task_id,
+                row.lane,
+                "Dashboard Current task has unknown or missing physical AWE ancestry",
+            )
+
+    for pointer in pointers:
+        if not pointer.executable:
+            continue
+        if not pointer.task_id:
+            add(
+                "",
+                pointer.harness,
+                "Dispatch is EXECUTABLE with no Task ID; physical AWE truth is unknown",
+            )
+            continue
+        physical = phys_by_id.get(pointer.task_id)
+        if not _physical_known(physical):
+            add(
+                pointer.task_id,
+                pointer.harness,
+                "EXECUTABLE Dispatch pointer has unknown or missing physical AWE ancestry",
+            )
+    return findings
 
 
 def _duplicate_current_findings(dashboard: Sequence[DashboardRow]) -> list[Finding]:
@@ -299,7 +435,7 @@ def _dispatch_findings(
         if not pointer.executable:
             continue
         physical = phys_by_id.get(pointer.task_id)
-        if physical is None:
+        if not _physical_known(physical):
             continue
         expected = canonical_lifecycle_status(pointer.expected_lifecycle_state)
         if physical.canonical_status in _UNSAFE_FOR_EXECUTABLE:
