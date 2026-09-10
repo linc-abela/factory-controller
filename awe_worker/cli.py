@@ -197,13 +197,17 @@ def main(argv: list[str] | None = None) -> int:
 
     elif args.command == "claim":
         snapshot = _optional_snapshot(getattr(args, "snapshot", None))
-        preflight = evaluate_claim_preflight(snapshot)
+        slot = ExecutionSlot.parse(args.slot)
+        preflight = evaluate_claim_preflight(
+            snapshot,
+            selected_task_id=args.task_id,
+            slot=slot,
+        )
         if not preflight.ok:
             json.dump(preflight.as_dict(), sys.stdout, indent=2)
             print()
             print(preflight.as_text(), file=sys.stderr)
             return 1
-        slot = ExecutionSlot.parse(args.slot)
         res = ledger.claim(
             task_id=args.task_id,
             lineage_id=args.task_id,

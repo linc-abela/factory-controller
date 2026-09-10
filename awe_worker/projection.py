@@ -12,7 +12,7 @@ from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any, Iterable, Mapping, Sequence
 
-from .model import canonical_lifecycle_status
+from .model import ExecutionSlot, canonical_lifecycle_status
 
 PASS = "PASS"
 FAIL_CLOSED = "FAIL_CLOSED"
@@ -24,6 +24,10 @@ DISPATCH_PHYSICAL_MISMATCH = "DISPATCH_PHYSICAL_MISMATCH"
 DASHBOARD_MODEL_MISMATCH = "DASHBOARD_MODEL_MISMATCH"
 UNKNOWN_PHYSICAL_TRUTH = "UNKNOWN_PHYSICAL_TRUTH"
 UNKNOWN_PROJECTION_SNAPSHOT = "UNKNOWN_PROJECTION_SNAPSHOT"
+NO_EXECUTABLE_TASK = "NO_EXECUTABLE_TASK"
+NO_CURRENT_POINTER = "NO_CURRENT_POINTER"
+SELECTED_TASK_MISMATCH = "SELECTED_TASK_MISMATCH"
+SLOT_CURRENT_AMBIGUOUS = "SLOT_CURRENT_AMBIGUOUS"
 
 _ACTIVE_DASHBOARD_CURRENT = frozenset({"Queue", "In Progress", "Blocked", "Review"})
 
@@ -174,11 +178,17 @@ def diagnose_snapshot_path(path: str | Path) -> DiagnosticReport:
     return diagnose_snapshot(load_snapshot(path))
 
 
-def evaluate_claim_preflight(snapshot: Mapping[str, Any] | None) -> DiagnosticReport:
+def evaluate_claim_preflight(
+    snapshot: Mapping[str, Any] | None,
+    selected_task_id: str | None = None,
+    slot: ExecutionSlot | Mapping[str, Any] | str | None = None,
+) -> DiagnosticReport:
     """Read-only gate used before local ledger or source-of-record claim.
 
     A missing snapshot is unknown projection truth and must fail closed.
-    This function never claims, moves pages, or writes Dashboard/Dispatch.
+    When a selected task and slot are supplied, the selected target must bind
+    to the authorized Dashboard Current pointer and Dispatch pointer for that
+    slot. This function never claims, moves pages, or writes Dashboard/Dispatch.
     """
     if snapshot is None:
         return DiagnosticReport(
@@ -193,7 +203,19 @@ def evaluate_claim_preflight(snapshot: Mapping[str, Any] | None) -> DiagnosticRe
                 ),
             ),
         )
-    return diagnose_snapshot(snapshot)
+    report = diagnose_snapshot(snapshot)
+    if not selected_task_id and slot is None:
+        return report
+    findings = list(report.findings)
+    findings.extend(
+        _authorized_pointer_findings(
+            snapshot,
+            selected_task_id=_norm(selected_task_id),
+            slot=slot,
+        )
+    )
+    verdict = PASS if not findings else FAIL_CLOSED
+    return DiagnosticReport(verdict=verdict, findings=tuple(findings))
 
 
 def snapshot_from_work_items(
@@ -226,22 +248,51 @@ def snapshot_from_work_items(
                 "execution_profile": profile,
             }
         )
-        current = getattr(task, "current", None)
-        if current is None:
-            current = canonical_lifecycle_status(status) in _ACTIVE_DASHBOARD_CURRENT
         derived_dashboard.append(
             {
                 "task_id": task_id,
                 "status": status,
-                "current": bool(current),
+                "current": canonical_lifecycle_status(status) in _ACTIVE_DASHBOARD_CURRENT,
                 "lane": lane,
                 "model_effort": profile,
             }
         )
+    rows = list(dashboard) if dashboard is not None else derived_dashboard
+    derived_dispatch = dispatch
+    if dispatch is None:
+        claimable = [
+            row
+            for row in rows
+            if _truthy(row.get("current"))
+            and canonical_lifecycle_status(str(row.get("status") or ""))
+            in {"Queue", "In Progress"}
+        ]
+        in_progress = [
+            row for row in claimable if canonical_lifecycle_status(str(row.get("status") or "")) == "In Progress"
+        ]
+        chosen = None
+        if len(in_progress) == 1:
+            chosen = in_progress[0]
+        elif len(claimable) == 1:
+            chosen = claimable[0]
+        if chosen:
+            derived_dispatch = {
+                "harness": chosen.get("lane") or "",
+                "dispatch_state": "EXECUTABLE",
+                "task_id": chosen.get("task_id") or "",
+                "expected_lifecycle_state": chosen.get("status") or "",
+                "execution_profile": chosen.get("model_effort") or "",
+            }
+        else:
+            derived_dispatch = {
+                "harness": "",
+                "dispatch_state": "NO_EXECUTABLE_TASK",
+                "task_id": "",
+            }
     return {
         "physical": physical,
-        "dashboard": list(dashboard) if dashboard is not None else derived_dashboard,
-        "dispatch": dispatch,
+        "dashboard": rows,
+        "dispatch": derived_dispatch,
     }
 
 
@@ -463,3 +514,176 @@ def _dispatch_findings(
                 )
             )
     return findings
+
+
+def _slot_from_profile(profile: str, harness: str = "") -> ExecutionSlot | None:
+    text = _norm(profile).replace("→", "->")
+    if not text:
+        return None
+    try:
+        if "->" in text:
+            return ExecutionSlot.parse(text)
+        parts = [p.strip() for p in text.split("/") if p.strip()]
+        if len(parts) >= 2 and harness:
+            return ExecutionSlot.parse(f"{harness}/{parts[0]}/{parts[1]}")
+        if harness and len(parts) >= 3:
+            return ExecutionSlot.parse("/".join(parts[:3]))
+        return ExecutionSlot.parse(text if harness == "" else f"{harness}/{text}")
+    except ValueError:
+        return None
+
+
+def _row_matches_slot(row: DashboardRow, slot: ExecutionSlot) -> bool:
+    if _lane_key(row.lane) and _lane_key(row.lane) != slot.harness:
+        return False
+    parsed = _slot_from_profile(row.model_effort, row.lane or slot.harness)
+    if parsed is None:
+        return False
+    return parsed.matches(slot)
+
+
+def _pointer_matches_slot(pointer: DispatchView, slot: ExecutionSlot) -> bool:
+    if _lane_key(pointer.harness) and _lane_key(pointer.harness) != slot.harness:
+        return False
+    if not pointer.execution_profile:
+        return _lane_key(pointer.harness) == slot.harness
+    parsed = _slot_from_profile(pointer.execution_profile, pointer.harness or slot.harness)
+    if parsed is None:
+        return False
+    return parsed.matches(slot)
+
+
+def _authorized_pointer_findings(
+    snapshot: Mapping[str, Any],
+    selected_task_id: str,
+    slot: ExecutionSlot | Mapping[str, Any] | str | None,
+) -> list[Finding]:
+    findings: list[Finding] = []
+    if slot is None or not selected_task_id:
+        findings.append(
+            Finding(
+                code=SELECTED_TASK_MISMATCH,
+                detail="Claim/startup selected a task without an exact slot or selected Task ID",
+            )
+        )
+        return findings
+    try:
+        resolved_slot = ExecutionSlot.parse(slot)
+    except ValueError:
+        findings.append(
+            Finding(
+                code=SELECTED_TASK_MISMATCH,
+                task_id=selected_task_id,
+                detail="Claim/startup slot is not an exact (harness, model, effort) identity",
+            )
+        )
+        return findings
+
+    phys = tuple(_as_physical(item) for item in (snapshot.get("physical") or ()))
+    dash = tuple(_as_dashboard(item) for item in (snapshot.get("dashboard") or ()))
+    pointers = _as_dispatch_list(snapshot.get("dispatch"))
+    phys_by_id = {item.task_id: item for item in phys if item.task_id}
+    selected_physical = phys_by_id.get(selected_task_id)
+    current_rows = [row for row in dash if row.current and _row_matches_slot(row, resolved_slot)]
+    slot_pointers = [pointer for pointer in pointers if _pointer_matches_slot(pointer, resolved_slot)]
+    executable = [pointer for pointer in slot_pointers if pointer.executable]
+    is_resume = bool(
+        selected_physical is not None
+        and selected_physical.canonical_status == "In Progress"
+    )
+
+    if len(current_rows) > 1:
+        ids = ", ".join(sorted(row.task_id or "?" for row in current_rows))
+        findings.append(
+            Finding(
+                code=SLOT_CURRENT_AMBIGUOUS,
+                task_id=selected_task_id,
+                lane=resolved_slot.harness,
+                detail=(
+                    f"{len(current_rows)} Dashboard Current=YES rows match slot "
+                    f"{resolved_slot.key} ({ids})"
+                ),
+            )
+        )
+        return findings
+    if not current_rows:
+        findings.append(
+            Finding(
+                code=NO_CURRENT_POINTER,
+                task_id=selected_task_id,
+                lane=resolved_slot.harness,
+                detail=f"No Dashboard Current=YES task matches slot {resolved_slot.key}",
+            )
+        )
+
+    current_id = current_rows[0].task_id if current_rows else ""
+    if current_id and current_id != selected_task_id:
+        findings.append(
+            Finding(
+                code=SELECTED_TASK_MISMATCH,
+                task_id=selected_task_id,
+                lane=resolved_slot.harness,
+                detail=(
+                    f"Selected {selected_task_id} is not the authorized Current pointer "
+                    f"{current_id} for slot {resolved_slot.key}"
+                ),
+            )
+        )
+
+    if is_resume:
+        if executable and executable[0].task_id != selected_task_id:
+            findings.append(
+                Finding(
+                    code=SELECTED_TASK_MISMATCH,
+                    task_id=selected_task_id,
+                    lane=resolved_slot.harness,
+                    detail=(
+                        f"In Progress resume {selected_task_id} disagrees with EXECUTABLE "
+                        f"Dispatch pointer {executable[0].task_id}"
+                    ),
+                )
+            )
+        return findings
+
+    if not executable:
+        findings.append(
+            Finding(
+                code=NO_EXECUTABLE_TASK,
+                task_id=selected_task_id,
+                lane=resolved_slot.harness,
+                detail=(
+                    f"Dispatch is NO_EXECUTABLE_TASK for slot {resolved_slot.key}; "
+                    "Queue claim is not authorized"
+                ),
+            )
+        )
+        return findings
+
+    pointer = executable[0]
+    if pointer.task_id != selected_task_id:
+        findings.append(
+            Finding(
+                code=SELECTED_TASK_MISMATCH,
+                task_id=selected_task_id,
+                lane=resolved_slot.harness,
+                detail=(
+                    f"Selected {selected_task_id} disagrees with EXECUTABLE Dispatch "
+                    f"pointer {pointer.task_id or '(empty)'}"
+                ),
+            )
+        )
+    parsed_pointer = _slot_from_profile(pointer.execution_profile, pointer.harness)
+    if pointer.execution_profile and parsed_pointer is not None and not parsed_pointer.matches(resolved_slot):
+        findings.append(
+            Finding(
+                code=SELECTED_TASK_MISMATCH,
+                task_id=selected_task_id,
+                lane=resolved_slot.harness,
+                detail=(
+                    f"EXECUTABLE Dispatch profile '{pointer.execution_profile}' "
+                    f"does not match slot {resolved_slot.key}"
+                ),
+            )
+        )
+    return findings
+

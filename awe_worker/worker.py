@@ -87,14 +87,18 @@ class AWEAutonomousWorker:
             default_adapters.update(harness_adapters)
         self.adapters = default_adapters
 
-    def _projection_preflight(self):
+    def _projection_preflight(self, selected_task_id: str, slot: ExecutionSlot):
         """Fail closed before any local or source-of-record claim."""
         snapshot = self.projection_snapshot
         if snapshot is None:
             provider = getattr(self.observation.source, "projection_snapshot", None)
             if callable(provider):
                 snapshot = provider()
-        return evaluate_claim_preflight(snapshot)
+        return evaluate_claim_preflight(
+            snapshot,
+            selected_task_id=selected_task_id,
+            slot=slot,
+        )
 
     def run_cycle(
         self,
@@ -146,7 +150,7 @@ class AWEAutonomousWorker:
 
         task = eligible_tasks[0]
 
-        preflight = self._projection_preflight()
+        preflight = self._projection_preflight(task.task_id, target_slot)
         if not preflight.ok:
             return CycleSummary(
                 worker_id=worker_id,
