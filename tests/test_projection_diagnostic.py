@@ -24,8 +24,10 @@ from awe_worker.model import AWEWorkItem, ExecutionSlot
 from awe_worker.observation import MemoryTaskSource
 from awe_worker.projection import (
     DASHBOARD_STATUS_MISMATCH,
+    DISPATCH_SLOT_AMBIGUOUS,
     DUPLICATE_DASHBOARD_CURRENT,
     FAIL_CLOSED,
+    INCOMPLETE_EXECUTION_PROFILE,
     NO_CURRENT_POINTER,
     NO_EXECUTABLE_TASK,
     PASS,
@@ -86,7 +88,7 @@ class ProjectionDiagnosticTests(unittest.TestCase):
         self.assertFalse(report.ok)
         self.assertIn("Do not claim work", report.as_text())
 
-    def test_duplicate_dashboard_current_for_one_harness(self):
+    def test_clean_multi_slot_harness_current_is_not_duplicate(self):
         report = diagnose_projection(
             physical=[
                 {
@@ -118,6 +120,58 @@ class ProjectionDiagnosticTests(unittest.TestCase):
                     "model_effort": "Codex → GPT-5.6 Luna / Max",
                 },
             ],
+            dispatch=[
+                {
+                    "harness": "codex",
+                    "dispatch_state": "EXECUTABLE",
+                    "task_id": "SF-229",
+                    "expected_lifecycle_state": "Queue",
+                    "execution_profile": "Codex → GPT-5.6 Sol / High",
+                },
+                {
+                    "harness": "codex",
+                    "dispatch_state": "EXECUTABLE",
+                    "task_id": "SF-230",
+                    "expected_lifecycle_state": "In Progress",
+                    "execution_profile": "Codex → GPT-5.6 Luna / Max",
+                },
+            ],
+        )
+        self.assertEqual(report.verdict, PASS)
+        self.assertEqual(report.findings, ())
+
+    def test_duplicate_same_slot_dashboard_current_fails_closed(self):
+        report = diagnose_projection(
+            physical=[
+                {
+                    "task_id": "SF-229",
+                    "lane": "Codex",
+                    "status": "Queue",
+                    "execution_profile": "Codex → GPT-5.6 Sol / High",
+                },
+                {
+                    "task_id": "SF-230",
+                    "lane": "Codex",
+                    "status": "Queue",
+                    "execution_profile": "Codex → GPT-5.6 Sol / High",
+                },
+            ],
+            dashboard=[
+                {
+                    "task_id": "SF-229",
+                    "status": "Queue",
+                    "current": True,
+                    "lane": "Codex",
+                    "model_effort": "Codex → GPT-5.6 Sol / High",
+                },
+                {
+                    "task_id": "SF-230",
+                    "status": "Queue",
+                    "current": True,
+                    "lane": "Codex",
+                    "model_effort": "Codex → GPT-5.6 Sol / High",
+                },
+            ],
             dispatch={
                 "harness": "codex",
                 "dispatch_state": "EXECUTABLE",
@@ -129,7 +183,7 @@ class ProjectionDiagnosticTests(unittest.TestCase):
         self.assertEqual(report.verdict, FAIL_CLOSED)
         dup = [finding for finding in report.findings if finding.code == DUPLICATE_DASHBOARD_CURRENT]
         self.assertEqual(len(dup), 1)
-        self.assertIn("codex", dup[0].detail.lower())
+        self.assertIn("codex/gpt-5.6-sol/high", dup[0].detail.lower())
         self.assertIn("SF-229", dup[0].detail)
         self.assertIn("SF-230", dup[0].detail)
 
@@ -516,7 +570,7 @@ class AuthorizedPointerBindingTests(unittest.TestCase):
         self.assertEqual(report.verdict, PASS)
         self.assertTrue(report.ok)
 
-    def test_in_progress_resume_allowed_without_executable_dispatch(self):
+    def test_in_progress_resume_denied_without_executable_dispatch(self):
         snapshot = {
             "physical": [
                 {
@@ -547,7 +601,8 @@ class AuthorizedPointerBindingTests(unittest.TestCase):
             selected_task_id="SF-238",
             slot=CURSOR_MEDIUM,
         )
-        self.assertEqual(report.verdict, PASS)
+        self.assertEqual(report.verdict, FAIL_CLOSED)
+        self.assertIn(NO_EXECUTABLE_TASK, {finding.code for finding in report.findings})
 
     def test_in_progress_resume_rejects_queue_sibling(self):
         snapshot = {
@@ -583,8 +638,9 @@ class AuthorizedPointerBindingTests(unittest.TestCase):
             ],
             "dispatch": {
                 "harness": "cursor",
-                "dispatch_state": "NO_EXECUTABLE_TASK",
-                "task_id": "",
+                "dispatch_state": "EXECUTABLE",
+                "task_id": "SF-238",
+                "expected_lifecycle_state": "In Progress",
                 "execution_profile": CURSOR_PROFILE,
             },
         }
@@ -709,8 +765,9 @@ class AuthorizedPointerBindingTests(unittest.TestCase):
             ],
             "dispatch": {
                 "harness": "cursor",
-                "dispatch_state": "NO_EXECUTABLE_TASK",
-                "task_id": "",
+                "dispatch_state": "EXECUTABLE",
+                "task_id": "SF-238",
+                "expected_lifecycle_state": "In Progress",
                 "execution_profile": CURSOR_PROFILE,
             },
         }
@@ -784,6 +841,272 @@ class AuthorizedPointerBindingTests(unittest.TestCase):
         codes = {item["code"] for item in payload["findings"]}
         self.assertIn(SELECTED_TASK_MISMATCH, codes)
         self.assertIn(NO_EXECUTABLE_TASK, codes)
+
+
+    def test_resume_happy_path_requires_executable_in_progress_pointer(self):
+        snapshot = {
+            "physical": [
+                {
+                    "task_id": "SF-238",
+                    "lane": "Cursor",
+                    "status": "In Progress",
+                    "execution_profile": CURSOR_PROFILE,
+                }
+            ],
+            "dashboard": [
+                {
+                    "task_id": "SF-238",
+                    "status": "In Progress",
+                    "current": True,
+                    "lane": "Cursor",
+                    "model_effort": CURSOR_PROFILE,
+                }
+            ],
+            "dispatch": {
+                "harness": "cursor",
+                "dispatch_state": "EXECUTABLE",
+                "task_id": "SF-238",
+                "expected_lifecycle_state": "In Progress",
+                "execution_profile": CURSOR_PROFILE,
+            },
+        }
+        report = evaluate_claim_preflight(
+            snapshot,
+            selected_task_id="SF-238",
+            slot=CURSOR_MEDIUM,
+        )
+        self.assertEqual(report.verdict, PASS)
+
+    def test_missing_physical_profile_fails_closed(self):
+        report = diagnose_snapshot(
+            {
+                "physical": [
+                    {
+                        "task_id": "SF-238",
+                        "lane": "Cursor",
+                        "status": "Queue",
+                        "execution_profile": "",
+                    }
+                ],
+                "dashboard": [
+                    {
+                        "task_id": "SF-238",
+                        "status": "Queue",
+                        "current": True,
+                        "lane": "Cursor",
+                        "model_effort": CURSOR_PROFILE,
+                    }
+                ],
+                "dispatch": {
+                    "harness": "cursor",
+                    "dispatch_state": "EXECUTABLE",
+                    "task_id": "SF-238",
+                    "expected_lifecycle_state": "Queue",
+                    "execution_profile": CURSOR_PROFILE,
+                },
+            }
+        )
+        self.assertEqual(report.verdict, FAIL_CLOSED)
+        self.assertIn(UNKNOWN_PHYSICAL_TRUTH, {finding.code for finding in report.findings})
+
+    def test_missing_dispatch_lifecycle_or_profile_fails_closed(self):
+        report = diagnose_snapshot(
+            {
+                "physical": [
+                    {
+                        "task_id": "SF-238",
+                        "lane": "Cursor",
+                        "status": "Queue",
+                        "execution_profile": CURSOR_PROFILE,
+                    }
+                ],
+                "dashboard": [
+                    {
+                        "task_id": "SF-238",
+                        "status": "Queue",
+                        "current": True,
+                        "lane": "Cursor",
+                        "model_effort": CURSOR_PROFILE,
+                    }
+                ],
+                "dispatch": {
+                    "harness": "cursor",
+                    "dispatch_state": "EXECUTABLE",
+                    "task_id": "SF-238",
+                    "expected_lifecycle_state": "",
+                    "execution_profile": CURSOR_PROFILE,
+                },
+            }
+        )
+        self.assertEqual(report.verdict, FAIL_CLOSED)
+        self.assertIn(INCOMPLETE_EXECUTION_PROFILE, {finding.code for finding in report.findings})
+
+    def test_duplicate_same_slot_dispatch_pointers_fail_closed(self):
+        snapshot = {
+            "physical": [
+                {
+                    "task_id": "SF-238",
+                    "lane": "Cursor",
+                    "status": "Queue",
+                    "execution_profile": CURSOR_PROFILE,
+                }
+            ],
+            "dashboard": [
+                {
+                    "task_id": "SF-238",
+                    "status": "Queue",
+                    "current": True,
+                    "lane": "Cursor",
+                    "model_effort": CURSOR_PROFILE,
+                }
+            ],
+            "dispatch": [
+                {
+                    "harness": "cursor",
+                    "dispatch_state": "EXECUTABLE",
+                    "task_id": "SF-238",
+                    "expected_lifecycle_state": "Queue",
+                    "execution_profile": CURSOR_PROFILE,
+                },
+                {
+                    "harness": "cursor",
+                    "dispatch_state": "EXECUTABLE",
+                    "task_id": "SF-238",
+                    "expected_lifecycle_state": "Queue",
+                    "execution_profile": CURSOR_PROFILE,
+                },
+            ],
+        }
+        report = diagnose_snapshot(snapshot)
+        self.assertEqual(report.verdict, FAIL_CLOSED)
+        self.assertIn(DISPATCH_SLOT_AMBIGUOUS, {finding.code for finding in report.findings})
+        claim = evaluate_claim_preflight(
+            snapshot,
+            selected_task_id="SF-238",
+            slot=CURSOR_MEDIUM,
+        )
+        self.assertEqual(claim.verdict, FAIL_CLOSED)
+        self.assertIn(DISPATCH_SLOT_AMBIGUOUS, {finding.code for finding in claim.findings})
+
+    def test_exact_slot_preflights_pass_independently_on_clean_multi_slot(self):
+        snapshot = {
+            "physical": [
+                {
+                    "task_id": "SF-229",
+                    "lane": "Codex",
+                    "status": "Queue",
+                    "execution_profile": "Codex → GPT-5.6 Sol / High",
+                },
+                {
+                    "task_id": "SF-230",
+                    "lane": "Codex",
+                    "status": "In Progress",
+                    "execution_profile": "Codex → GPT-5.6 Luna / Max",
+                },
+            ],
+            "dashboard": [
+                {
+                    "task_id": "SF-229",
+                    "status": "Queue",
+                    "current": True,
+                    "lane": "Codex",
+                    "model_effort": "Codex → GPT-5.6 Sol / High",
+                },
+                {
+                    "task_id": "SF-230",
+                    "status": "In Progress",
+                    "current": True,
+                    "lane": "Codex",
+                    "model_effort": "Codex → GPT-5.6 Luna / Max",
+                },
+            ],
+            "dispatch": [
+                {
+                    "harness": "codex",
+                    "dispatch_state": "EXECUTABLE",
+                    "task_id": "SF-229",
+                    "expected_lifecycle_state": "Queue",
+                    "execution_profile": "Codex → GPT-5.6 Sol / High",
+                },
+                {
+                    "harness": "codex",
+                    "dispatch_state": "EXECUTABLE",
+                    "task_id": "SF-230",
+                    "expected_lifecycle_state": "In Progress",
+                    "execution_profile": "Codex → GPT-5.6 Luna / Max",
+                },
+            ],
+        }
+        queue = evaluate_claim_preflight(
+            snapshot,
+            selected_task_id="SF-229",
+            slot="codex/gpt-5.6-sol/high",
+        )
+        resume = evaluate_claim_preflight(
+            snapshot,
+            selected_task_id="SF-230",
+            slot="codex/gpt-5.6-luna/max",
+        )
+        self.assertEqual(queue.verdict, PASS)
+        self.assertEqual(resume.verdict, PASS)
+
+    def test_worker_does_not_resume_in_progress_without_executable_dispatch(self):
+        snapshot = {
+            "physical": [
+                {
+                    "task_id": "SF-238",
+                    "lane": "Cursor",
+                    "status": "In Progress",
+                    "execution_profile": CURSOR_PROFILE,
+                }
+            ],
+            "dashboard": [
+                {
+                    "task_id": "SF-238",
+                    "status": "In Progress",
+                    "current": True,
+                    "lane": "Cursor",
+                    "model_effort": CURSOR_PROFILE,
+                }
+            ],
+            "dispatch": {
+                "harness": "cursor",
+                "dispatch_state": "NO_EXECUTABLE_TASK",
+                "task_id": "",
+                "execution_profile": CURSOR_PROFILE,
+            },
+        }
+        task = AWEWorkItem(
+            task_id="SF-238",
+            title="in progress current",
+            lane="Cursor",
+            role="developer",
+            status="In Progress",
+            model="Grok 4.6",
+            effort="Medium",
+            sequence=238,
+            current=True,
+        )
+        source = MemoryTaskSource([task], projection_snapshot=snapshot)
+        ledger = AWELedger(":memory:")
+        sor = MagicMock()
+        adapter = MockHarnessAdapter("cursor")
+        worker = AWEAutonomousWorker(
+            ledger=ledger,
+            source=source,
+            source_of_record=sor,
+            harness_adapters={"cursor": adapter},
+            target_repo=".",
+        )
+        summary = worker.run_cycle(
+            worker_id="w1",
+            target_slot=ExecutionSlot.parse(CURSOR_MEDIUM),
+            dry_run=False,
+        )
+        self.assertEqual(summary.health, "refused")
+        self.assertIsNone(ledger.get_claim("SF-238"))
+        sor.claim_task.assert_not_called()
+        self.assertEqual(adapter.woken_tasks, [])
 
 
 if __name__ == "__main__":

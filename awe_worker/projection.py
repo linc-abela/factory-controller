@@ -28,6 +28,10 @@ NO_EXECUTABLE_TASK = "NO_EXECUTABLE_TASK"
 NO_CURRENT_POINTER = "NO_CURRENT_POINTER"
 SELECTED_TASK_MISMATCH = "SELECTED_TASK_MISMATCH"
 SLOT_CURRENT_AMBIGUOUS = "SLOT_CURRENT_AMBIGUOUS"
+DISPATCH_SLOT_AMBIGUOUS = "DISPATCH_SLOT_AMBIGUOUS"
+INCOMPLETE_EXECUTION_PROFILE = "INCOMPLETE_EXECUTION_PROFILE"
+
+_CANONICAL_PHYSICAL = frozenset({"Queue", "In Progress", "Blocked", "Review", "Processed"})
 
 _ACTIVE_DASHBOARD_CURRENT = frozenset({"Queue", "In Progress", "Blocked", "Review"})
 
@@ -146,10 +150,11 @@ def diagnose_projection(
     pointers = _as_dispatch_list(dispatch)
     findings: list[Finding] = []
 
+    findings.extend(_duplicate_physical_findings(phys))
     phys_by_id = {item.task_id: item for item in phys if item.task_id}
 
     findings.extend(_duplicate_current_findings(dash))
-    findings.extend(_unknown_physical_findings(phys_by_id, dash, pointers))
+    findings.extend(_unknown_physical_findings(phys, dash, pointers))
     findings.extend(_status_mismatch_findings(phys_by_id, dash))
     findings.extend(_model_mismatch_findings(phys_by_id, dash))
     findings.extend(_dispatch_findings(phys_by_id, pointers))
@@ -346,39 +351,81 @@ def _as_dispatch(item: DispatchView | Mapping[str, Any]) -> DispatchView:
 
 
 def _physical_known(physical: PhysicalTask | None) -> bool:
-    return physical is not None and bool(physical.task_id) and bool(physical.canonical_status)
+    if physical is None or not physical.task_id:
+        return False
+    if not physical.lane or physical.canonical_status not in _CANONICAL_PHYSICAL:
+        return False
+    return _exact_slot(physical.execution_profile, physical.lane) is not None
+
+
+def _duplicate_physical_findings(physical: Sequence[PhysicalTask]) -> list[Finding]:
+    findings: list[Finding] = []
+    counts: dict[str, int] = {}
+    for item in physical:
+        if not item.task_id:
+            continue
+        counts[item.task_id] = counts.get(item.task_id, 0) + 1
+    for task_id, count in sorted(counts.items()):
+        if count < 2:
+            continue
+        findings.append(
+            Finding(
+                code=UNKNOWN_PHYSICAL_TRUTH,
+                task_id=task_id,
+                detail=f"{count} physical AWE pages exist for {task_id}; physical truth is ambiguous",
+            )
+        )
+    return findings
 
 
 def _unknown_physical_findings(
-    phys_by_id: Mapping[str, PhysicalTask],
+    physical: Sequence[PhysicalTask],
     dashboard: Sequence[DashboardRow],
     pointers: Sequence[DispatchView],
 ) -> list[Finding]:
     findings: list[Finding] = []
-    seen: set[tuple[str, str, str]] = set()
+    seen: set[tuple[str, ...]] = set()
+    phys_by_id = {item.task_id: item for item in physical if item.task_id}
 
-    def add(code_task: str, lane: str, detail: str) -> None:
-        key = (code_task, lane, detail)
+    def add(code_task: str, lane: str, detail: str, code: str = UNKNOWN_PHYSICAL_TRUTH) -> None:
+        key = (code, code_task, lane, detail)
         if key in seen:
             return
         seen.add(key)
         findings.append(
             Finding(
-                code=UNKNOWN_PHYSICAL_TRUTH,
+                code=code,
                 task_id=code_task,
                 lane=lane,
                 detail=detail,
             )
         )
 
+    for item in physical:
+        if not item.task_id:
+            continue
+        if not _physical_known(item):
+            add(
+                item.task_id,
+                item.lane,
+                "Physical AWE task is missing a parseable lane, lifecycle, or exact execution profile",
+            )
+
     for row in dashboard:
+        if row.current and row.model_effort and _exact_slot(row.model_effort, row.lane) is None:
+            add(
+                row.task_id,
+                row.lane,
+                "Dashboard Current row has a missing or unparseable exact execution profile",
+                INCOMPLETE_EXECUTION_PROFILE,
+            )
         if not row.current:
             continue
         if not row.task_id:
             add("", row.lane, "Dashboard Current row has no Task ID; physical AWE truth is unknown")
             continue
-        physical = phys_by_id.get(row.task_id)
-        if not _physical_known(physical):
+        known = phys_by_id.get(row.task_id)
+        if not _physical_known(known):
             add(
                 row.task_id,
                 row.lane,
@@ -388,6 +435,21 @@ def _unknown_physical_findings(
     for pointer in pointers:
         if not pointer.executable:
             continue
+        if pointer.execution_profile and _exact_slot(pointer.execution_profile, pointer.harness) is None:
+            add(
+                pointer.task_id,
+                pointer.harness,
+                "EXECUTABLE Dispatch pointer has a missing or unparseable exact execution profile",
+                INCOMPLETE_EXECUTION_PROFILE,
+            )
+        expected = canonical_lifecycle_status(pointer.expected_lifecycle_state)
+        if expected not in _CANONICAL_PHYSICAL:
+            add(
+                pointer.task_id,
+                pointer.harness,
+                "EXECUTABLE Dispatch pointer is missing a parseable expected lifecycle",
+                INCOMPLETE_EXECUTION_PROFILE,
+            )
         if not pointer.task_id:
             add(
                 "",
@@ -395,8 +457,8 @@ def _unknown_physical_findings(
                 "Dispatch is EXECUTABLE with no Task ID; physical AWE truth is unknown",
             )
             continue
-        physical = phys_by_id.get(pointer.task_id)
-        if not _physical_known(physical):
+        known = phys_by_id.get(pointer.task_id)
+        if not _physical_known(known):
             add(
                 pointer.task_id,
                 pointer.harness,
@@ -407,21 +469,24 @@ def _unknown_physical_findings(
 
 def _duplicate_current_findings(dashboard: Sequence[DashboardRow]) -> list[Finding]:
     findings: list[Finding] = []
-    by_lane: dict[str, list[DashboardRow]] = {}
+    by_slot: dict[str, list[DashboardRow]] = {}
     for row in dashboard:
         if not row.current:
             continue
-        by_lane.setdefault(_lane_key(row.lane), []).append(row)
-    for lane, rows in sorted(by_lane.items()):
+        slot = _exact_slot(row.model_effort, row.lane)
+        if slot is None:
+            continue
+        by_slot.setdefault(slot.key, []).append(row)
+    for slot_key, rows in sorted(by_slot.items()):
         if len(rows) < 2:
             continue
         ids = ", ".join(sorted(row.task_id or "?" for row in rows))
         findings.append(
             Finding(
                 code=DUPLICATE_DASHBOARD_CURRENT,
-                lane=lane,
+                lane=rows[0].lane,
                 detail=(
-                    f"{len(rows)} Dashboard rows are Current for harness '{lane}' "
+                    f"{len(rows)} Dashboard rows are Current for exact slot '{slot_key}' "
                     f"({ids}); claim is ambiguous"
                 ),
             )
@@ -482,7 +547,11 @@ def _dispatch_findings(
     pointers: Sequence[DispatchView],
 ) -> list[Finding]:
     findings: list[Finding] = []
+    by_slot: dict[str, list[DispatchView]] = {}
     for pointer in pointers:
+        slot = _exact_slot(pointer.execution_profile, pointer.harness)
+        if slot is not None:
+            by_slot.setdefault(slot.key, []).append(pointer)
         if not pointer.executable:
             continue
         physical = phys_by_id.get(pointer.task_id)
@@ -501,7 +570,7 @@ def _dispatch_findings(
                     ),
                 )
             )
-        elif expected and physical.canonical_status != expected:
+        elif expected in _CANONICAL_PHYSICAL and physical.canonical_status != expected:
             findings.append(
                 Finding(
                     code=DISPATCH_PHYSICAL_MISMATCH,
@@ -513,10 +582,28 @@ def _dispatch_findings(
                     ),
                 )
             )
+    for slot_key, slot_pointers in sorted(by_slot.items()):
+        if len(slot_pointers) < 2:
+            continue
+        ids = ", ".join(sorted(pointer.task_id or "?" for pointer in slot_pointers))
+        findings.append(
+            Finding(
+                code=DISPATCH_SLOT_AMBIGUOUS,
+                lane=slot_pointers[0].harness,
+                detail=(
+                    f"{len(slot_pointers)} Dispatch pointers match exact slot '{slot_key}' "
+                    f"({ids}); start/resume grant is ambiguous"
+                ),
+            )
+        )
     return findings
 
 
 def _slot_from_profile(profile: str, harness: str = "") -> ExecutionSlot | None:
+    return _exact_slot(profile, harness)
+
+
+def _exact_slot(profile: str, harness: str = "") -> ExecutionSlot | None:
     text = _norm(profile).replace("→", "->")
     if not text:
         return None
@@ -524,11 +611,11 @@ def _slot_from_profile(profile: str, harness: str = "") -> ExecutionSlot | None:
         if "->" in text:
             return ExecutionSlot.parse(text)
         parts = [p.strip() for p in text.split("/") if p.strip()]
+        if len(parts) >= 3:
+            return ExecutionSlot.parse("/".join(parts[:3]))
         if len(parts) >= 2 and harness:
             return ExecutionSlot.parse(f"{harness}/{parts[0]}/{parts[1]}")
-        if harness and len(parts) >= 3:
-            return ExecutionSlot.parse("/".join(parts[:3]))
-        return ExecutionSlot.parse(text if harness == "" else f"{harness}/{text}")
+        return None
     except ValueError:
         return None
 
@@ -545,9 +632,7 @@ def _row_matches_slot(row: DashboardRow, slot: ExecutionSlot) -> bool:
 def _pointer_matches_slot(pointer: DispatchView, slot: ExecutionSlot) -> bool:
     if _lane_key(pointer.harness) and _lane_key(pointer.harness) != slot.harness:
         return False
-    if not pointer.execution_profile:
-        return _lane_key(pointer.harness) == slot.harness
-    parsed = _slot_from_profile(pointer.execution_profile, pointer.harness or slot.harness)
+    parsed = _exact_slot(pointer.execution_profile, pointer.harness or slot.harness)
     if parsed is None:
         return False
     return parsed.matches(slot)
@@ -582,8 +667,8 @@ def _authorized_pointer_findings(
     phys = tuple(_as_physical(item) for item in (snapshot.get("physical") or ()))
     dash = tuple(_as_dashboard(item) for item in (snapshot.get("dashboard") or ()))
     pointers = _as_dispatch_list(snapshot.get("dispatch"))
-    phys_by_id = {item.task_id: item for item in phys if item.task_id}
-    selected_physical = phys_by_id.get(selected_task_id)
+    selected_matches = [item for item in phys if item.task_id == selected_task_id]
+    selected_physical = selected_matches[0] if len(selected_matches) == 1 else None
     current_rows = [row for row in dash if row.current and _row_matches_slot(row, resolved_slot)]
     slot_pointers = [pointer for pointer in pointers if _pointer_matches_slot(pointer, resolved_slot)]
     executable = [pointer for pointer in slot_pointers if pointer.executable]
@@ -591,6 +676,46 @@ def _authorized_pointer_findings(
         selected_physical is not None
         and selected_physical.canonical_status == "In Progress"
     )
+    expected_lifecycle = "In Progress" if is_resume else "Queue"
+    action = "In Progress resume" if is_resume else "Queue claim"
+
+    if len(selected_matches) != 1 or not _physical_known(selected_physical):
+        findings.append(
+            Finding(
+                code=UNKNOWN_PHYSICAL_TRUTH,
+                task_id=selected_task_id,
+                lane=resolved_slot.harness,
+                detail=f"Selected {selected_task_id} has unknown, duplicate, or incomplete physical AWE truth",
+            )
+        )
+    elif selected_physical is not None:
+        physical_slot = _exact_slot(selected_physical.execution_profile, selected_physical.lane)
+        if _lane_key(selected_physical.lane) != resolved_slot.harness or (
+            physical_slot is None or not physical_slot.matches(resolved_slot)
+        ):
+            findings.append(
+                Finding(
+                    code=SELECTED_TASK_MISMATCH,
+                    task_id=selected_task_id,
+                    lane=resolved_slot.harness,
+                    detail=(
+                        f"Physical profile '{selected_physical.execution_profile}' "
+                        f"does not match slot {resolved_slot.key}"
+                    ),
+                )
+            )
+        elif selected_physical.canonical_status not in {"Queue", "In Progress"}:
+            findings.append(
+                Finding(
+                    code=SELECTED_TASK_MISMATCH,
+                    task_id=selected_task_id,
+                    lane=resolved_slot.harness,
+                    detail=(
+                        f"Physical lifecycle '{selected_physical.status}' cannot be claimed "
+                        f"or resumed for slot {resolved_slot.key}"
+                    ),
+                )
+            )
 
     if len(current_rows) > 1:
         ids = ", ".join(sorted(row.task_id or "?" for row in current_rows))
@@ -629,20 +754,34 @@ def _authorized_pointer_findings(
                 ),
             )
         )
-
-    if is_resume:
-        if executable and executable[0].task_id != selected_task_id:
+    elif current_rows:
+        current_status = current_rows[0].canonical_status
+        if current_status != expected_lifecycle:
             findings.append(
                 Finding(
-                    code=SELECTED_TASK_MISMATCH,
+                    code=DASHBOARD_STATUS_MISMATCH,
                     task_id=selected_task_id,
                     lane=resolved_slot.harness,
                     detail=(
-                        f"In Progress resume {selected_task_id} disagrees with EXECUTABLE "
-                        f"Dispatch pointer {executable[0].task_id}"
+                        f"Dashboard Current status '{current_rows[0].status}' is not "
+                        f"{expected_lifecycle} for this {action}"
                     ),
                 )
             )
+
+    if len(slot_pointers) > 1:
+        ids = ", ".join(sorted(pointer.task_id or "?" for pointer in slot_pointers))
+        findings.append(
+            Finding(
+                code=DISPATCH_SLOT_AMBIGUOUS,
+                task_id=selected_task_id,
+                lane=resolved_slot.harness,
+                detail=(
+                    f"{len(slot_pointers)} Dispatch pointers match slot {resolved_slot.key} "
+                    f"({ids})"
+                ),
+            )
+        )
         return findings
 
     if not executable:
@@ -653,7 +792,7 @@ def _authorized_pointer_findings(
                 lane=resolved_slot.harness,
                 detail=(
                     f"Dispatch is NO_EXECUTABLE_TASK for slot {resolved_slot.key}; "
-                    "Queue claim is not authorized"
+                    f"{action} is not authorized"
                 ),
             )
         )
@@ -672,8 +811,17 @@ def _authorized_pointer_findings(
                 ),
             )
         )
-    parsed_pointer = _slot_from_profile(pointer.execution_profile, pointer.harness)
-    if pointer.execution_profile and parsed_pointer is not None and not parsed_pointer.matches(resolved_slot):
+    parsed_pointer = _exact_slot(pointer.execution_profile, pointer.harness)
+    if parsed_pointer is None:
+        findings.append(
+            Finding(
+                code=INCOMPLETE_EXECUTION_PROFILE,
+                task_id=selected_task_id,
+                lane=resolved_slot.harness,
+                detail="EXECUTABLE Dispatch pointer is missing a parseable exact execution profile",
+            )
+        )
+    elif not parsed_pointer.matches(resolved_slot):
         findings.append(
             Finding(
                 code=SELECTED_TASK_MISMATCH,
@@ -682,6 +830,28 @@ def _authorized_pointer_findings(
                 detail=(
                     f"EXECUTABLE Dispatch profile '{pointer.execution_profile}' "
                     f"does not match slot {resolved_slot.key}"
+                ),
+            )
+        )
+    expected = canonical_lifecycle_status(pointer.expected_lifecycle_state)
+    if expected not in _CANONICAL_PHYSICAL:
+        findings.append(
+            Finding(
+                code=INCOMPLETE_EXECUTION_PROFILE,
+                task_id=selected_task_id,
+                lane=resolved_slot.harness,
+                detail="EXECUTABLE Dispatch pointer is missing a parseable expected lifecycle",
+            )
+        )
+    elif expected != expected_lifecycle:
+        findings.append(
+            Finding(
+                code=DISPATCH_PHYSICAL_MISMATCH,
+                task_id=selected_task_id,
+                lane=resolved_slot.harness,
+                detail=(
+                    f"EXECUTABLE Dispatch expected '{pointer.expected_lifecycle_state}' "
+                    f"but {action} requires '{expected_lifecycle}'"
                 ),
             )
         )
