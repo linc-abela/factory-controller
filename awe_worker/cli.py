@@ -31,6 +31,7 @@ from .notion import (
     NotionSourceOfRecord,
 )
 from .observation import AWEObservationService, DirectoryTaskSource, NotionTaskSource
+from .projection import diagnose_snapshot, diagnose_snapshot_path
 from .reconciliation import TurnCadenceReconciler
 from .scheduler import AWEScheduledRunner
 from .worker import AWEAutonomousWorker
@@ -149,7 +150,22 @@ def main(argv: list[str] | None = None) -> int:
     # status
     subparsers.add_parser("status", help="Show worker ledger health, active claims, and liveness")
 
+    # diagnose-projection (read-only; never claims or writes)
+    diag_p = subparsers.add_parser(
+        "diagnose-projection",
+        help="Read-only AWE vs Dashboard vs Dispatch drift check (fail-closed)",
+    )
+    diag_p.add_argument(
+        "--snapshot",
+        required=True,
+        help="JSON snapshot path, or '-' for stdin. Never mutates Notion/GitHub.",
+    )
+
     args = parser.parse_args(argv)
+
+    if args.command == "diagnose-projection":
+        return _run_diagnose_projection(args.snapshot)
+
     ledger = AWELedger(args.db)
 
     if args.command == "observe":
@@ -329,6 +345,21 @@ def main(argv: list[str] | None = None) -> int:
         return 0
 
     return 0
+
+
+def _run_diagnose_projection(snapshot: str) -> int:
+    if snapshot == "-":
+        payload = json.load(sys.stdin)
+        if not isinstance(payload, dict):
+            print("snapshot must be a JSON object", file=sys.stderr)
+            return 2
+        report = diagnose_snapshot(payload)
+    else:
+        report = diagnose_snapshot_path(snapshot)
+    json.dump(report.as_dict(), sys.stdout, indent=2)
+    print()
+    print(report.as_text(), file=sys.stderr)
+    return 0 if report.ok else 1
 
 
 if __name__ == "__main__":
