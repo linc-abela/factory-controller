@@ -35,6 +35,7 @@ from .model import (
 )
 from .notion import NotionClient, NotionSourceOfRecord
 from .observation import AWEObservationService, MemoryTaskSource, TaskSource
+from .projection import evaluate_claim_preflight
 from .reconciliation import TurnCadenceReconciler
 
 
@@ -53,6 +54,7 @@ class AWEAutonomousWorker:
         target_repo: str | Path | None = None,
         source_of_record: NotionSourceOfRecord | None = None,
         cadence_coordinator: CadenceContinuationCoordinator | None = None,
+        projection_snapshot: Mapping[str, Any] | None = None,
     ) -> None:
         self.ledger = ledger
         self.observation = AWEObservationService(source)
@@ -68,6 +70,7 @@ class AWEAutonomousWorker:
             if nc.is_configured:
                 source_of_record = NotionSourceOfRecord(client=nc)
         self.source_of_record = source_of_record
+        self.projection_snapshot = projection_snapshot
 
         self.cadence = cadence_coordinator or CadenceContinuationCoordinator(
             reconciler=self.reconciler,
@@ -83,6 +86,19 @@ class AWEAutonomousWorker:
         if harness_adapters:
             default_adapters.update(harness_adapters)
         self.adapters = default_adapters
+
+    def _projection_preflight(self, selected_task_id: str, slot: ExecutionSlot):
+        """Fail closed before any local or source-of-record claim."""
+        snapshot = self.projection_snapshot
+        if snapshot is None:
+            provider = getattr(self.observation.source, "projection_snapshot", None)
+            if callable(provider):
+                snapshot = provider()
+        return evaluate_claim_preflight(
+            snapshot,
+            selected_task_id=selected_task_id,
+            slot=slot,
+        )
 
     def run_cycle(
         self,
@@ -133,6 +149,22 @@ class AWEAutonomousWorker:
             )
 
         task = eligible_tasks[0]
+
+        preflight = self._projection_preflight(task.task_id, target_slot)
+        if not preflight.ok:
+            return CycleSummary(
+                worker_id=worker_id,
+                cycle_id=cycle_id,
+                observed_tasks=len(all_tasks),
+                claimed_task=None,
+                grounding_source=None,
+                wake_receipt=None,
+                completion_report=None,
+                gate_decision=None,
+                escalation=None,
+                health="refused",
+                detail=f"PROJECTION_FAIL_CLOSED: {preflight.as_text()}",
+            )
 
         if dry_run:
             grounding = self.grounder.ground_task(repo_path=self.target_repo, task=task)
