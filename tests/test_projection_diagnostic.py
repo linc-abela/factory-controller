@@ -1109,5 +1109,157 @@ class AuthorizedPointerBindingTests(unittest.TestCase):
         self.assertEqual(adapter.woken_tasks, [])
 
 
+def _rich(text: str) -> list[dict]:
+    return [{"plain_text": text}]
+
+
+def _select(name: str) -> dict:
+    return {"select": {"name": name}}
+
+
+def _paragraph(text: str) -> dict:
+    return {
+        "id": f"block-{abs(hash(text)) % 10_000}",
+        "type": "paragraph",
+        "paragraph": {"rich_text": _rich(text)},
+    }
+
+
+def _heading(text: str) -> dict:
+    return {
+        "id": f"heading-{abs(hash(text)) % 10_000}",
+        "type": "heading_2",
+        "heading_2": {"rich_text": _rich(text)},
+    }
+
+
+class LivePhysicalProfileIndependenceTests(unittest.TestCase):
+    """Frozen blocker #3: live physical profile must not come from Dashboard."""
+
+    TASK_PAGE_ID = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"
+    CURSOR_QUEUE = "3d1690f6-eb14-819a-88b4-c0c020d0f75b"
+    WRONG_PROFILE = "Cursor → Grok 4.6 / High"
+
+    def _dashboard_row(self) -> dict:
+        return {
+            "id": "dash-sf-238",
+            "properties": {
+                "Task ID": {"rich_text": _rich("SF-238")},
+                "Task": {"title": _rich("SF-238 — diagnostic")},
+                "Status": _select("Queue"),
+                "Lane": _select("Cursor"),
+                "Effort": _select("High"),
+                "Model / Effort": {"rich_text": _rich(self.WRONG_PROFILE)},
+                "Task Page": {
+                    "url": f"https://app.notion.com/p/{self.TASK_PAGE_ID.replace('-', '')}"
+                },
+                "Current": {"checkbox": True},
+                "Needs Owner": {"checkbox": False},
+            },
+        }
+
+    def _children(self, page_id: str, **_kwargs) -> dict:
+        from awe_worker.dispatch import DISPATCH_PAGE_IDS
+
+        if page_id == DISPATCH_PAGE_IDS["cursor"]:
+            return {
+                "results": [
+                    _paragraph("## Current pointer"),
+                    _paragraph("- Dispatch state: `EXECUTABLE`"),
+                    _paragraph("- Task ID: `SF-238`"),
+                    _paragraph(f"- Execution profile: `{self.WRONG_PROFILE}`"),
+                    _paragraph("- Expected lifecycle state: `Queue`"),
+                    _paragraph(
+                        f'- Task page: <mention-page url="https://app.notion.com/p/{self.TASK_PAGE_ID.replace("-", "")}"/>'
+                    ),
+                ]
+            }
+        if page_id == self.TASK_PAGE_ID:
+            return {
+                "results": [
+                    _heading("Execution profile"),
+                    _paragraph(f"**{CURSOR_PROFILE}**"),
+                    _heading("Objective"),
+                    _paragraph("Do not copy Dashboard profile onto physical truth."),
+                ]
+            }
+        return {"results": []}
+
+    def test_wrong_dashboard_and_dispatch_profile_cannot_fabricate_physical_agreement(self):
+        from awe_worker.notion import LiveNotionTaskSource
+        from awe_worker.projection import DASHBOARD_MODEL_MISMATCH
+
+        mock_client = MagicMock()
+        mock_client.is_configured = True
+        mock_client.query_database.return_value = {
+            "results": [self._dashboard_row()],
+            "has_more": False,
+        }
+        mock_client.retrieve_page.return_value = {
+            "id": self.TASK_PAGE_ID,
+            "parent": {"type": "page_id", "page_id": self.CURSOR_QUEUE},
+        }
+        mock_client.retrieve_block_children.side_effect = self._children
+
+        snapshot = LiveNotionTaskSource(client=mock_client).projection_snapshot()
+        physical = snapshot["physical"]
+        dashboard = snapshot["dashboard"]
+        self.assertEqual(len(physical), 1)
+        self.assertEqual(physical[0]["execution_profile"], CURSOR_PROFILE)
+        self.assertEqual(dashboard[0]["model_effort"], self.WRONG_PROFILE)
+        self.assertNotEqual(
+            physical[0]["execution_profile"],
+            dashboard[0]["model_effort"],
+        )
+        cursor_dispatch = next(
+            item for item in snapshot["dispatch"] if item["harness"] == "cursor"
+        )
+        self.assertEqual(cursor_dispatch["execution_profile"], self.WRONG_PROFILE)
+
+        report = diagnose_snapshot(snapshot)
+        self.assertEqual(report.verdict, FAIL_CLOSED)
+        self.assertIn(DASHBOARD_MODEL_MISMATCH, {finding.code for finding in report.findings})
+
+        claim = evaluate_claim_preflight(
+            snapshot,
+            selected_task_id="SF-238",
+            slot=CURSOR_MEDIUM,
+        )
+        self.assertEqual(claim.verdict, FAIL_CLOSED)
+
+        task = AWEWorkItem(
+            task_id="SF-238",
+            title="SF-238",
+            lane="Cursor",
+            role="Main Developer",
+            status="Queue",
+            model="Grok 4.6",
+            effort="Medium",
+            sequence=238,
+            task_page_id=self.TASK_PAGE_ID,
+        )
+        source = MemoryTaskSource([task], projection_snapshot=snapshot)
+        ledger = AWELedger(":memory:")
+        sor = MagicMock()
+        adapter = MockHarnessAdapter("cursor")
+        worker = AWEAutonomousWorker(
+            ledger=ledger,
+            source=source,
+            source_of_record=sor,
+            harness_adapters={"cursor": adapter},
+            target_repo=".",
+        )
+        summary = worker.run_cycle(
+            worker_id="w1",
+            target_slot=ExecutionSlot.parse(CURSOR_MEDIUM),
+            dry_run=False,
+        )
+        self.assertEqual(summary.health, "refused")
+        self.assertIsNone(ledger.get_claim("SF-238"))
+        sor.claim_task.assert_not_called()
+        self.assertEqual(adapter.woken_tasks, [])
+        mock_client.update_page.assert_not_called()
+
+
 if __name__ == "__main__":
     unittest.main()

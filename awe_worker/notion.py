@@ -114,6 +114,44 @@ def resolve_physical_folder_status(parent_id: str, lane: str = "") -> str | None
     return None
 
 
+def parse_physical_execution_profile(text: str) -> str:
+    """Parse an execution profile from physical task-page text only.
+
+    Missing or unparseable values return empty so callers fail closed.
+    Dashboard/Dispatch text is never an input here.
+    """
+    if not text or not str(text).strip():
+        return ""
+    heading = re.search(
+        r"(?im)^(?:#+\s*)?execution profile\s*[:\-]?\s*(.*)$",
+        text,
+    )
+    if heading is None:
+        return ""
+    same_line = heading.group(1).strip().strip("*").strip("`").strip()
+    candidates: list[str] = []
+    if same_line:
+        candidates.append(same_line)
+    else:
+        for line in text[heading.end() :].splitlines():
+            stripped = line.strip().strip("*").strip("`").strip()
+            if not stripped:
+                continue
+            if stripped.startswith("#"):
+                break
+            candidates.append(stripped)
+            break
+    for candidate in candidates:
+        if not candidate or candidate.lower() in {"none", "n/a"}:
+            return ""
+        try:
+            ExecutionSlot.parse(candidate)
+        except ValueError:
+            return ""
+        return candidate
+    return ""
+
+
 def get_lane_folder_id(lane: str, status_name: str) -> str | None:
     """Get physical folder UUID for a given harness lane and lifecycle status."""
     l_key = lane.lower() if lane else "antigravity"
@@ -317,6 +355,35 @@ class LiveNotionTaskSource:
         if phys_status != task.status:
             return dataclasses.replace(task, status=phys_status)
         return task
+
+    def read_physical_execution_profile(self, task_page_id: str) -> str:
+        """Read execution profile from the physical task page, never Dashboard."""
+        if not self.client.is_configured or not task_page_id:
+            return ""
+        try:
+            from .dispatch import _block_plain_text
+
+            parts: list[str] = []
+            cursor: str | None = None
+            while True:
+                resp = self.client.retrieve_block_children(
+                    task_page_id, page_size=100, start_cursor=cursor
+                )
+                children = resp.get("results") if isinstance(resp, dict) else None
+                if isinstance(children, list):
+                    parts.extend(
+                        _block_plain_text(block)
+                        for block in children
+                        if isinstance(block, Mapping)
+                    )
+                if not isinstance(resp, dict) or not resp.get("has_more") or not resp.get("next_cursor"):
+                    break
+                cursor = str(resp["next_cursor"])
+        except NotionAPIError:
+            return ""
+        except Exception:
+            return ""
+        return parse_physical_execution_profile("\n".join(parts))
 
     def fetch_tasks(self, filter_status: str | None = None) -> list[AWEWorkItem]:
         """Fetch all pages from Notion AWE database, handling pagination and physical ancestry."""
@@ -552,7 +619,9 @@ class LiveNotionTaskSource:
                         "task_id": verified.task_id,
                         "lane": verified.lane,
                         "status": verified.status,
-                        "execution_profile": profile,
+                        "execution_profile": self.read_physical_execution_profile(
+                            verified.task_page_id
+                        ),
                     }
                 )
 
