@@ -3,11 +3,15 @@
 from __future__ import annotations
 
 import os
+import sys
 import tempfile
+import time
 import unittest
+from pathlib import Path
 from unittest.mock import patch
 
 from awe_worker.cli import _resolve_task_source
+from awe_worker.credentials import MemorySecretStore, set_default_secret_store
 from awe_worker.dispatch import (
     DispatchPointer,
     HeadlessDispatchResolver,
@@ -276,31 +280,83 @@ class LiveSourceSafetyTests(unittest.TestCase):
 
 class ServiceLifecycleTests(unittest.TestCase):
     def test_install_is_idempotent_and_does_not_start_a_process_or_store_tokens(self):
-        with patch.dict(os.environ, {"NOTION_TOKEN": ""}, clear=False):
-            with tempfile.TemporaryDirectory() as tmp:
-                service = ContinuationService(
-                    db_path="/tmp/sf263-worker.db",
-                    state_dir=tmp,
+        from awe_worker.credentials import MemorySecretStore, set_default_secret_store
+
+        set_default_secret_store(MemorySecretStore())
+        try:
+            with patch.dict(os.environ, {"NOTION_TOKEN": ""}, clear=False):
+                with tempfile.TemporaryDirectory() as tmp:
+                    service = ContinuationService(
+                        db_path="/tmp/sf263-worker.db",
+                        state_dir=tmp,
+                    )
+                    command = ["python", "-m", "awe_worker.cli", "supervisor", "run", "--live"]
+                    first = service.install(
+                        command,
+                        working_dir=tmp,
+                        interval_seconds=10,
+                        apply=True,
+                        now=1.0,
+                    )
+                    second = service.install(
+                        command,
+                        working_dir=tmp,
+                        interval_seconds=10,
+                        apply=True,
+                        now=2.0,
+                    )
+                    self.assertEqual(first["outcome"], "installed")
+                    self.assertEqual(second["outcome"], "unchanged")
+                    self.assertFalse(service.status()["pid"])
+                    manifest_text = service.manifest_path.read_text()
+                    self.assertNotIn("NOTION_TOKEN", manifest_text)
+                    self.assertNotIn("secret_", manifest_text)
+                    self.assertIn("env_then_keychain", manifest_text)
+                    self.assertEqual(
+                        first["manifest"]["credential_provider"],
+                        "env_then_keychain",
+                    )
+                    self.assertNotIn("secret", first["credential"])
+                    self.assertFalse(first["credential"]["configured"])
+        finally:
+            set_default_secret_store(None)
+
+    def test_duplicate_start_remains_fenced_and_does_not_rewrite_credentials(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = MemorySecretStore(initial="keep-me")
+            set_default_secret_store(store)
+            try:
+                service = ContinuationService(db_path=str(Path(tmp) / "w.db"), state_dir=tmp)
+                service.install(
+                    [sys.executable, "-c", "import time; time.sleep(30)"],
+                    working_dir=tmp,
+                    interval_seconds=1,
+                    apply=True,
                 )
-                command = ["python", "-m", "awe_worker.cli", "supervisor", "run", "--live"]
-                first = service.install(
-                    command,
+                first = service.start()
+                second = service.start()
+                self.assertTrue(first["ok"], first)
+                self.assertEqual(second["code"], "SERVICE_ALREADY_RUNNING")
+                self.assertEqual(store.get()[0], "keep-me")
+                service.stop()
+                pid = int(first.get("pid") or 0)
+                deadline = time.monotonic() + 2
+                while pid and service._pid_alive(pid) and time.monotonic() < deadline:
+                    time.sleep(0.05)
+            finally:
+                set_default_secret_store(None)
+
+    def test_install_refuses_notion_token_argv(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            service = ContinuationService(db_path="/tmp/sf267-worker.db", state_dir=tmp)
+            with self.assertRaises(Exception) as raised:
+                service.install(
+                    ["python", "-m", "awe_worker.cli", "--notion-token", "should-not-be-here"],
                     working_dir=tmp,
                     interval_seconds=10,
                     apply=True,
-                    now=1.0,
                 )
-                second = service.install(
-                    command,
-                    working_dir=tmp,
-                    interval_seconds=10,
-                    apply=True,
-                    now=2.0,
-                )
-                self.assertEqual(first["outcome"], "installed")
-                self.assertEqual(second["outcome"], "unchanged")
-                self.assertFalse(service.status()["pid"])
-                self.assertNotIn("NOTION_TOKEN", service.manifest_path.read_text())
+            self.assertIn("notion-token", str(raised.exception))
 
 
 if __name__ == "__main__":

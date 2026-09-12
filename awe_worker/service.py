@@ -16,6 +16,8 @@ import time
 from pathlib import Path
 from typing import Any, Sequence
 
+from .credentials import credential_status, manifest_credential_metadata
+
 SERVICE_SCHEMA = "factory-controller/awe-continuation-service/1.0"
 
 
@@ -59,6 +61,8 @@ class ContinuationService:
             raise ServiceError(f"working directory does not exist: {working}")
         if interval_seconds < 0:
             raise ServiceError("interval_seconds cannot be negative")
+        if any(part == "--notion-token" or part.startswith("--notion-token=") for part in command):
+            raise ServiceError("service command must not carry --notion-token")
         manifest = {
             "schema_version": SERVICE_SCHEMA,
             "worker_id": self.worker_id,
@@ -68,6 +72,7 @@ class ContinuationService:
             "interval_seconds": interval_seconds,
             "pid_path": str(self.pid_path),
             "log_path": str(self.log_path),
+            **manifest_credential_metadata(),
         }
         existing = self._read_manifest()
         unchanged = bool(
@@ -82,6 +87,7 @@ class ContinuationService:
             "pid_path": str(self.pid_path),
             "log_path": str(self.log_path),
             "manifest": manifest,
+            "credential": credential_status().as_dict(),
             "outcome": "unchanged" if unchanged else "planned",
             "applied": False,
             "starts_process": False,
@@ -137,6 +143,8 @@ class ContinuationService:
         self.state_dir.mkdir(parents=True, exist_ok=True)
         try:
             log = self.log_path.open("a", encoding="utf-8")
+            # Inherit the caller environment for PATH/debug, but never inject a
+            # resolved secret. The child re-reads env or the Factory Keychain.
             process = subprocess.Popen(
                 command,
                 cwd=working_dir,
@@ -144,6 +152,7 @@ class ContinuationService:
                 stdout=log,
                 stderr=subprocess.STDOUT,
                 start_new_session=True,
+                env=os.environ.copy(),
             )
         except (OSError, ValueError) as exc:
             try:
@@ -222,6 +231,10 @@ class ContinuationService:
             "service_state": "running" if running else "stopped",
             "pid": pid if running else None,
             "installed_command": manifest.get("command") if manifest else None,
+            "credential": credential_status().as_dict(),
+            "credential_provider": (
+                manifest.get("credential_provider") if manifest else None
+            ),
         }
 
     def _read_manifest(self) -> dict[str, Any] | None:

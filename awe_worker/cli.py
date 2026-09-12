@@ -3,12 +3,14 @@
 from __future__ import annotations
 
 import argparse
+import getpass
 import json
 import os
 import sys
 from pathlib import Path
 
 from .cadence import CadenceContinuationCoordinator
+from .credentials import CredentialError, credential_status, store_host_credential
 from .detector import CompletionDetector
 from .grounding import ContextBrokerGrounder
 from .harness import (
@@ -203,6 +205,18 @@ def main(argv: list[str] | None = None) -> int:
     )
     sup_status_p.add_argument("--state-dir", default=None)
     sup_status_p.add_argument("--worker-id", default="awe-continuation-1")
+    cred_status_p = supervisor_actions.add_parser(
+        "credentials-status",
+        help="Show whether a Factory Notion credential is configured (never prints the secret)",
+    )
+    cred_status_p.add_argument("--state-dir", default=None)
+    cred_status_p.add_argument("--worker-id", default="awe-continuation-1")
+    cred_set_p = supervisor_actions.add_parser(
+        "credentials-set",
+        help="Store a Notion token in the Factory Keychain from a hidden prompt or stdin",
+    )
+    cred_set_p.add_argument("--state-dir", default=None)
+    cred_set_p.add_argument("--worker-id", default="awe-continuation-1")
     for action, help_text in (
         ("install", "Install the one-service continuation manifest"),
         ("start", "Start the installed continuation service"),
@@ -250,6 +264,10 @@ def main(argv: list[str] | None = None) -> int:
                 state_dir=args.state_dir,
                 worker_id=args.worker_id,
             )
+        if args.supervisor_action == "credentials-status":
+            return _run_credentials_status()
+        if args.supervisor_action == "credentials-set":
+            return _run_credentials_set()
         if args.supervisor_action in {"install", "start", "stop", "restart"}:
             return _run_continuation_service(args)
         return _run_continuation_supervisor(args)
@@ -632,6 +650,38 @@ def _run_continuation_service(args: argparse.Namespace) -> int:
         result = service.restart()
     print(json.dumps(result, sort_keys=True, indent=2))
     return 0 if result.get("ok", True) else 1
+
+
+def _read_secret_from_operator() -> str:
+    """Read a token from a hidden prompt or stdin. Never echo it."""
+    if sys.stdin.isatty():
+        return getpass.getpass("Notion token (input hidden): ")
+    return sys.stdin.read()
+
+
+def _run_credentials_status() -> int:
+    payload = {"ok": True, **credential_status().as_dict()}
+    json.dump(payload, sys.stdout, indent=2, sort_keys=True)
+    print()
+    return 0 if payload["configured"] else 2
+
+
+def _run_credentials_set() -> int:
+    try:
+        secret = _read_secret_from_operator()
+        result = store_host_credential(secret)
+    except CredentialError as exc:
+        json.dump(
+            {"ok": False, "code": exc.code, "detail": exc.detail},
+            sys.stdout,
+            indent=2,
+            sort_keys=True,
+        )
+        print()
+        return 2
+    json.dump({"ok": True, **result.as_dict()}, sys.stdout, indent=2, sort_keys=True)
+    print()
+    return 0
 
 
 def _run_continuation_status(

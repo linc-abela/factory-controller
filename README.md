@@ -104,11 +104,18 @@ activate downstream work; Factory integration authority remains the checkpoint
 that makes a downstream Queue executable.
 
 Use the one service lifecycle below. `install` is a plan unless `--apply` is
-given, and the manifest stores no Notion or Cursor credential. `NOTION_TOKEN`
-or `NOTION_API_KEY` must be supplied through the runtime environment when the
-service starts.
+given. The manifest stores only a non-secret credential-provider selector
+(`env_then_keychain`) and never a Notion or Cursor token. Interactive runs may
+still supply `NOTION_TOKEN` or `NOTION_API_KEY` in the process environment.
+Unattended start/restart resolve the same credential from the Factory macOS
+Keychain item `factory-controller.notion` / `awe-continuation` inside the
+child process. Missing or unreadable credentials fail closed as
+`NOTION_NOT_CONFIGURED` (or `KEYCHAIN_UNREADABLE` / `KEYCHAIN_MALFORMED`) with
+zero claims and zero wakes.
 
 ```sh
+./dev awe-worker --db awe_worker.db supervisor credentials-status
+printf '%s' "$NOTION_TOKEN" | ./dev awe-worker --db awe_worker.db supervisor credentials-set
 ./dev awe-worker --db awe_worker.db supervisor install --repo "$PWD"
 ./dev awe-worker --db awe_worker.db supervisor install --repo "$PWD" --apply
 ./dev awe-worker --db awe_worker.db supervisor start
@@ -116,6 +123,9 @@ service starts.
 ./dev awe-worker --db awe_worker.db supervisor stop
 ./dev awe-worker --db awe_worker.db supervisor restart
 ```
+
+`credentials-set` reads the token from a hidden prompt or stdin and never
+echoes it. It is a one-time host setup, not a per-task or per-restart step.
 
 For a one-time Cursor setup, authenticate its CLI interactively and verify
 `cursor agent status`. If authentication is unavailable, the worker records

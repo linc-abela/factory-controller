@@ -17,6 +17,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Mapping, Sequence
 
+from .credentials import resolve_notion_credential
 from .model import AWEStatus, AWEWorkItem, ExecutionSlot
 
 DEFAULT_AWE_DATABASE_ID = "91e1d4f0-9caf-4eae-9978-574f0af0930f"
@@ -35,17 +36,13 @@ class NotionAPIError(RuntimeError):
 
 
 def resolve_notion_token(token: str | None = None) -> str:
-    """Resolve Notion authentication token strictly from environment or argument.
+    """Resolve a Notion token from argument, process env, or Factory Keychain.
 
     Never inspects or scavenges another agent harness's configuration files,
-    tokens, or credential stores.
+    MCP connectors, or credential stores. Missing/unreadable credentials
+    return an empty string so callers fail closed as ``NOTION_NOT_CONFIGURED``.
     """
-    if token and token.strip():
-        return token.strip()
-    env_token = os.environ.get("NOTION_TOKEN") or os.environ.get("NOTION_API_KEY")
-    if env_token and env_token.strip():
-        return env_token.strip()
-    return ""
+    return resolve_notion_credential(token).secret
 
 
 AWE_ROOT_PAGE_ID = "3c5690f6-eb14-81cc-810e-e9ffaa1dc3e5"
