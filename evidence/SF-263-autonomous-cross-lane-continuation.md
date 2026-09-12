@@ -6,7 +6,7 @@
 
 **Base:** `76645ff1a3daec96739e142affcae158e6af8ce3`
 
-**Implementation head:** `64c4f0baf66969a5cdbc09b390e99301a45974b1`
+**Implementation head:** `2168bf25888e578dd4c0aa3e0fee683c23cf5290`
 
 ## Root cause
 
@@ -46,13 +46,13 @@ All project commands ran in the configured repository container.
 
 ```text
 ./dev test
-Ran 1758 tests in 207.789s
+Ran 1759 tests in 253.650s
 OK (skipped=6)
 
 docker compose run --rm controller python -m unittest \
   tests.test_awe_continuation tests.test_awe_worker \
   tests.test_projection_diagnostic tests.test_supervisor_activation
-Ran 127 tests in 1.020s
+Ran 128 tests in 1.236s
 OK
 ```
 
