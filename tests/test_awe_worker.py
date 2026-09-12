@@ -993,8 +993,13 @@ class NoCredentialScavengingTests(unittest.TestCase):
             self.assertEqual(resolve_notion_token(), "env-token")
 
         # 3. If neither provided, returns empty string without reading files
-        with patch.dict(os.environ, {}, clear=True):
-            self.assertEqual(resolve_notion_token(), "")
+        from awe_worker.credentials import MemorySecretStore, set_default_secret_store
+        set_default_secret_store(MemorySecretStore())
+        try:
+            with patch.dict(os.environ, {}, clear=True):
+                self.assertEqual(resolve_notion_token(), "")
+        finally:
+            set_default_secret_store(None)
 
 
 class CLIContractTests(unittest.TestCase):
