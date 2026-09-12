@@ -16,7 +16,7 @@ from awe_worker.dispatch import (
 from awe_worker.ledger import AWELedger
 from awe_worker.model import AWEWorkItem, CompletionReport, CycleSummary, ExecutionSlot, WakeReceipt
 from awe_worker.notion import AWE_LANE_FOLDERS, parse_physical_execution_profile
-from awe_worker.scheduler import AWEScheduledRunner
+from awe_worker.scheduler import AWEContinuationSupervisor, AWEScheduledRunner
 from awe_worker.service import ContinuationService
 from awe_worker.harness import MockHarnessAdapter
 from awe_worker.harness import CursorHarnessAdapter
@@ -112,9 +112,11 @@ class SequenceProvider:
 
 
 class FakeWorker:
-    def __init__(self, ledger: AWELedger, settled_key: str):
+    def __init__(self, ledger: AWELedger, settled_key: str = "", settled_keys=None):
         self.ledger = ledger
-        self.settled_key = settled_key
+        self.settled_keys = set(settled_keys or ())
+        if settled_key:
+            self.settled_keys.add(settled_key)
         self.calls = []
 
     def run_cycle(self, worker_id, target_slot, dry_run=False):
@@ -125,7 +127,7 @@ class FakeWorker:
             slot_key=target_slot.key,
         )
         completion = None
-        if target_slot.key == self.settled_key:
+        if target_slot.key in self.settled_keys:
             completion = CompletionReport(state="DONE", task_id="SF-263")
         return CycleSummary(
             worker_id=worker_id,
@@ -143,6 +145,31 @@ class FakeWorker:
 
 
 class ContinuationSupervisorTests(unittest.TestCase):
+    def test_cross_lane_happy_path_reenters_without_owner_command(self):
+        cursor = ExecutionSlot("cursor", "grok-4.6", "high")
+        codex = ExecutionSlot("codex", "gpt-5.6-luna", "max")
+        antigravity = ExecutionSlot("antigravity", "gemini-3.8-flash", "high")
+        # The changing observations model an upstream integration checkpoint
+        # publishing the next exact Dispatch binding after each ACCEPT.  The
+        # supervisor only re-observes and wakes; no Owner command is involved.
+        provider = SequenceProvider([[cursor], [codex], [antigravity], []])
+        worker = FakeWorker(
+            AWELedger(":memory:"),
+            settled_keys={cursor.key, codex.key, antigravity.key},
+        )
+        runner = AWEContinuationSupervisor(
+            worker=worker,
+            worker_id="happy-path-test",
+            slot_provider=provider,
+            settlement_rechecks=1,
+        )
+
+        summaries = runner.run(interval_seconds=0, max_cycles=2, dry_run=False)
+
+        self.assertEqual(worker.calls, [cursor.key, codex.key, antigravity.key])
+        self.assertEqual([summary.claimed_task for summary in summaries], ["SF-263"] * 3)
+        self.assertEqual(provider.calls, 4)
+
     def test_one_poll_handles_multiple_slots_and_one_settlement_recheck(self):
         first = ExecutionSlot("codex", "gpt-5.6-luna", "max")
         second = ExecutionSlot("antigravity", "gemini-3.8-flash", "high")

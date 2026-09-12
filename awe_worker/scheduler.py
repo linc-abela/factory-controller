@@ -118,6 +118,7 @@ class LiveDispatchSlotProvider:
     def observe_slots(self) -> tuple[ExecutionSlot, ...]:
         slots: list[ExecutionSlot] = []
         slot_keys: set[str] = set()
+        ambiguous_keys: set[str] = set()
         self.last_observed_at = time.time()
         self.last_errors = {}
         self.last_states = {}
@@ -134,11 +135,14 @@ class LiveDispatchSlotProvider:
                     if slot.harness != harness.lower():
                         self.last_errors[harness] = "EXECUTION_PROFILE_HARNESS_MISMATCH"
                         continue
+                    if slot.key in ambiguous_keys:
+                        continue
                     if slot.key in slot_keys:
                         self.last_errors[harness] = "DISPATCH_SLOT_AMBIGUOUS"
                         self.last_states[harness] = "stale"
                         slots = [candidate for candidate in slots if candidate.key != slot.key]
                         slot_keys.discard(slot.key)
+                        ambiguous_keys.add(slot.key)
                         continue
                     slot_keys.add(slot.key)
                     slots.append(slot)
