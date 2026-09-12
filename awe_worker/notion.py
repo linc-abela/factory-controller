@@ -123,24 +123,48 @@ def parse_physical_execution_profile(text: str) -> str:
     if not text or not str(text).strip():
         return ""
     heading = re.search(
-        r"(?im)^(?:#+\s*)?execution profile\s*[:\-]?\s*(.*)$",
+        r"(?im)^[ \t]*(?:[-*+][ \t]*)?(?:#+[ \t]*)?(?:\*\*)?execution profile"
+        r"(?:\*\*)?[ \t]*[:\-]?[ \t]*(.*)$",
         text,
     )
     if heading is None:
         return ""
-    same_line = heading.group(1).strip().strip("*").strip("`").strip()
+    same_line = _clean_profile_value(heading.group(1))
     candidates: list[str] = []
     if same_line:
         candidates.append(same_line)
     else:
-        for line in text[heading.end() :].splitlines():
-            stripped = line.strip().strip("*").strip("`").strip()
+        lane = ""
+        model_effort = ""
+        # Notion commonly renders the value as two sibling property lines:
+        # ``Lane: Codex`` and ``Model / Effort: GPT-5.6 Luna / Max``.  Scan
+        # only the immediate section, and stop at the next heading, so prose
+        # elsewhere in a task page can never become an inferred profile.
+        for line in text[heading.end() :].splitlines()[:16]:
+            stripped = _clean_profile_value(line)
             if not stripped:
                 continue
             if stripped.startswith("#"):
                 break
+            direct = _field_value(stripped, r"execution profile")
+            if direct:
+                candidates.append(direct)
+                break
+            lane_value = _field_value(stripped, r"lane")
+            if lane_value:
+                lane = lane_value
+                continue
+            model_value = _field_value(stripped, r"model\s*/\s*effort")
+            if model_value:
+                model_effort = model_value
+                continue
+            # A plain next-line value is supported for the original task-page
+            # format, but an unparseable first value remains a fail-closed
+            # result rather than falling through to unrelated body text.
             candidates.append(stripped)
             break
+        if lane and model_effort:
+            candidates.insert(0, f"{lane} -> {model_effort}")
     for candidate in candidates:
         if not candidate or candidate.lower() in {"none", "n/a"}:
             return ""
@@ -150,6 +174,20 @@ def parse_physical_execution_profile(text: str) -> str:
             return ""
         return candidate
     return ""
+
+
+def _clean_profile_value(value: str) -> str:
+    """Remove Markdown list/emphasis wrappers without changing the value."""
+    return value.strip().lstrip("-+*").strip().strip("*").strip("`").strip()
+
+
+def _field_value(text: str, label_pattern: str) -> str:
+    match = re.match(
+        rf"^(?:[-*+]\s*)?(?:\*\*)?{label_pattern}(?:\*\*)?\s*:\s*(.*?)\s*$",
+        text,
+        flags=re.IGNORECASE,
+    )
+    return _clean_profile_value(match.group(1)) if match else ""
 
 
 def get_lane_folder_id(lane: str, status_name: str) -> str | None:
@@ -501,7 +539,9 @@ class LiveNotionTaskSource:
 
         # Extract Effort
         effort_obj = props.get("Effort", {}).get("select", {})
-        effort_name = effort_obj.get("name", "medium").lower() if effort_obj else "medium"
+        # A live row with no explicit effort is incomplete.  Do not silently
+        # turn missing execution identity into the default medium slot.
+        effort_name = effort_obj.get("name", "").lower() if effort_obj else ""
 
         # Extract Model from "Model / Effort" rich text
         model_str = ""
@@ -628,19 +668,19 @@ class LiveNotionTaskSource:
         dispatch_views: list[dict[str, Any]] = []
         resolver = HeadlessDispatchResolver(client=self.client)
         for harness in DISPATCH_PAGE_IDS:
-            result = resolver.resolve(harness)
-            pointer = result.pointer
-            if pointer is None:
-                continue
-            dispatch_views.append(
-                {
-                    "harness": harness,
-                    "dispatch_state": pointer.dispatch_state,
-                    "task_id": pointer.task_id,
-                    "expected_lifecycle_state": pointer.expected_lifecycle_state,
-                    "execution_profile": pointer.execution_profile,
-                }
-            )
+            for result in resolver.resolve_all(harness):
+                pointer = result.pointer
+                if pointer is None:
+                    continue
+                dispatch_views.append(
+                    {
+                        "harness": harness,
+                        "dispatch_state": pointer.dispatch_state,
+                        "task_id": pointer.task_id,
+                        "expected_lifecycle_state": pointer.expected_lifecycle_state,
+                        "execution_profile": pointer.execution_profile,
+                    }
+                )
         return {"physical": physical, "dashboard": dashboard, "dispatch": dispatch_views}
 
 

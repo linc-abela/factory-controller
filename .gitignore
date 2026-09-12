@@ -3,5 +3,5 @@ __pycache__/
 *.db
 *.db-shm
 *.db-wal
+.awe-worker/
 .coverage
-

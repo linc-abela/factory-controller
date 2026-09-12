@@ -134,6 +134,22 @@ class AWEAutonomousWorker:
         eligible_tasks = self.observation.filter_eligible(slot=target_slot, tasks=all_tasks)
 
         if not eligible_tasks:
+            # Keep protected work visible to the escalation gate.  Ordinary
+            # queue filtering excludes owner-only items so they can never be
+            # dispatched accidentally, but silently treating them as empty
+            # work would hide the required Owner decision from observability.
+            owner_gated_tasks = [
+                task
+                for task in all_tasks
+                if task.status in (AWEStatus.QUEUE.value, AWEStatus.IN_PROGRESS.value)
+                and task.slot.matches(target_slot)
+                and task.owner_only
+            ]
+            owner_gated_tasks.sort(key=lambda item: (item.sequence, item.task_id))
+            if owner_gated_tasks:
+                eligible_tasks = owner_gated_tasks
+
+        if not eligible_tasks:
             return CycleSummary(
                 worker_id=worker_id,
                 cycle_id=cycle_id,

@@ -267,12 +267,38 @@ class CursorHarnessAdapter:
 
         # If logged in in future:
         cmd = [self.cursor_bin, "agent", "-p", OWNER_QUEUE_COMMAND]
-        return WakeReceipt(
-            success=True,
-            harness="cursor",
-            slot_key=task.slot.key,
-            command=cmd,
-        )
+        if dry_run:
+            return WakeReceipt(
+                success=True,
+                harness="cursor",
+                slot_key=task.slot.key,
+                command=cmd,
+                pid=99996,
+                stdout="[DRY RUN] Cursor wake simulated",
+            )
+        try:
+            proc = subprocess.Popen(
+                cmd,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+            )
+            return WakeReceipt(
+                success=True,
+                harness="cursor",
+                slot_key=task.slot.key,
+                command=cmd,
+                pid=proc.pid,
+            )
+        except Exception as exc:
+            return WakeReceipt(
+                success=False,
+                harness="cursor",
+                slot_key=task.slot.key,
+                command=cmd,
+                error_code="WAKE_SUBPROCESS_FAILED",
+                detail=str(exc),
+            )
 
 
 class ClaudeHarnessAdapter:
