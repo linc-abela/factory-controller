@@ -6,6 +6,8 @@ Task: [SF-267](https://app.notion.com/p/3d9690f6eb1481faacbae49a6396d3a1)
 Repository: `linc-abela/factory-controller`
 Base: `main@e6593b3811b6a2bf3608a2f919c26ed6aa82004d`
 Branch: `sf/SF-267/notion-service-credential-bootstrap`
+Head: `0dcde46f9b24bf34cc3e5bf8c128b4a78706794e`
+PR: https://github.com/linc-abela/factory-controller/pull/9
 
 ## Root cause confirmed on host
 
