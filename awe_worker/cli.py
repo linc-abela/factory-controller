@@ -33,7 +33,8 @@ from .notion import (
 from .observation import AWEObservationService, DirectoryTaskSource, NotionTaskSource
 from .projection import diagnose_snapshot, diagnose_snapshot_path, evaluate_claim_preflight, load_snapshot
 from .reconciliation import TurnCadenceReconciler
-from .scheduler import AWEScheduledRunner
+from .scheduler import AWEContinuationSupervisor, AWEScheduledRunner, LiveDispatchSlotProvider
+from .service import ContinuationService
 from .worker import AWEAutonomousWorker
 
 
@@ -69,7 +70,10 @@ def _resolve_task_source(
 ) -> tuple[Any, NotionSourceOfRecord | None]:
     """Resolve task source and optional source-of-record based on configuration."""
     nc = NotionClient(token=notion_token)
-    if source_type == "notion" and nc.is_configured:
+    if source_type == "notion":
+        # A live command must never silently operate on the fixture directory
+        # when Notion authentication is absent.  LiveNotionTaskSource itself
+        # fails closed and the supervisor records the unavailable projection.
         src = LiveNotionTaskSource(client=nc, database_id=database_id)
         sor = NotionSourceOfRecord(client=nc)
         return src, sor
@@ -147,7 +151,10 @@ def main(argv: list[str] | None = None) -> int:
     # run (scheduled worker service)
     run_p = subparsers.add_parser("run", help="Run bounded or persistent scheduled worker loop")
     run_p.add_argument("--worker-id", default="host-worker-1", help="Worker identity")
-    run_p.add_argument("--slot", required=True, help="Exact execution slot (harness/model/effort)")
+    run_p.add_argument(
+        "--slot", default=None,
+        help="Optional exact slot for a one-slot rehearsal; live mode observes fixed Dispatch pages",
+    )
     run_p.add_argument("--interval", type=float, default=10.0, help="Cycle interval in seconds")
     run_p.add_argument("--max-cycles", type=int, default=None, help="Maximum cycles before stopping (optional)")
     run_p.add_argument("--source", choices=["notion", "dir"], default="notion")
@@ -161,6 +168,61 @@ def main(argv: list[str] | None = None) -> int:
         default=None,
         help="Optional projection snapshot JSON path or '-'. Overrides the task source snapshot.",
     )
+
+    # provider-backed continuation supervisor
+    supervisor_p = subparsers.add_parser(
+        "supervisor",
+        help="Run the always-on live AWE cross-lane continuation supervisor",
+    )
+    supervisor_actions = supervisor_p.add_subparsers(
+        dest="supervisor_action", required=True
+    )
+    sup_run_p = supervisor_actions.add_parser(
+        "run", help="Observe fixed Dispatch pages and continue every exact slot"
+    )
+    sup_run_p.add_argument("--worker-id", default="awe-continuation-1")
+    sup_run_p.add_argument("--interval", type=float, default=10.0)
+    sup_run_p.add_argument("--max-cycles", type=int, default=None)
+    sup_run_p.add_argument("--source", choices=["notion", "dir"], default="notion")
+    sup_run_p.add_argument("--source-dir", default="tests/fixtures/work_exchange")
+    sup_run_p.add_argument("--database-id", default=DEFAULT_AWE_DATABASE_ID)
+    sup_run_p.add_argument("--repo", default=".")
+    sup_run_p.add_argument("--heartbeat-file", default=None)
+    sup_run_p.add_argument(
+        "--slot", action="append", default=[],
+        help="Exact slot; only allowed with --source dir and repeatable",
+    )
+    sup_run_p.add_argument("--settlement-rechecks", type=int, default=1)
+    sup_run_p.add_argument(
+        "--snapshot", default=None,
+        help="Optional projection snapshot for explicit directory rehearsal",
+    )
+    _add_dry_run_arguments(sup_run_p)
+    sup_status_p = supervisor_actions.add_parser(
+        "status", help="Show durable continuation service and wake telemetry"
+    )
+    sup_status_p.add_argument("--state-dir", default=None)
+    sup_status_p.add_argument("--worker-id", default="awe-continuation-1")
+    for action, help_text in (
+        ("install", "Install the one-service continuation manifest"),
+        ("start", "Start the installed continuation service"),
+        ("stop", "Request a graceful service stop"),
+        ("restart", "Restart the installed continuation service"),
+    ):
+        service_p = supervisor_actions.add_parser(action, help=help_text)
+        service_p.add_argument("--state-dir", default=None)
+        service_p.add_argument("--worker-id", default="awe-continuation-1")
+        if action == "install":
+            service_p.add_argument("--interval", type=float, default=10.0)
+            service_p.add_argument("--source", choices=["notion", "dir"], default="notion")
+            service_p.add_argument("--source-dir", default="tests/fixtures/work_exchange")
+            service_p.add_argument("--database-id", default=DEFAULT_AWE_DATABASE_ID)
+            service_p.add_argument("--repo", default=".")
+            service_p.add_argument("--heartbeat-file", default=None)
+            service_p.add_argument("--slot", action="append", default=[])
+            service_p.add_argument("--settlement-rechecks", type=int, default=1)
+            service_p.add_argument("--snapshot", default=None)
+            service_p.add_argument("--apply", action="store_true")
 
     # status
     subparsers.add_parser("status", help="Show worker ledger health, active claims, and liveness")
@@ -181,6 +243,17 @@ def main(argv: list[str] | None = None) -> int:
     if args.command == "diagnose-projection":
         return _run_diagnose_projection(args.snapshot)
 
+    if args.command == "supervisor":
+        if args.supervisor_action == "status":
+            return _run_continuation_status(
+                args.db,
+                state_dir=args.state_dir,
+                worker_id=args.worker_id,
+            )
+        if args.supervisor_action in {"install", "start", "stop", "restart"}:
+            return _run_continuation_service(args)
+        return _run_continuation_supervisor(args)
+
     ledger = AWELedger(args.db)
 
     if args.command == "observe":
@@ -188,7 +261,7 @@ def main(argv: list[str] | None = None) -> int:
             args.source, args.source_dir, args.database_id, notion_token=args.notion_token
         )
         obs = AWEObservationService(src)
-        slot = ExecutionSlot.parse(args.slot)
+        slot = ExecutionSlot.parse(args.slot) if args.slot else None
         tasks = obs.filter_eligible(slot=slot) if args.slot else obs.observe_all()
         output = [t.as_dict() for t in tasks]
         json.dump({"eligible_count": len(tasks), "source": args.source, "tasks": output}, sys.stdout, indent=2)
@@ -307,7 +380,19 @@ def main(argv: list[str] | None = None) -> int:
         return 0
 
     elif args.command == "run":
-        slot = ExecutionSlot.parse(args.slot)
+        slot = ExecutionSlot.parse(args.slot) if args.slot else None
+        if args.source == "dir" and slot is None:
+            print(
+                json.dumps(
+                    {
+                        "ok": False,
+                        "code": "SLOT_REQUIRED_FOR_DIRECTORY_SOURCE",
+                        "detail": "directory service requires an exact --slot value",
+                    },
+                    sort_keys=True,
+                )
+            )
+            return 2
         src, sor = _resolve_task_source(
             args.source, args.source_dir, args.database_id, notion_token=args.notion_token
         )
@@ -318,10 +403,16 @@ def main(argv: list[str] | None = None) -> int:
             source_of_record=sor,
             projection_snapshot=_optional_snapshot(getattr(args, "snapshot", None)),
         )
-        runner = AWEScheduledRunner(
+        provider = (
+            LiveDispatchSlotProvider(client=NotionClient(token=args.notion_token))
+            if args.source == "notion" and slot is None
+            else None
+        )
+        runner = AWEContinuationSupervisor(
             worker=worker,
             worker_id=args.worker_id,
             heartbeat_file=args.heartbeat_file,
+            slot_provider=provider,
         )
         summaries = runner.run(
             interval_seconds=args.interval,
@@ -334,6 +425,7 @@ def main(argv: list[str] | None = None) -> int:
             "cycles_run": len(summaries),
             "last_health": summaries[-1].health if summaries else "idle",
             "last_claimed_task": summaries[-1].claimed_task if summaries else None,
+            "runtime": runner.get_runtime_status().as_dict(),
         }, sys.stdout, indent=2)
         print()
         return 0
@@ -368,10 +460,231 @@ def main(argv: list[str] | None = None) -> int:
             "active_claims": active,
             "harnesses": harness_status,
             "worker_liveness": liveness,
+            "continuation_supervisor": runner.get_runtime_status().as_dict(),
         }, sys.stdout, indent=2)
         print()
         return 0
 
+    return 0
+
+
+def _run_continuation_supervisor(args: argparse.Namespace) -> int:
+    """Run one supported, provider-backed AWE continuation service."""
+    if args.source == "notion" and args.slot:
+        print(
+            json.dumps(
+                {
+                    "ok": False,
+                    "code": "LIVE_DISPATCH_SLOT_OVERRIDE_REFUSED",
+                    "detail": "live supervisor slots come only from fixed Dispatch pages",
+                },
+                sort_keys=True,
+            )
+        )
+        return 2
+    if args.source == "dir" and not args.slot:
+        print(
+            json.dumps(
+                {
+                    "ok": False,
+                    "code": "SLOT_REQUIRED_FOR_DIRECTORY_SOURCE",
+                    "detail": "directory rehearsal requires one or more exact --slot values",
+                },
+                sort_keys=True,
+            )
+        )
+        return 2
+
+    ledger = AWELedger(args.db)
+    src, sor = _resolve_task_source(
+        args.source,
+        args.source_dir,
+        args.database_id,
+        notion_token=args.notion_token,
+    )
+    snapshot = _optional_snapshot(args.snapshot) if args.source == "dir" else None
+    worker = AWEAutonomousWorker(
+        ledger=ledger,
+        source=src,
+        target_repo=args.repo,
+        source_of_record=sor,
+        projection_snapshot=snapshot,
+    )
+    provider = (
+        LiveDispatchSlotProvider(client=NotionClient(token=args.notion_token))
+        if args.source == "notion"
+        else None
+    )
+    target_slots = (
+        tuple(ExecutionSlot.parse(raw) for raw in args.slot)
+        if args.source == "dir"
+        else None
+    )
+    runner = AWEContinuationSupervisor(
+        worker=worker,
+        worker_id=args.worker_id,
+        heartbeat_file=args.heartbeat_file,
+        slot_provider=provider,
+        target_slots=target_slots,
+        settlement_rechecks=args.settlement_rechecks,
+    )
+    summaries = runner.run(
+        interval_seconds=max(0.0, args.interval),
+        max_cycles=args.max_cycles,
+        dry_run=args.dry_run,
+    )
+    runtime = runner.get_runtime_status().as_dict()
+    last = summaries[-1] if summaries else None
+    json.dump(
+        {
+            "ok": True,
+            "worker_id": args.worker_id,
+            "polls_run": args.max_cycles if args.max_cycles is not None else None,
+            "cycles_run": len(summaries),
+            "last_health": last.health if last else runtime["work_state"],
+            "last_claimed_task": last.claimed_task if last else runtime["last_claimed_task"],
+            "runtime": runtime,
+        },
+        sys.stdout,
+        indent=2,
+    )
+    print()
+    return 0
+
+
+def _continuation_service_command(args: argparse.Namespace) -> list[str]:
+    command = [
+        sys.executable,
+        "-m",
+        "awe_worker.cli",
+        "--db",
+        str(args.db),
+        "supervisor",
+        "run",
+        "--worker-id",
+        args.worker_id,
+        "--interval",
+        str(args.interval),
+        "--source",
+        args.source,
+        "--source-dir",
+        args.source_dir,
+        "--database-id",
+        args.database_id,
+        "--repo",
+        args.repo,
+        "--settlement-rechecks",
+        str(args.settlement_rechecks),
+        "--live",
+    ]
+    if args.heartbeat_file:
+        command.extend(["--heartbeat-file", args.heartbeat_file])
+    if getattr(args, "snapshot", None):
+        command.extend(["--snapshot", args.snapshot])
+    for slot in args.slot:
+        command.extend(["--slot", slot])
+    return command
+
+
+def _run_continuation_service(args: argparse.Namespace) -> int:
+    """Handle the install/start/stop/restart lifecycle for one service."""
+    service = ContinuationService(
+        db_path=args.db,
+        state_dir=args.state_dir,
+        worker_id=args.worker_id,
+    )
+    if args.supervisor_action == "install":
+        if args.source == "notion" and args.slot:
+            print(
+                json.dumps(
+                    {
+                        "ok": False,
+                        "code": "LIVE_DISPATCH_SLOT_OVERRIDE_REFUSED",
+                        "detail": "live service slots come only from fixed Dispatch pages",
+                    },
+                    sort_keys=True,
+                )
+            )
+            return 2
+        if args.source == "dir" and not args.slot:
+            print(
+                json.dumps(
+                    {
+                        "ok": False,
+                        "code": "SLOT_REQUIRED_FOR_DIRECTORY_SOURCE",
+                        "detail": "directory service requires one or more exact --slot values",
+                    },
+                    sort_keys=True,
+                )
+            )
+            return 2
+        result = service.install(
+            _continuation_service_command(args),
+            working_dir=args.repo,
+            interval_seconds=args.interval,
+            apply=args.apply,
+        )
+    elif args.supervisor_action == "start":
+        result = service.start()
+    elif args.supervisor_action == "stop":
+        result = service.stop()
+    else:
+        result = service.restart()
+    print(json.dumps(result, sort_keys=True, indent=2))
+    return 0 if result.get("ok", True) else 1
+
+
+def _run_continuation_status(
+    db_path: str,
+    *,
+    state_dir: str | None = None,
+    worker_id: str = "awe-continuation-1",
+) -> int:
+    """Read continuation telemetry without selecting a task or touching Notion."""
+    ledger = AWELedger(db_path)
+    runner = AWEContinuationSupervisor(
+        worker=AWEAutonomousWorker(
+            ledger=ledger,
+            source=DirectoryTaskSource("tests/fixtures/work_exchange"),
+        ),
+        worker_id=worker_id,
+    )
+    runtime = runner.get_runtime_status().as_dict()
+    harnesses = {}
+    for harness in ("antigravity", "codex", "cursor", "claude"):
+        available, code, detail = get_adapter_for_harness(harness).check_availability()
+        harnesses[harness] = {
+            "available": available,
+            "code": code,
+            "detail": detail,
+        }
+    liveness = [
+        {
+            "worker_id": record.worker_id,
+            "pid": record.pid,
+            "status": record.status,
+            "cycles_completed": record.cycles_completed,
+            "last_heartbeat": record.last_heartbeat,
+        }
+        for record in runner.get_liveness_status()
+    ]
+    json.dump(
+        {
+            "ok": True,
+            "continuation_supervisor": runtime,
+            "service": ContinuationService(
+                db_path=db_path,
+                state_dir=state_dir,
+                worker_id=worker_id,
+            ).status(),
+            "harnesses": harnesses,
+            "worker_liveness": liveness,
+            "active_claims": ledger.get_active_claims(),
+        },
+        sys.stdout,
+        indent=2,
+    )
+    print()
     return 0
 
 

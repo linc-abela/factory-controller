@@ -9,5 +9,4 @@ dependencies = []
 factory-controller = "factory_controller.cli:main"
 
 [tool.setuptools.packages.find]
-include = ["factory_controller*"]
-
+include = ["factory_controller*", "awe_worker*"]

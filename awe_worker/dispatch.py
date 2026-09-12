@@ -29,10 +29,13 @@ EXECUTABLE = "EXECUTABLE"
 
 _POINTER_MARKERS = (
     "task id:",
+    "task page:",
     "execution profile:",
     "expected lifecycle state:",
     "dispatch state:",
+    "physical state:",
     "current pointer",
+    "executable",
 )
 
 
@@ -115,6 +118,55 @@ def parse_pointers(text: str, harness: str = "") -> list[DispatchPointer]:
                 harness=harness,
             )
         )
+    if pointers or re.search(
+        r"(?im)^\s*(?:[-*+]\s*)?\**(?:EXECUTABLE|NO_EXECUTABLE_TASK)\b", text
+    ) is None:
+        return pointers
+
+    # The live Dispatch pages were created before the canonical pointer block
+    # format existed.  They are still authoritative assignment projections,
+    # so accept that shape only when all of the same binding facts can be
+    # recovered.  We never search for a task or infer a profile from a title.
+    legacy_chunks = re.split(
+        r"(?im)(?=^\s*(?:[-*+]\s*)?\**(?:EXECUTABLE|NO_EXECUTABLE_TASK)\b)",
+        text,
+    )
+    for chunk in legacy_chunks:
+        if not re.search(
+            r"(?im)^\s*(?:[-*+]\s*)?\**(?:EXECUTABLE|NO_EXECUTABLE_TASK)\b",
+            chunk,
+        ):
+            continue
+        task_id = _field(chunk, r"Task ID:\s*`?([^`\n]+)`?")
+        if not task_id:
+            match = re.search(r"\b(SF-\d+)\b", chunk, flags=re.IGNORECASE)
+            task_id = match.group(1).upper() if match else ""
+        execution_profile = _field(chunk, r"Execution Profile:\s*`?([^`\n]*)`?")
+        if not execution_profile:
+            execution_profile = _profile_from_fields(chunk)
+        lifecycle = _field(chunk, r"Expected Lifecycle State:\s*`?([^`\n]+)`?")
+        if not lifecycle:
+            lifecycle = _field(chunk, r"Physical State:\s*`?([^`\n]+)`?")
+        dispatch_state = _field(chunk, r"Dispatch State:\s*`?([^`\n]+)`?")
+        if not dispatch_state:
+            dispatch_state = (
+                NO_EXECUTABLE_TASK
+                if re.search(
+                    r"(?im)^\s*(?:[-*+]\s*)?\**NO_EXECUTABLE_TASK\b", chunk
+                )
+                else EXECUTABLE
+            )
+        pointers.append(
+            DispatchPointer(
+                task_id=task_id,
+                execution_profile=execution_profile,
+                expected_lifecycle_state=lifecycle,
+                task_page_url=_task_page_url(chunk),
+                dispatch_state=dispatch_state,
+                frozen_head=_field(chunk, r"Frozen Head:\s*`?([^`\n]+)`?"),
+                harness=harness,
+            )
+        )
     return pointers
 
 
@@ -148,6 +200,20 @@ def _field(text: str, pattern: str) -> str:
     if value.lower() in {"none", "n/a", "<mention-page/>"}:
         return ""
     return value
+
+
+def _profile_from_fields(text: str) -> str:
+    """Build a profile only from explicit assignment fields."""
+    lane = _field(text, r"Lane:\s*`?([^`\n]+)`?")
+    model_effort = _field(text, r"Model\s*/\s*Effort:\s*`?([^`\n]+)`?")
+    if lane and model_effort:
+        candidate = f"{lane} -> {model_effort}"
+        try:
+            ExecutionSlot.parse(candidate)
+        except ValueError:
+            return ""
+        return candidate
+    return ""
 
 
 def _block_plain_text(block: Mapping[str, Any]) -> str:
@@ -278,12 +344,9 @@ class HeadlessDispatchResolver:
             return DispatchResolveResult(False, DISPATCH_STALE, detail=f"unknown harness '{harness}'")
         if not self.client.is_configured:
             return DispatchResolveResult(False, DISPATCH_STALE, detail="NOTION_NOT_CONFIGURED")
-        try:
-            children = self._all_children(page_id)
-        except NotionAPIError as exc:
-            return DispatchResolveResult(False, DISPATCH_STALE, detail=str(exc))
-        text = "\n".join(_block_plain_text(b) for b in children if isinstance(b, Mapping))
-        pointers = parse_pointers(text, harness=harness.lower())
+        pointers, read_error = self._read_pointers(harness)
+        if read_error:
+            return read_error
         if not pointers:
             return DispatchResolveResult(False, DISPATCH_STALE, detail="missing Dispatch pointer")
 
@@ -296,6 +359,49 @@ class HeadlessDispatchResolver:
                     detail="duplicate-slot Dispatch requires exact execution profile",
                 )
             return DispatchResolveResult(False, DISPATCH_STALE, detail="no matching Dispatch pointer")
+        return self._validate_pointer(selected, harness.lower(), slot=slot)
+
+    def resolve_all(self, harness: str) -> list[DispatchResolveResult]:
+        """Resolve every pointer on one fixed harness Dispatch page.
+
+        A continuation supervisor needs all independently authorized slots, but
+        the same physical ancestry and profile checks apply to each pointer.
+        An empty/error result is represented explicitly so status reporting can
+        distinguish ``NO_EXECUTABLE_TASK`` from an unreadable projection.
+        """
+        pointers, read_error = self._read_pointers(harness)
+        if read_error:
+            return [read_error]
+        if not pointers:
+            return [DispatchResolveResult(False, DISPATCH_STALE, detail="missing Dispatch pointer")]
+        return [self._validate_pointer(pointer, harness.lower()) for pointer in pointers]
+
+    def _read_pointers(
+        self,
+        harness: str,
+    ) -> tuple[list[DispatchPointer], DispatchResolveResult | None]:
+        page_id = DISPATCH_PAGE_IDS.get((harness or "").strip().lower(), "")
+        if not page_id:
+            return [], DispatchResolveResult(
+                False, DISPATCH_STALE, detail=f"unknown harness '{harness}'"
+            )
+        if not self.client.is_configured:
+            return [], DispatchResolveResult(
+                False, DISPATCH_STALE, detail="NOTION_NOT_CONFIGURED"
+            )
+        try:
+            children = self._all_children(page_id)
+        except NotionAPIError as exc:
+            return [], DispatchResolveResult(False, DISPATCH_STALE, detail=str(exc))
+        text = "\n".join(_block_plain_text(b) for b in children if isinstance(b, Mapping))
+        return parse_pointers(text, harness=(harness or "").strip().lower()), None
+
+    def _validate_pointer(
+        self,
+        selected: DispatchPointer,
+        harness: str,
+        slot: ExecutionSlot | None = None,
+    ) -> DispatchResolveResult:
         if selected.dispatch_state.upper() == NO_EXECUTABLE_TASK or not selected.executable:
             return DispatchResolveResult(True, NO_EXECUTABLE_TASK, pointer=selected, detail="no executable task")
         if not selected.task_page_id:
@@ -322,8 +428,16 @@ class HeadlessDispatchResolver:
                 pointer=selected,
                 detail=f"UNKNOWN_PHYSICAL_ANCESTRY: parent {parent_id}",
             )
-        expected = selected.expected_lifecycle_state
         from .model import canonical_lifecycle_status
+
+        expected = selected.expected_lifecycle_state
+        if not expected:
+            return DispatchResolveResult(
+                False,
+                DISPATCH_STALE,
+                pointer=selected,
+                detail="missing expected lifecycle state",
+            )
         expected_canonical = canonical_lifecycle_status(expected)
         if expected_canonical and physical.lower() != expected_canonical.lower():
             return DispatchResolveResult(
@@ -332,7 +446,21 @@ class HeadlessDispatchResolver:
                 pointer=selected,
                 detail=f"physical ancestry '{physical}' != Dispatch '{expected}'",
             )
-        if slot and not selected.slot.matches(slot):
+        if not selected.execution_profile:
+            return DispatchResolveResult(
+                False,
+                DISPATCH_STALE,
+                pointer=selected,
+                detail="missing execution profile",
+            )
+        if selected.slot.harness != harness:
+            return DispatchResolveResult(
+                False,
+                DISPATCH_STALE,
+                pointer=selected,
+                detail="execution profile harness mismatch",
+            )
+        if slot is not None and not selected.slot.matches(slot):
             return DispatchResolveResult(
                 False,
                 DISPATCH_STALE,

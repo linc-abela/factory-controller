@@ -1,9 +1,9 @@
 # Factory Controller
 
 Pure-standard-library, single-host Controller runtime, executed through the
-repository container. SQLite is authoritative
-for live mission state; Notion is not read by runtime code. Factory-maintenance
-work is admitted from a directory of JSON packets
+repository container. SQLite is authoritative for local claims and audit state;
+the live AWE worker reads Notion as its physical source of record and projection.
+Factory-maintenance work is admitted from a directory of JSON packets
 (`factory.controller.work_packet.v1`) through `work-intake`; the directory is
 one adapter behind that seam.
 
@@ -94,6 +94,35 @@ outcomes. Retry exhaustion becomes an explicit escalation.
 The append-only event ledger is the history; the mission row is its operational
 projection. Claims use `BEGIN IMMEDIATE`, expiring leases, and fencing tokens.
 Started external steps survive restart and reuse the same operation key.
+
+### AWE cross-lane continuation
+
+The AWE continuation supervisor observes only the three fixed harness Dispatch
+pages, resolves every complete `(harness, model, effort)` slot, and re-enters
+the same worker after settlement. It does not search for substitute tasks or
+activate downstream work; Factory integration authority remains the checkpoint
+that makes a downstream Queue executable.
+
+Use the one service lifecycle below. `install` is a plan unless `--apply` is
+given, and the manifest stores no Notion or Cursor credential. `NOTION_TOKEN`
+or `NOTION_API_KEY` must be supplied through the runtime environment when the
+service starts.
+
+```sh
+./dev awe-worker --db awe_worker.db supervisor install --repo "$PWD"
+./dev awe-worker --db awe_worker.db supervisor install --repo "$PWD" --apply
+./dev awe-worker --db awe_worker.db supervisor start
+./dev awe-worker --db awe_worker.db supervisor status
+./dev awe-worker --db awe_worker.db supervisor stop
+./dev awe-worker --db awe_worker.db supervisor restart
+```
+
+For a one-time Cursor setup, authenticate its CLI interactively and verify
+`cursor agent status`. If authentication is unavailable, the worker records
+`HARNESS_WAKE_PATH_UNAVAILABLE:cursor`, leaves the task resumable, and never
+reports a false wake. `status` exposes service state, last observation/cycle,
+last claimed task, per-harness wake receipts, and no-work, projection, or
+Owner-gated conditions.
 
 ## Providers
 
