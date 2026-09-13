@@ -165,8 +165,14 @@ def accept_line(evidence: Mapping[str, Any]) -> str:
 def _quota_exhausted(text: str) -> bool:
     lowered = text.lower()
     return any(token in lowered for token in (
-        "quota", "rate limit", "token limit", "usage limit",
-        "insufficient_quota", "context length exceeded"))
+        "insufficient_quota",
+        "quota exceeded",
+        "quota_exceeded",
+        "rate limit exceeded",
+        "usage limit reached",
+        "you've hit your usage limit",
+        "context length exceeded",
+    ))
 
 
 def _run(cmd: list[str], *, cwd: Path | None = None, timeout: int = 120
@@ -234,15 +240,42 @@ class FleetExecutors:
 
     def implementation(self, mission: Any,
                        architecture: Mapping[str, Any], work: Path) -> dict[str, Any]:
+        existing = self._implementation_result(architecture, work, {})
+        if existing.get("head"):
+            return existing
+        if _git_dirty(work):
+            receipt = self._codex(
+                "gpt-5.6-luna", "max",
+                _implementation_commit_prompt(mission, architecture, work), work)
+            result = self._implementation_result(architecture, work, receipt)
+            if result.get("head"):
+                return result
         prompt = _implementation_prompt(mission, architecture, work)
         receipt = self._codex("gpt-5.6-luna", "max", prompt, work)
+        result = self._implementation_result(architecture, work, receipt)
+        if result.get("head") or not _git_dirty(work):
+            return result
+        follow = self._codex(
+            "gpt-5.6-luna", "max",
+            _implementation_commit_prompt(mission, architecture, work), work)
+        result = self._implementation_result(architecture, work, follow)
+        result["continuation_receipt"] = follow
+        return result
+
+    def _implementation_result(self, architecture: Mapping[str, Any], work: Path,
+                               receipt: Mapping[str, Any]) -> dict[str, Any]:
         impl_file = work / "implementation.json"
         head = _git_head(work)
+        intake = str(architecture.get("intake_head") or "")
+        if not intake:
+            root = _git(["rev-list", "--max-parents=0", "HEAD"], work)
+            if root.returncode == 0:
+                intake = (root.stdout.strip().splitlines() or [""])[0]
         if impl_file.is_file():
             body = json.loads(impl_file.read_text(encoding="utf-8"))
             return {
                 "packages": body.get("packages") or [{
-                    "id": mission.package_id,
+                    "id": "core",
                     **IMPL_ROUTE,
                     "branch": body.get("branch") or _git_branch(work),
                     "head": body.get("head") or head,
@@ -251,10 +284,10 @@ class FleetExecutors:
                 "head": body.get("head") or head,
                 "runner_receipt": receipt,
             }
-        if head and architecture.get("intake_head") and head != architecture.get("intake_head"):
+        if head and intake and head != intake:
             return {
                 "packages": [{
-                    "id": mission.package_id,
+                    "id": "core",
                     **IMPL_ROUTE,
                     "branch": _git_branch(work),
                     "head": head,
@@ -271,6 +304,12 @@ class FleetExecutors:
         packages = implementation.get("packages") or ()
         included = [str(item.get("head") or "") for item in packages if item.get("head")]
         if head:
+            marker = work / CANDIDATE_MARKER
+            marker.write_text(json.dumps({
+                "candidate_head": head,
+                "package_id": mission.package_id,
+                "mission_key": mission.mission_key,
+            }, indent=2) + "\n", encoding="utf-8")
             return {
                 "candidate_head": head,
                 "included_heads": included or [head],
@@ -434,6 +473,11 @@ def _git_branch(cwd: Path) -> str:
     return proc.stdout.strip() if proc.returncode == 0 else ""
 
 
+def _git_dirty(cwd: Path) -> bool:
+    proc = _git(["status", "--porcelain"], cwd)
+    return proc.returncode == 0 and bool(proc.stdout.strip())
+
+
 def _architecture_prompt(mission: Any,
                          hermes: Mapping[str, Any], work: Path) -> str:
     return (
@@ -464,4 +508,17 @@ def _implementation_prompt(mission: Any,
         "Do not present the pre-intake prototype as RC-alpha.\n"
         % (mission.mission_key, mission.package_id, work, CANDIDATE_MARKER,
            architecture.get("artifact") or "")
+    )
+
+
+def _implementation_commit_prompt(mission: Any,
+                                 architecture: Mapping[str, Any], work: Path) -> str:
+    return (
+        "Continue the same Factory implementation mission %s. "
+        "Uncommitted work already exists in %s. Do not restart. "
+        "Commit the architecture delta on an isolated branch so HEAD differs "
+        "from intake %s. Write implementation.json and %s with the new HEAD. "
+        "Then stop.\n"
+        % (mission.mission_key, work, architecture.get("intake_head") or "",
+           CANDIDATE_MARKER)
     )
