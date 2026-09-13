@@ -404,10 +404,15 @@ class FleetExecutors:
         )
         selected = _final_profile(attempts)
         result = self._implementation_result(architecture, work, selected)
+        if rejected and str(result.get("head") or "") == rejected:
+            result = {"producer": result.get("producer") or {}}
         result["attempts"] = attempts
         result["live"] = self._live(work)
         if repair:
             result["repair"] = dict(repair)
+        if not result.get("head"):
+            result["detail"] = result.get("detail") or (
+                "no_new_head" if attempts else "no_eligible_live_profile")
         return result
 
     def _execute_capability(
@@ -421,6 +426,7 @@ class FleetExecutors:
         context: Mapping[str, Any],
     ) -> list[dict[str, Any]]:
         attempts: list[dict[str, Any]] = []
+        self._clear_transient(work)
         for _ in range(8):
             live = self._live(work)
             ctx = dict(context)
@@ -691,6 +697,20 @@ class FleetExecutors:
         body.setdefault("live", {})
         body.setdefault("incumbent", "")
         return body
+
+    def _clear_transient(self, work: Path) -> None:
+        """Re-probe live availability at the start of a capability attempt.
+
+        Stale QUOTA_EXHAUSTED / TEMPORARILY_UNAVAILABLE from a prior process is
+        not current truth. Marks written during this attempt still exclude.
+        """
+
+        body = self._routing(work)
+        live = dict(body.get("live") or {})
+        if live:
+            body["live"] = {}
+            self._routing_path(work).write_text(
+                json.dumps(body, indent=2) + "\n", encoding="utf-8")
 
     def _live(self, work: Path) -> dict[str, str]:
         live = self._routing(work).get("live") or {}

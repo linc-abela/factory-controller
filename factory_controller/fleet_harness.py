@@ -120,7 +120,7 @@ class FleetHarness:
                 profile, TEMPORARILY_UNAVAILABLE, -1, "", "",
                 "HARNESS_WAKE_PATH_UNAVAILABLE:cursor")
         model = profile.model if profile.effort != "runtime" else "auto"
-        cmd = [binary, "agent", "-p", "--model", model, prompt]
+        cmd = [binary, "agent", "-p", "--force", "--model", model, prompt]
         return self._spawn(profile, cmd, cwd)
 
     def _spawn(self, profile: Profile, cmd: list[str], cwd: Path) -> HarnessReceipt:

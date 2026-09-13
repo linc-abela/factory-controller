@@ -13,6 +13,7 @@ from factory_controller.fleet_harness import (
     COMPLETED,
     HarnessReceipt,
     QUOTA_EXHAUSTED,
+    TEMPORARILY_UNAVAILABLE,
     classify_provider_output,
     provider_model_id,
 )
@@ -267,6 +268,30 @@ class GoldenPathRoutingAbstractionTests(unittest.TestCase):
             result = executors.architecture(_Mission(), {}, work)
         self.assertEqual(result["model"], "vesper")
         self.assertEqual(harness.calls, ["cursor/helios/high", "codex/vesper/max"])
+
+    def test_repair_retries_temporarily_unavailable_profiles(self):
+        catalog = capability_map.parse(ALT_MAP)
+        harness = _ScriptedHarness([(COMPLETED, _commit_delta)])
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            work = root / "work"
+            work.mkdir()
+            executors = golden_path.FleetExecutors(
+                vault_root=root, state_dir=root, catalog=catalog, harness=harness)
+            executors._prepare_work(_Mission(), work)
+            intake = golden_path._git_head(work)
+            nova = next(p for p in catalog.for_capability(CAP_IMPLEMENTATION)
+                        if p.model == "nova-2")
+            executors._mark(work, nova, TEMPORARILY_UNAVAILABLE)
+            alpha = next(p for p in catalog.for_capability(CAP_IMPLEMENTATION)
+                         if p.model == "alpha")
+            executors._mark(work, alpha, QUOTA_EXHAUSTED)
+            result = executors.implementation(
+                _Mission(), {"intake_head": intake, "artifact": ""}, work,
+                repair={"rejected_head": intake, "feedback": "visual bar unmet"})
+        self.assertTrue(result.get("head"))
+        self.assertNotEqual(result.get("head"), intake)
+        self.assertTrue(harness.calls)
 
 
 if __name__ == "__main__":
