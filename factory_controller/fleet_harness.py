@@ -75,6 +75,8 @@ class FleetHarness:
             return self._codex(profile, prompt, cwd)
         if profile.harness == "cursor":
             return self._cursor(profile, prompt, cwd)
+        if profile.harness == "antigravity":
+            return self._antigravity(profile, prompt, cwd)
         return HarnessReceipt(
             status=TEMPORARILY_UNAVAILABLE,
             harness=profile.harness,
@@ -91,6 +93,23 @@ class FleetHarness:
                 "HARNESS_BINARY_MISSING")
         cmd = [binary, "exec", "-m", profile.model, "-c",
                "model_reasoning_effort=%s" % profile.effort, prompt]
+        return self._spawn(profile, cmd, cwd)
+
+    def _antigravity(self, profile: Profile, prompt: str, cwd: Path) -> HarnessReceipt:
+        binary = shutil.which("agy") or "/Users/karlosabay/.local/bin/agy"
+        if not os.path.exists(binary):
+            return self._receipt(
+                profile, TEMPORARILY_UNAVAILABLE, -1, "", "",
+                "HARNESS_BINARY_MISSING")
+        cmd = [
+            binary, "--print",
+            "--model", provider_model_id(profile),
+            "--effort", profile.effort,
+            "--dangerously-skip-permissions",
+            "--add-dir", str(cwd),
+            "--print-timeout", "15m0s",
+            prompt,
+        ]
         return self._spawn(profile, cmd, cwd)
 
     def _cursor(self, profile: Profile, prompt: str, cwd: Path) -> HarnessReceipt:
@@ -136,6 +155,20 @@ class FleetHarness:
             stdout_tail=stdout[-4000:],
             stderr_tail=stderr[-2000:],
         )
+
+
+def provider_model_id(profile: Profile) -> str:
+    """Translate a mapping profile onto the harness binary's model id.
+
+    Routing still names a capability. This is adapter-only: Gemini 3.8 Medium
+    on Antigravity is `gemini-3.8-flash-medium`.
+    """
+
+    model = profile.model
+    if profile.harness == "antigravity" and model.startswith("gemini-"):
+        if "flash" not in model and "pro" not in model:
+            return "%s-flash-%s" % (model, profile.effort)
+    return model
 
 
 def classify_provider_output(text: str, returncode: int = 0) -> str:

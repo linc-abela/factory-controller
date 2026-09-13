@@ -12,6 +12,14 @@ VAULT = Path("/Users/Shared/Projects/factory-vault-SF-272")
 STATE = Path("/Users/Shared/Projects/software-factory/factory-controller-SF-272/.sf272-state")
 
 
+REJECTED_HEAD = "36567bd17176472e94d476dc6cb7a5a6eddce825"
+REJECT_FEEDBACK = (
+    "map flickers; roads are crude diagonal bars; overall visual/art quality "
+    "is below the approved PCP/architecture bar; architecture had already "
+    "recorded the visual bar as unmet."
+)
+
+
 def main() -> int:
     STATE.mkdir(parents=True, exist_ok=True)
     store = MissionStore(STATE / "controller.db")
@@ -23,6 +31,8 @@ def main() -> int:
     if kyri is None:
         print("SF272_FACTORY_GOLDEN_PATH_REJECT — pcp")
         return 1
+    kyri = plane.ingest_owner_validation(
+        kyri.mission_key, REJECTED_HEAD, "REJECT", REJECT_FEEDBACK) or kyri
     plane.claim(kyri.mission_key, "sf272-live")
     try:
         store.submit(

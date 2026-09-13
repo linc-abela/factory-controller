@@ -66,6 +66,19 @@ CREATE INDEX IF NOT EXISTS pcp_missions_by_package
   ON pcp_missions(package_id, package_version);
 """
 
+OWNER_DECISIONS = """
+CREATE TABLE IF NOT EXISTS owner_validation_decisions (
+  decision_id INTEGER PRIMARY KEY AUTOINCREMENT,
+  mission_key TEXT NOT NULL,
+  candidate_head TEXT NOT NULL,
+  decision TEXT NOT NULL,
+  feedback TEXT NOT NULL DEFAULT '',
+  created_at REAL NOT NULL
+);
+CREATE INDEX IF NOT EXISTS owner_validation_by_mission
+  ON owner_validation_decisions(mission_key, created_at);
+"""
+
 
 @dataclass(frozen=True)
 class PCPMission:
@@ -360,10 +373,12 @@ def _free_port() -> int:
 
 
 def serve_product_rc(web_root: Path, *, state_dir: str | Path, package_id: str,
-                     candidate_head: str) -> str:
+                     candidate_head: str, lane: str = "pcp-rc-alpha") -> str:
     """Serve a sealed Factory candidate. Prototype checkouts are not valid."""
 
     if not candidate_head or not str(candidate_head).strip():
+        return ""
+    if lane not in {"pcp-rc-alpha", "pcp-e2e"}:
         return ""
     root = Path(web_root).resolve()
     marker = root / ".factory-candidate.json"
@@ -375,7 +390,7 @@ def serve_product_rc(web_root: Path, *, state_dir: str | Path, package_id: str,
         return ""
     if _web_root(root) is None and not (root / "index.html").is_file():
         return ""
-    receipt_dir = Path(state_dir) / "pcp-rc-alpha"
+    receipt_dir = Path(state_dir) / lane
     receipt_dir.mkdir(parents=True, exist_ok=True)
     receipt = receipt_dir / ("%s.json" % package_id)
     if receipt.is_file():
@@ -449,6 +464,7 @@ class PCPMissionPlane:
         self.clock = clock or store.clock
         with store.transaction() as db:
             db.executescript(SCHEMA)
+            db.executescript(OWNER_DECISIONS)
             cols = {row[1] for row in db.execute("PRAGMA table_info(pcp_missions)")}
             if "evidence_json" not in cols:
                 db.execute(
@@ -556,6 +572,67 @@ class PCPMissionPlane:
             )
             return True
 
+    def ingest_owner_validation(
+        self, mission_key_value: str, candidate_head: str, decision: str,
+        feedback: str = "",
+    ) -> PCPMission | None:
+        """Record Owner Validation. REJECT continues the same mission automatically."""
+
+        from .golden_path import apply_owner_reject, lifecycle_of
+
+        now = self.clock()
+        decision = str(decision or "").upper()
+        if decision not in {"APPROVE", "REJECT"}:
+            raise ValueError("OWNER_VALIDATION_DECISION_INVALID")
+        with self._store.transaction() as db:
+            db.executescript(OWNER_DECISIONS)
+            db.execute(
+                """INSERT INTO owner_validation_decisions
+                   (mission_key, candidate_head, decision, feedback, created_at)
+                   VALUES (?,?,?,?,?)""",
+                (mission_key_value, candidate_head, decision, feedback, now),
+            )
+            row = db.execute(
+                "SELECT * FROM pcp_missions WHERE mission_key=?",
+                (mission_key_value,),
+            ).fetchone()
+            if row is None:
+                return None
+            evidence = _parse_evidence(row)
+            event = {
+                "mission_key": mission_key_value,
+                "candidate_head": candidate_head,
+                "decision": decision,
+                "feedback": feedback,
+                "timestamp": now,
+                "notion_required": False,
+            }
+            history = list(evidence.get("owner_validation_history") or [])
+            history.append(event)
+            evidence["owner_validation"] = event
+            evidence["owner_validation_history"] = history
+            alpha = row["rc_alpha_url"] or ""
+            lifecycle = row["lifecycle"]
+            if decision == "REJECT":
+                before = str((evidence.get("integration") or {}).get("candidate_head")
+                             or (evidence.get("rc_alpha") or {}).get("candidate_head")
+                             or "")
+                evidence = apply_owner_reject(evidence)
+                after = str((evidence.get("integration") or {}).get("candidate_head") or "")
+                if after != before:
+                    alpha = ""
+                lifecycle = lifecycle_of(evidence)
+            db.execute(
+                """UPDATE pcp_missions
+                   SET evidence_json=?, lifecycle=?, rc_alpha_url=?,
+                       worker_lease=NULL, lease_expires_at=NULL, updated_at=?
+                   WHERE mission_key=?""",
+                (json.dumps(evidence, sort_keys=True), lifecycle, alpha,
+                 now, mission_key_value),
+            )
+        return next(
+            item for item in self.list() if item.mission_key == mission_key_value)
+
     def record_evidence(self, mission_key_value: str, evidence: Mapping[str, Any],
                         *, lifecycle: str = "") -> None:
         from .golden_path import lifecycle_of
@@ -596,10 +673,15 @@ class PCPMissionPlane:
             try:
                 self._store.submit(payload, row.mission_key)
             except Exception:
-                continue
-            if row.lifecycle in {"OWNER_VALIDATION", "OWNER_SIGNOFF", "PRODUCTION"}:
+                pass
+            if row.lifecycle in {"OWNER_SIGNOFF", "PRODUCTION"}:
                 advanced.append(row)
                 continue
+            if row.lifecycle == "OWNER_VALIDATION":
+                ov = (row.evidence or {}).get("owner_validation") or {}
+                if str(ov.get("decision") or "").upper() != "REJECT":
+                    advanced.append(row)
+                    continue
             if not self.claim(row.mission_key, worker_id):
                 continue
             if callable(process):

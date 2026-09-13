@@ -13,6 +13,7 @@ from typing import Any, Mapping
 from .capability_map import (
     CAP_ARCHITECTURE,
     CAP_IMPLEMENTATION,
+    CAP_QA,
     CapabilityMap,
     Profile,
 )
@@ -72,6 +73,8 @@ def resolve(
         chosen = _architecture(pool, eligible, status)
     elif capability.startswith(CAP_IMPLEMENTATION):
         chosen = _implementation(eligible, ctx)
+    elif capability.startswith(CAP_QA):
+        chosen = eligible[0], "best_eligible"
     else:
         chosen = eligible[0], "best_eligible"
     if chosen is None:

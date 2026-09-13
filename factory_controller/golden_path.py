@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import shutil
 import subprocess
 import time
@@ -19,7 +20,7 @@ from typing import Any, Mapping, Protocol
 
 from . import capability_map
 from . import capability_resolver
-from .capability_map import CAP_ARCHITECTURE, CAP_IMPLEMENTATION, Profile
+from .capability_map import CAP_ARCHITECTURE, CAP_IMPLEMENTATION, CAP_QA, Profile
 from .fleet_harness import (
     COMPLETED,
     FAILED,
@@ -39,6 +40,8 @@ LINKS = (
     "rc_alpha",
 )
 CANDIDATE_MARKER = ".factory-candidate.json"
+AG_RECEIPT = "ag-e2e.json"
+MAX_REPAIR = 8
 _RERUN = {QUOTA_EXHAUSTED, TEMPORARILY_UNAVAILABLE}
 
 
@@ -51,7 +54,8 @@ class IncompleteChain(ValueError):
 class PipelineExecutors(Protocol):
     def hermes(self, mission: Any) -> dict[str, Any]: ...
     def architecture(self, mission: Any, hermes: Mapping[str, Any], work: Path) -> dict[str, Any]: ...
-    def implementation(self, mission: Any, architecture: Mapping[str, Any], work: Path) -> dict[str, Any]: ...
+    def implementation(self, mission: Any, architecture: Mapping[str, Any], work: Path,
+                       repair: Mapping[str, Any] | None = None) -> dict[str, Any]: ...
     def integrate(self, mission: Any, implementation: Mapping[str, Any], work: Path) -> dict[str, Any]: ...
     def e2e(self, mission: Any, work: Path, candidate_head: str) -> dict[str, Any]: ...
     def deploy(self, mission: Any, work: Path, candidate_head: str, state_dir: Path) -> dict[str, Any]: ...
@@ -83,6 +87,99 @@ def missing_links(evidence: Mapping[str, Any] | None) -> tuple[str, ...]:
         elif link == "rc_alpha" and not item.get("url"):
             missing.append(link)
     return tuple(missing)
+
+
+def apply_owner_reject(evidence: dict[str, Any]) -> dict[str, Any]:
+    """Invalidate RC evidence for a rejected candidate and keep the same mission."""
+
+    ov = evidence.get("owner_validation") or {}
+    if str(ov.get("decision") or "").upper() != "REJECT":
+        return evidence
+    rejected = str(ov.get("candidate_head") or "")
+    current = str(
+        (evidence.get("integration") or {}).get("candidate_head")
+        or (evidence.get("rc_alpha") or {}).get("candidate_head")
+        or "")
+    if rejected and current and rejected != current:
+        return evidence
+    if not rejected:
+        return evidence
+    if rejected in list(evidence.get("rejected_candidates") or []):
+        evidence.setdefault("_repair", {
+            "reason": "owner_reject",
+            "rejected_head": rejected,
+            "feedback": ov.get("feedback") or "",
+            "defects": _split_defects(ov.get("feedback") or ""),
+        })
+        return evidence
+    history = list(evidence.get("repair_history") or [])
+    history.append({
+        "reason": "owner_reject",
+        "candidate_head": rejected,
+        "feedback": ov.get("feedback") or "",
+        "functional_e2e": evidence.get("functional_e2e"),
+        "rc_alpha": evidence.get("rc_alpha"),
+        "implementation": evidence.get("implementation"),
+        "integration": evidence.get("integration"),
+    })
+    rejected_heads = list(evidence.get("rejected_candidates") or [])
+    if rejected not in rejected_heads:
+        rejected_heads.append(rejected)
+    e2e_runs = list(evidence.get("e2e_runs") or [])
+    if evidence.get("functional_e2e"):
+        e2e_runs.append(evidence["functional_e2e"])
+    evidence["repair_history"] = history
+    evidence["rejected_candidates"] = rejected_heads
+    evidence["e2e_runs"] = e2e_runs
+    evidence["_repair"] = {
+        "reason": "owner_reject",
+        "rejected_head": rejected,
+        "feedback": ov.get("feedback") or "",
+        "defects": _split_defects(ov.get("feedback") or ""),
+    }
+    evidence.pop("rc_alpha", None)
+    evidence.pop("functional_e2e", None)
+    evidence.pop("implementation", None)
+    evidence.pop("integration", None)
+    evidence["lifecycle"] = lifecycle_of(evidence)
+    return evidence
+
+
+def _split_defects(text: str) -> list[str]:
+    parts = [part.strip(" -") for part in re.split(r"[;\n]+", text) if part.strip()]
+    return parts or ([text] if text else [])
+
+
+def _stale_failed_e2e(evidence: dict[str, Any]) -> dict[str, Any]:
+    e2e = evidence.get("functional_e2e") or {}
+    if e2e.get("result") != "FAIL":
+        return evidence
+    head = str(e2e.get("candidate") or e2e.get("candidate_head") or "")
+    history = list(evidence.get("repair_history") or [])
+    history.append({
+        "reason": "ag_e2e_fail",
+        "candidate_head": head,
+        "functional_e2e": e2e,
+        "implementation": evidence.get("implementation"),
+        "integration": evidence.get("integration"),
+    })
+    e2e_runs = list(evidence.get("e2e_runs") or [])
+    e2e_runs.append(e2e)
+    defects = e2e.get("defects") or _split_defects(str(e2e.get("detail") or ""))
+    evidence["repair_history"] = history
+    evidence["e2e_runs"] = e2e_runs
+    evidence["_repair"] = {
+        "reason": "ag_e2e_fail",
+        "rejected_head": head,
+        "feedback": e2e.get("detail") or "",
+        "defects": defects,
+    }
+    evidence.pop("functional_e2e", None)
+    evidence.pop("implementation", None)
+    evidence.pop("integration", None)
+    evidence.pop("rc_alpha", None)
+    evidence["lifecycle"] = lifecycle_of(evidence)
+    return evidence
 
 
 def lifecycle_of(evidence: Mapping[str, Any]) -> str:
@@ -125,6 +222,7 @@ def run(mission: Any, *, vault_root: str | Path,
     """Advance one mission as far as executors can prove. Never serves a prototype."""
 
     evidence = {**seed_evidence(mission), **(mission.evidence or {})}
+    evidence = apply_owner_reject(dict(evidence))
     work = Path(state_dir) / "pcp-pipeline" / mission.package_id / "work"
     work.mkdir(parents=True, exist_ok=True)
     if not (evidence.get("hermes") or {}).get("routing"):
@@ -138,30 +236,49 @@ def run(mission: Any, *, vault_root: str | Path,
         evidence["lifecycle"] = lifecycle_of(evidence)
         if not (evidence["architecture"] or {}).get("artifact"):
             return evidence
-    if not ((evidence.get("implementation") or {}).get("head") or
-            (evidence.get("implementation") or {}).get("packages")):
-        evidence["implementation"] = executors.implementation(
-            mission, evidence["architecture"], work)
-        evidence["lifecycle"] = lifecycle_of(evidence)
+    for _ in range(MAX_REPAIR):
+        evidence = apply_owner_reject(evidence)
+        repair = evidence.get("_repair") if isinstance(evidence.get("_repair"), Mapping) else None
         if not ((evidence.get("implementation") or {}).get("head") or
                 (evidence.get("implementation") or {}).get("packages")):
-            return evidence
-    if not (evidence.get("integration") or {}).get("candidate_head"):
-        evidence["integration"] = executors.integrate(
-            mission, evidence["implementation"], work)
-        evidence["lifecycle"] = lifecycle_of(evidence)
+            evidence["implementation"] = executors.implementation(
+                mission, evidence["architecture"], work, repair)
+            evidence["lifecycle"] = lifecycle_of(evidence)
+            if not ((evidence.get("implementation") or {}).get("head") or
+                    (evidence.get("implementation") or {}).get("packages")):
+                return evidence
         if not (evidence.get("integration") or {}).get("candidate_head"):
-            return evidence
-    head = evidence["integration"]["candidate_head"]
-    if (evidence.get("functional_e2e") or {}).get("result") != "PASS":
-        evidence["functional_e2e"] = executors.e2e(mission, work, head)
-        evidence["lifecycle"] = lifecycle_of(evidence)
+            evidence["integration"] = executors.integrate(
+                mission, evidence["implementation"], work)
+            evidence["lifecycle"] = lifecycle_of(evidence)
+            if not (evidence.get("integration") or {}).get("candidate_head"):
+                return evidence
+        head = str(evidence["integration"]["candidate_head"])
+        rejected = {str(item) for item in (evidence.get("rejected_candidates") or ())}
+        if head in rejected:
+            evidence["_repair"] = {
+                **(repair or {}),
+                "reason": (repair or {}).get("reason") or "rejected_head_reuse",
+                "rejected_head": head,
+            }
+            evidence.pop("implementation", None)
+            evidence.pop("integration", None)
+            continue
         if (evidence.get("functional_e2e") or {}).get("result") != "PASS":
-            return evidence
-    if not (evidence.get("rc_alpha") or {}).get("url"):
-        evidence["rc_alpha"] = executors.deploy(
-            mission, work, head, Path(state_dir))
-        evidence["lifecycle"] = lifecycle_of(evidence)
+            evidence["functional_e2e"] = executors.e2e(mission, work, head)
+            evidence["lifecycle"] = lifecycle_of(evidence)
+            if (evidence.get("functional_e2e") or {}).get("result") != "PASS":
+                if (evidence.get("functional_e2e") or {}).get("result") == "FAIL":
+                    evidence = _stale_failed_e2e(evidence)
+                    continue
+                return evidence
+        if not (evidence.get("rc_alpha") or {}).get("url"):
+            evidence["rc_alpha"] = executors.deploy(
+                mission, work, head, Path(state_dir))
+            evidence["lifecycle"] = lifecycle_of(evidence)
+        evidence.pop("_repair", None)
+        return evidence
+    evidence["lifecycle"] = lifecycle_of(evidence)
     return evidence
 
 
@@ -207,6 +324,7 @@ class FleetExecutors:
                 "capabilities": {
                     "architecture": CAP_ARCHITECTURE,
                     "implementation": CAP_IMPLEMENTATION,
+                    "functional_e2e": CAP_QA,
                 },
                 "eligible": {
                     "architecture": [
@@ -216,6 +334,10 @@ class FleetExecutors:
                     "implementation": [
                         profile.as_dict()
                         for profile in catalog.for_capability(CAP_IMPLEMENTATION)
+                    ],
+                    "functional_e2e": [
+                        profile.as_dict()
+                        for profile in catalog.for_capability(CAP_QA)
                     ],
                 },
             },
@@ -252,21 +374,31 @@ class FleetExecutors:
         }
 
     def implementation(self, mission: Any,
-                       architecture: Mapping[str, Any], work: Path) -> dict[str, Any]:
-        existing = self._implementation_result(architecture, work, None)
-        if existing.get("head"):
-            return existing
+                       architecture: Mapping[str, Any], work: Path,
+                       repair: Mapping[str, Any] | None = None) -> dict[str, Any]:
+        if not repair:
+            existing = self._implementation_result(architecture, work, None)
+            if existing.get("head"):
+                return existing
+        rejected = str((repair or {}).get("rejected_head") or "")
+
+        def _new_head() -> bool:
+            result = self._implementation_result(architecture, work, None)
+            head = str(result.get("head") or "")
+            return bool(head) and (not rejected or head != rejected)
+
         attempts = self._execute_capability(
             CAP_IMPLEMENTATION, mission, work,
             prompt_for=lambda profile: (
+                _repair_prompt(mission, architecture, work, profile, repair)
+                if repair else
                 _implementation_commit_prompt(mission, architecture, work, profile)
                 if _git_dirty(work)
                 else _implementation_prompt(mission, architecture, work, profile)
             ),
-            succeeded=lambda: bool(
-                self._implementation_result(architecture, work, None).get("head")),
+            succeeded=_new_head,
             context={
-                "difficulty": "high",
+                "difficulty": "recovery" if repair else "high",
                 "incumbent": self._routing(work).get("incumbent") or "",
             },
         )
@@ -274,6 +406,8 @@ class FleetExecutors:
         result = self._implementation_result(architecture, work, selected)
         result["attempts"] = attempts
         result["live"] = self._live(work)
+        if repair:
+            result["repair"] = dict(repair)
         return result
 
     def _execute_capability(
@@ -429,38 +563,74 @@ class FleetExecutors:
         if _git_head(work) != candidate_head:
             return {
                 "candidate": candidate_head,
+                "candidate_head": candidate_head,
                 "result": "FAIL",
                 "detail": "worktree HEAD is not the integrated candidate",
+                "scenarios": [],
             }
-        scenarios: list[str] = []
-        result = "PASS"
-        detail = ""
+        from . import pcp_missions
+        url = pcp_missions.serve_product_rc(
+            work, state_dir=self.state_dir, package_id=mission.package_id,
+            candidate_head=candidate_head, lane="pcp-e2e")
+        receipt = work / AG_RECEIPT
+        if receipt.is_file():
+            receipt.unlink()
+        architecture = {}
+        try:
+            raw = (work / "architecture.json").read_text(encoding="utf-8")
+            architecture = json.loads(raw)
+        except (OSError, ValueError):
+            architecture = {}
+        routing = self._routing(work)
+
+        def succeeded() -> bool:
+            body = _ag_receipt(work)
+            return (
+                body.get("result") == "PASS"
+                and str(body.get("candidate_head") or "") == candidate_head
+            )
+
+        attempts = self._execute_capability(
+            CAP_QA, mission, work,
+            prompt_for=lambda profile: _e2e_prompt(
+                mission, work, candidate_head, url, profile, architecture,
+                routing.get("repair") or {}),
+            succeeded=succeeded,
+            context={"difficulty": "medium", "rendered": True},
+        )
+        selected = _final_profile(attempts)
+        body = _ag_receipt(work)
+        scenarios = list(body.get("scenarios") or [])
         if (work / "package.json").is_file() and shutil.which("node"):
-            scenarios.append("node --test")
+            scenarios.append("node --test (supplemental)")
             proc = _run(["node", "--test"], cwd=work, timeout=180)
-            if proc.returncode != 0:
-                result = "FAIL"
-                detail = (proc.stdout + proc.stderr)[-4000:]
-        marker = work / CANDIDATE_MARKER
-        if not marker.is_file():
-            if result == "PASS":
-                result = "FAIL"
-                detail = "missing %s" % CANDIDATE_MARKER
-            scenarios.append(CANDIDATE_MARKER)
-        else:
-            scenarios.append(CANDIDATE_MARKER)
-            try:
-                body = json.loads(marker.read_text(encoding="utf-8"))
-            except (OSError, ValueError):
-                body = {}
-            if body.get("candidate_head") != candidate_head:
-                result = "FAIL"
-                detail = "candidate marker does not match integrated head"
+            if proc.returncode != 0 and body.get("result") == "PASS":
+                # Supplemental only: cannot grant PASS, may add evidence.
+                body.setdefault("defects", []).append("supplemental node --test failed")
+        result = "PASS" if succeeded() else "FAIL"
+        if not attempts and not body:
+            result = "FAIL"
+        if attempts and not succeeded():
+            last = attempts[-1]
+            if last.get("availability_result") in _RERUN:
+                result = last["availability_result"]
+        route = selected.as_dict() if selected is not None else (
+            attempts[-1]["candidate"] if attempts else {})
         return {
             "candidate": candidate_head,
-            "scenarios": scenarios,
+            "candidate_head": candidate_head,
+            "mission_key": mission.mission_key,
+            "capability": CAP_QA,
+            "url": url,
+            "scenarios": scenarios or body.get("scenarios") or ["rendered_browser"],
             "result": result,
-            "detail": detail,
+            "defects": body.get("defects") or [],
+            "detail": body.get("detail") or "",
+            "run_id": body.get("run_id") or "",
+            "evidence_artifacts": body.get("evidence") or [str(receipt)],
+            "attempts": attempts,
+            **{k: route[k] for k in ("harness", "model", "effort") if k in route},
+            "receipt": body,
         }
 
     def deploy(self, mission: Any, work: Path,
@@ -602,6 +772,72 @@ def _git_branch(cwd: Path) -> str:
 def _git_dirty(cwd: Path) -> bool:
     proc = _git(["status", "--porcelain"], cwd)
     return proc.returncode == 0 and bool(proc.stdout.strip())
+
+
+def _repair_prompt(mission: Any, architecture: Mapping[str, Any],
+                   work: Path, profile: Profile,
+                   repair: Mapping[str, Any] | None) -> str:
+    repair = repair or {}
+    defects = repair.get("defects") or _split_defects(str(repair.get("feedback") or ""))
+    return (
+        "Continue the SAME Factory implementation mission %s as %s %s / %s. "
+        "Do not start a new product. Repair the current candidate in %s.\n"
+        "Rejected/failed head that must not be reused: %s\n"
+        "Owner/QA defects to fix:\n- %s\n"
+        "Architecture artifact: %s\n"
+        "Commit a new HEAD on an isolated branch. Write implementation.json "
+        "and %s with the new HEAD. Do not present the Lab prototype as RC-alpha. "
+        "Do not stop until the defects above have a concrete product change.\n"
+        % (mission.mission_key, profile.harness, profile.model, profile.effort,
+           work, repair.get("rejected_head") or "",
+           "\n- ".join(str(item) for item in defects) or "(see feedback)",
+           architecture.get("artifact") or "", CANDIDATE_MARKER)
+    )
+
+
+def _e2e_prompt(mission: Any, work: Path, candidate_head: str, url: str,
+                profile: Profile, architecture: Mapping[str, Any],
+                repair: Mapping[str, Any]) -> str:
+    arch_e2e = architecture.get("functional_e2e") or architecture.get(
+        "functional_e2e_acceptance") or architecture.get("unmet_visual_bar") or ""
+    defects = repair.get("defects") or ()
+    receipt = work / AG_RECEIPT
+    return (
+        "You are Factory QA / rendered functional E2E (%s %s / %s).\n"
+        "Mission: %s\nCandidate head: %s\nRendered URL: %s\n"
+        "Workspace: %s\n"
+        "Test the ACTUAL running/rendered integrated candidate that would become "
+        "RC-alpha. For browser/visual products, exercise the golden Owner journey "
+        "in a real browser and inspect visible behavior.\n"
+        "node --test, unit tests, candidate-marker checks, HTTP 200, and a "
+        "reachable URL may supplement this run but MUST NOT be treated as PASS.\n"
+        "Evaluate at minimum:\n"
+        "- persistent/repeated map or render flicker during normal tick/update;\n"
+        "- road/map rendering quality against the approved PCP/architecture visual bar;\n"
+        "- obvious layout/art regressions in the golden Owner journey;\n"
+        "- interaction failures in the Owner-testable flow;\n"
+        "- architecture-recorded unmet visual/product acceptance: %s\n"
+        "Prior defects: %s\n"
+        "Write %s as JSON with keys: mission_key, candidate_head, capability, "
+        "runner, model, effort, run_id, scenarios, result (PASS or FAIL), "
+        "defects (array), evidence (array), detail.\n"
+        "candidate_head MUST equal %s. Do not modify product source. "
+        "Do not fake PASS. If the URL is missing or the page is a stub, FAIL.\n"
+        % (profile.harness, profile.model, profile.effort,
+           mission.mission_key, candidate_head, url or "(missing rendered URL)",
+           work, arch_e2e, defects, receipt, candidate_head)
+    )
+
+
+def _ag_receipt(work: Path) -> dict[str, Any]:
+    path = work / AG_RECEIPT
+    if not path.is_file():
+        return {}
+    try:
+        body = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return {}
+    return body if isinstance(body, dict) else {}
 
 
 def _architecture_prompt(mission: Any, hermes: Mapping[str, Any],

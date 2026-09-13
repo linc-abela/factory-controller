@@ -16,6 +16,7 @@ from typing import Sequence
 MAP_RELPATH = Path("FACTORY/roadmap/phase-2-agent-capability-mapping.md")
 CAP_ARCHITECTURE = "architecture / technical design"
 CAP_IMPLEMENTATION = "developer fleet"
+CAP_QA = "qa / e2e / regression / performance"
 
 _CELL = re.compile(r"[*_`]+")
 _EFFORT = re.compile(r"\b(low|medium|high|max|xhigh)\b", re.I)
@@ -120,7 +121,7 @@ def parse(text: str) -> CapabilityMap:
 
 
 def _capability_key(capability: str) -> str:
-    for prefix in (CAP_ARCHITECTURE, CAP_IMPLEMENTATION):
+    for prefix in (CAP_ARCHITECTURE, CAP_IMPLEMENTATION, CAP_QA):
         if capability.startswith(prefix):
             return prefix
     return capability

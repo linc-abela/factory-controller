@@ -14,6 +14,7 @@ from factory_controller.fleet_harness import (
     HarnessReceipt,
     QUOTA_EXHAUSTED,
     classify_provider_output,
+    provider_model_id,
 )
 
 
@@ -160,6 +161,10 @@ class CapabilityResolverTests(unittest.TestCase):
         self.assertEqual(arch[1].role, "continuity_fallback")
         self.assertGreaterEqual(len(impl), 3)
         self.assertTrue(all(p.role == "member" for p in impl))
+        qa = catalog.for_capability(capability_map.CAP_QA)
+        self.assertGreaterEqual(len(qa), 1)
+        self.assertEqual(qa[0].harness, "antigravity")
+        self.assertEqual(qa[0].effort, "medium")
 
 
 class HarnessNormalizationTests(unittest.TestCase):
@@ -171,6 +176,13 @@ class HarnessNormalizationTests(unittest.TestCase):
         self.assertEqual(
             classify_provider_output("Error: Not logged in", 1),
             "TEMPORARILY_UNAVAILABLE")
+
+    def test_antigravity_gemini_medium_uses_flash_model_id(self):
+        profile = capability_map.Profile(
+            capability=capability_map.CAP_QA, role="member",
+            harness="antigravity", model="gemini-3.8", effort="medium",
+            purpose="e2e", quota_continuity=False)
+        self.assertEqual(provider_model_id(profile), "gemini-3.8-flash-medium")
 
 
 class GoldenPathRoutingAbstractionTests(unittest.TestCase):

@@ -31,6 +31,8 @@ class _FakeFleet:
     def __init__(self, prototype: Path) -> None:
         self.prototype = prototype
         self.head = FAKE_HEAD
+        self.e2e_queue: list[str] = []
+        self.impls = 0
 
     def hermes(self, mission):
         return {
@@ -40,6 +42,7 @@ class _FakeFleet:
                 "capabilities": {
                     "architecture": "architecture / technical design",
                     "implementation": "developer fleet",
+                    "functional_e2e": "qa / e2e / regression / performance",
                 },
                 "architecture": dict(FAKE_ARCH),
                 "implementation": dict(FAKE_DEV),
@@ -69,8 +72,11 @@ class _FakeFleet:
             "body": body,
         }
 
-    def implementation(self, mission, architecture, work: Path):
+    def implementation(self, mission, architecture, work: Path, repair=None):
         work.mkdir(parents=True, exist_ok=True)
+        self.impls += 1
+        if repair:
+            self.head = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
         if self.prototype.is_dir():
             for item in self.prototype.iterdir():
                 if item.is_file():
@@ -102,10 +108,14 @@ class _FakeFleet:
     def e2e(self, mission, work: Path, candidate_head: str):
         body = (work / "index.html").read_text(encoding="utf-8")
         ok = "post-intake implementation delta" in body
+        result = "PASS" if ok else "FAIL"
+        if self.e2e_queue:
+            result = self.e2e_queue.pop(0)
         return {
             "candidate": candidate_head,
             "scenarios": ["playable finite shoe", "post-intake delta"],
-            "result": "PASS" if ok else "FAIL",
+            "result": result,
+            "defects": [] if result == "PASS" else ["rendered visual bar unmet"],
         }
 
     def deploy(self, mission, work: Path, candidate_head: str, state_dir: Path):
@@ -418,6 +428,127 @@ class SF272PCPMissionQueueTests(unittest.TestCase):
         self.assertIn("lodus-kyriedachi-life", rows)
         self.assertEqual(rows["lodus-kyriedachi-life"].lifecycle, "HERMES")
         self.assertFalse(rows["lodus-kyriedachi-life"].clarification)
+
+    def test_owner_reject_continues_same_mission_to_new_rc(self):
+        checkout = self.root / "projects" / "lodus-casino"
+        checkout.mkdir(parents=True)
+        (checkout / "index.html").write_text(
+            "<!doctype html><title>lodus-casino</title><p>finite-shoe higher/lower</p>\n",
+            encoding="utf-8")
+        executors = _FakeFleet(checkout)
+
+        def process(mission):
+            return golden_path.run(
+                mission, vault_root=self.vault, state_dir=self.root / "state",
+                executors=executors)
+
+        rows = self.plane.advance(process=process)
+        casino = next(row for row in rows if row.package_id == "lodus-casino")
+        self.addCleanup(lambda: self._stop_rc(self.root / "state", "lodus-casino"))
+        first_key = casino.mission_key
+        first_url = casino.rc_alpha_url
+        self.assertEqual(casino.lifecycle, "OWNER_VALIDATION")
+        rejected = casino.evidence["integration"]["candidate_head"]
+        updated = self.plane.ingest_owner_validation(
+            first_key, rejected, "REJECT",
+            "map flickers; roads are crude diagonal bars")
+        self.assertEqual(updated.mission_key, first_key)
+        self.assertEqual(updated.rc_alpha_url, "")
+        self.assertNotEqual(updated.lifecycle, "OWNER_VALIDATION")
+        self.assertEqual(
+            updated.evidence["owner_validation"]["candidate_head"], rejected)
+        rows = self.plane.advance(process=process)
+        casino = next(row for row in rows if row.mission_key == first_key)
+        self.assertEqual(casino.mission_key, first_key)
+        self.assertEqual(casino.lifecycle, "OWNER_VALIDATION")
+        self.assertTrue(casino.rc_alpha_url)
+        self.assertNotEqual(casino.rc_alpha_url, first_url)
+        self.assertNotEqual(
+            casino.evidence["integration"]["candidate_head"], rejected)
+        self.assertIn(rejected, casino.evidence["rejected_candidates"])
+
+    def test_e2e_fail_triggers_repair_before_rc_alpha(self):
+        checkout = self.root / "projects" / "lodus-casino"
+        checkout.mkdir(parents=True)
+        (checkout / "index.html").write_text(
+            "<!doctype html><title>lodus-casino</title><p>finite-shoe higher/lower</p>\n",
+            encoding="utf-8")
+        executors = _FakeFleet(checkout)
+        executors.e2e_queue = ["FAIL", "PASS"]
+
+        def process(mission):
+            return golden_path.run(
+                mission, vault_root=self.vault, state_dir=self.root / "state",
+                executors=executors)
+
+        rows = self.plane.advance(process=process)
+        casino = next(row for row in rows if row.package_id == "lodus-casino")
+        self.addCleanup(lambda: self._stop_rc(self.root / "state", "lodus-casino"))
+        self.assertEqual(casino.lifecycle, "OWNER_VALIDATION")
+        self.assertEqual(casino.evidence["functional_e2e"]["result"], "PASS")
+        self.assertTrue(casino.evidence.get("e2e_runs"))
+        self.assertEqual(casino.evidence["e2e_runs"][0]["result"], "FAIL")
+        self.assertNotEqual(
+            casino.evidence["integration"]["candidate_head"], FAKE_HEAD)
+
+
+class SF272RenderedE2ETests(unittest.TestCase):
+    def test_node_test_pass_is_not_ag_e2e_pass(self):
+        from factory_controller.capability_map import parse as parse_map
+        from factory_controller.fleet_harness import HarnessReceipt
+
+        catalog = parse_map("""
+| Capability / role | Runner | Model | Effort / policy | Purpose |
+|---|---|---|---|---|
+| **QA / E2E / regression / performance** | Antigravity | **Gemini 3.8** | **Medium** | rendered functional E2E |
+| **Developer Fleet** | Cursor | **Nova 2** | **High** | recovery |
+""")
+        calls: list[str] = []
+
+        class Harness:
+            def run(self, profile, prompt, cwd):
+                calls.append(profile.key)
+                return HarnessReceipt(
+                    status="COMPLETED", harness=profile.harness,
+                    model=profile.model, effort=profile.effort,
+                    stdout_tail="node tests passed")
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            work = root / "work"
+            work.mkdir()
+            (work / "index.html").write_text(
+                "<!doctype html><title>x</title><p>ok</p>\n", encoding="utf-8")
+            (work / "package.json").write_text('{"name":"x"}', encoding="utf-8")
+            golden_path._git(["init"], work)
+            golden_path._git(["add", "-A"], work)
+            golden_path._git(["commit", "-m", "intake"], work)
+            head = golden_path._git_head(work)
+            (work / golden_path.CANDIDATE_MARKER).write_text(json.dumps({
+                "candidate_head": head, "package_id": "x", "mission_key": "m",
+            }), encoding="utf-8")
+            mission = type("M", (), {
+                "mission_key": "m", "package_id": "x",
+                "canonical_path": "PRODUCTS/x/pcp.json",
+                "package_digest": "d", "evidence": None,
+            })()
+            executors = golden_path.FleetExecutors(
+                vault_root=root, state_dir=root, catalog=catalog,
+                harness=Harness())
+            result = executors.e2e(mission, work, head)
+            receipt = root / "pcp-e2e" / "x.json"
+            if receipt.is_file():
+                try:
+                    pid = int(json.loads(receipt.read_text()).get("pid") or 0)
+                    if pid > 1:
+                        os.kill(pid, 15)
+                except (OSError, ValueError, ProcessLookupError):
+                    pass
+        self.assertEqual(result["result"], "FAIL")
+        self.assertEqual(result["capability"], golden_path.CAP_QA)
+        self.assertTrue(calls)
+        self.assertIn("antigravity", calls[0])
+        self.assertNotEqual(result.get("harness"), "node")
 
 
 if __name__ == "__main__":
