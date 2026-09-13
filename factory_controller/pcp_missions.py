@@ -7,6 +7,13 @@ Notion is never consulted. Duplicate detection is path + package digest.
 from __future__ import annotations
 
 import json
+import os
+import socket
+import subprocess
+import sys
+import time
+import urllib.error
+import urllib.request
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Mapping
@@ -235,8 +242,62 @@ def mission_key(canonical_path: str, package_digest: str) -> str:
     return "%s@%s" % (canonical_path, package_digest)
 
 
+_PROJECT_ROOTS = (
+    Path("/Users/Shared/Projects"),
+    Path("/Users/Shared/Projects/software-factory"),
+)
+_STUB_MARKERS = (
+    "<p>RC-alpha. Stop: Owner Validation.</p>",
+    "RC-alpha. Stop: Owner Validation.",
+)
+
+
+def _web_root(checkout: Path) -> Path | None:
+    if not checkout.is_dir():
+        return None
+    if (checkout / "index.html").is_file():
+        return checkout
+    public = checkout / "public"
+    if (public / "index.html").is_file():
+        return public
+    return None
+
+
+def resolve_product_checkout(vault_root: str | Path, mission: PCPMission, *,
+                             project_roots: tuple[Path, ...] | None = None
+                             ) -> Path | None:
+    """Locate the product bytes named by the promoted PCP. Notion is unused."""
+
+    names: list[str] = []
+    pcp_path = Path(vault_root) / mission.canonical_path
+    try:
+        package = json.loads(pcp_path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        package = {}
+    handoff = package.get("factory_handoff") if isinstance(package, Mapping) else None
+    if isinstance(handoff, Mapping):
+        source = handoff.get("source_repository")
+        if isinstance(source, str) and source.strip():
+            names.append(source.strip().rsplit("/", 1)[-1])
+        product_id = handoff.get("product_id")
+        if isinstance(product_id, str) and product_id.strip():
+            names.append(product_id.strip())
+    names.append(mission.package_id)
+    seen: set[str] = set()
+    roots = project_roots if project_roots is not None else _PROJECT_ROOTS
+    for name in names:
+        if not name or name in seen:
+            continue
+        seen.add(name)
+        for root in roots:
+            web = _web_root(root / name)
+            if web is not None:
+                return web
+    return None
+
+
 def write_rc_alpha_surface(root: str | Path, mission: PCPMission) -> Path:
-    """Write a reachable RC-alpha surface for Owner Validation. No Notion."""
+    """Test/fixture helper. Not a working product RC."""
     dest = Path(root) / mission.package_id
     dest.mkdir(parents=True, exist_ok=True)
     (dest / "index.html").write_text(
@@ -255,6 +316,87 @@ def write_rc_alpha_surface(root: str | Path, mission: PCPMission) -> Path:
         encoding="utf-8",
     )
     return dest
+
+
+def is_stub_rc_body(body: str) -> bool:
+    return any(marker in body for marker in _STUB_MARKERS)
+
+
+def _pid_alive(pid: int) -> bool:
+    if pid <= 0:
+        return False
+    try:
+        os.kill(pid, 0)
+    except OSError:
+        return False
+    return True
+
+
+def _fetch(url: str, timeout: float = 2.0) -> str:
+    with urllib.request.urlopen(url, timeout=timeout) as resp:
+        return resp.read().decode("utf-8", errors="replace")
+
+
+def _free_port() -> int:
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+        sock.bind(("127.0.0.1", 0))
+        return int(sock.getsockname()[1])
+
+
+def serve_product_rc(web_root: Path, *, state_dir: str | Path, package_id: str) -> str:
+    """Serve existing product bytes on loopback. Never invents a stub page."""
+
+    root = Path(web_root).resolve()
+    if _web_root(root) is None and not (root / "index.html").is_file():
+        return ""
+    receipt_dir = Path(state_dir) / "pcp-rc-alpha"
+    receipt_dir.mkdir(parents=True, exist_ok=True)
+    receipt = receipt_dir / ("%s.json" % package_id)
+    if receipt.is_file():
+        try:
+            prior = json.loads(receipt.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            prior = {}
+        url = str(prior.get("url") or "")
+        pid = int(prior.get("pid") or 0)
+        if url and _pid_alive(pid):
+            try:
+                body = _fetch(url)
+            except (OSError, urllib.error.URLError, TimeoutError, ValueError):
+                body = ""
+            if body and not is_stub_rc_body(body):
+                return url
+    port = _free_port()
+    log = receipt.with_suffix(".log")
+    with log.open("w", encoding="utf-8") as handle:
+        proc = subprocess.Popen(
+            [
+                sys.executable, "-m", "http.server", str(port),
+                "--bind", "127.0.0.1", "--directory", str(root),
+            ],
+            stdout=handle,
+            stderr=subprocess.STDOUT,
+            start_new_session=True,
+        )
+    url = "http://127.0.0.1:%d/" % port
+    body = ""
+    for _ in range(50):
+        if proc.poll() is not None:
+            return ""
+        try:
+            body = _fetch(url)
+            if body:
+                break
+        except (OSError, urllib.error.URLError, TimeoutError, ValueError):
+            time.sleep(0.05)
+    if not body or is_stub_rc_body(body):
+        proc.terminate()
+        return ""
+    receipt.write_text(
+        json.dumps({"url": url, "pid": proc.pid, "root": str(root)}, indent=2) + "\n",
+        encoding="utf-8",
+    )
+    return url
 
 
 class PCPMissionPlane:

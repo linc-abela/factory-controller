@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import os
 import tempfile
 import unittest
 from pathlib import Path
@@ -169,6 +170,24 @@ class SF272PCPMissionQueueTests(unittest.TestCase):
         self.store = MissionStore(self.root / "controller.db")
         self.plane = pcp_missions.PCPMissionPlane(self.store, self.vault)
 
+    @staticmethod
+    def _stop_rc(state_dir, package_id):
+        receipt = Path(state_dir) / "pcp-rc-alpha" / ("%s.json" % package_id)
+        if not receipt.is_file():
+            return
+        try:
+            pid = int(json.loads(receipt.read_text(encoding="utf-8")).get("pid") or 0)
+        except (OSError, ValueError):
+            return
+        if pid > 1:
+            try:
+                os.killpg(pid, 15)
+            except ProcessLookupError:
+                try:
+                    os.kill(pid, 15)
+                except ProcessLookupError:
+                    pass
+
     def test_promoted_pcp_is_detected_without_notion(self):
         rows = self.plane.sync()
         ids = {row.package_id: row for row in rows}
@@ -220,35 +239,60 @@ class SF272PCPMissionQueueTests(unittest.TestCase):
         self.assertEqual(rows["lodus-kyriedachi-life"].lifecycle, "IMPLEMENT")
         self.assertFalse(rows["lodus-kyriedachi-life"].clarification)
 
+    def test_missing_checkout_does_not_invent_a_stub_rc(self):
+        rows = self.plane.advance(rc_alpha_for=lambda mission: "")
+        casino = next(row for row in rows if row.package_id == "lodus-casino")
+        self.assertEqual(casino.lifecycle, "IMPLEMENT")
+        self.assertEqual(casino.rc_alpha_url, "")
+
+    def test_handoff_checkout_is_served_as_working_rc(self):
+        checkout = self.root / "projects" / "prototype-casino"
+        checkout.mkdir(parents=True)
+        (checkout / "index.html").write_text(
+            "<!doctype html><title>Casino proof</title><p>playable finite shoe</p>\n",
+            encoding="utf-8")
+        casino = next(row for row in self.plane.sync() if row.package_id == "lodus-casino")
+        pcp_path = self.vault / casino.canonical_path
+        body = json.loads(pcp_path.read_text(encoding="utf-8"))
+        body["factory_handoff"] = {
+            "product_id": "casino",
+            "source_repository": "linc-abela/prototype-casino",
+        }
+        pcp_path.write_text(json.dumps(body), encoding="utf-8")
+        found = pcp_missions.resolve_product_checkout(
+            self.vault, casino, project_roots=(self.root / "projects",))
+        self.assertEqual(found, checkout)
+        url = pcp_missions.serve_product_rc(
+            found, state_dir=self.root / "state", package_id=casino.package_id)
+        self.addCleanup(lambda: self._stop_rc(self.root / "state", casino.package_id))
+        self.assertTrue(url.startswith("http://127.0.0.1:"))
+        fetched = pcp_missions._fetch(url)
+        self.assertIn("playable finite shoe", fetched)
+        self.assertFalse(pcp_missions.is_stub_rc_body(fetched))
+
     def test_golden_path_admits_controller_mission_and_working_rc(self):
-        import http.server
-        import threading
-        import urllib.request
+        checkout = self.root / "projects" / "lodus-casino"
+        checkout.mkdir(parents=True)
+        (checkout / "index.html").write_text(
+            "<!doctype html><title>lodus-casino</title><p>finite-shoe higher/lower</p>\n",
+            encoding="utf-8")
 
         def rc_alpha_for(mission):
-            surface = pcp_missions.write_rc_alpha_surface(self.root / "rc", mission)
-
-            class _Handler(http.server.SimpleHTTPRequestHandler):
-                def __init__(self, *args, **kwargs):
-                    super().__init__(*args, directory=str(surface), **kwargs)
-
-                def log_message(self, format, *args):
-                    return
-
-            httpd = http.server.ThreadingHTTPServer(("127.0.0.1", 0), _Handler)
-            thread = threading.Thread(target=httpd.serve_forever, daemon=True)
-            thread.start()
-            self.addCleanup(httpd.shutdown)
-            host, port = httpd.server_address[:2]
-            return "http://%s:%s/" % (host, port)
+            found = pcp_missions.resolve_product_checkout(
+                self.vault, mission, project_roots=(self.root / "projects",))
+            if found is None:
+                return ""
+            return pcp_missions.serve_product_rc(
+                found, state_dir=self.root / "state", package_id=mission.package_id)
 
         rows = self.plane.advance(rc_alpha_for=rc_alpha_for)
         casino = next(row for row in rows if row.package_id == "lodus-casino")
+        self.addCleanup(lambda: self._stop_rc(self.root / "state", "lodus-casino"))
         self.assertEqual(casino.lifecycle, "OWNER_VALIDATION")
         self.assertTrue(casino.rc_alpha_url)
-        with urllib.request.urlopen(casino.rc_alpha_url, timeout=2) as resp:
-            body = resp.read().decode("utf-8")
-        self.assertIn("lodus-casino", body)
+        body = pcp_missions._fetch(casino.rc_alpha_url)
+        self.assertIn("finite-shoe higher/lower", body)
+        self.assertFalse(pcp_missions.is_stub_rc_body(body))
         mission, created = self.store.submit(
             {
                 "work_item_id": "lodus-casino:build",

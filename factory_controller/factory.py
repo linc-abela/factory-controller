@@ -322,9 +322,11 @@ def _peer_dir(controller_root: Path, name: str) -> Path:
     if stem.startswith(prefix):
         suffix = stem[len(prefix):]
         if suffix:
-            candidate = parent / (name + suffix)
-            if candidate.is_dir():
-                return candidate
+            for candidate in (
+                    parent / (name + suffix),
+                    Path("/Users/Shared/Projects") / (name + suffix)):
+                if candidate.is_dir():
+                    return candidate
     return parent / name
 
 
@@ -3103,12 +3105,19 @@ class FactoryLifecycle:
                 "block this product." % portfolio_mission.mission_ref)
 
     def _pcp_rc_alpha(self, mission):
-        """Local RC-alpha surface from a promoted PCP. No Notion."""
-        if mission.rc_alpha_url:
-            return mission.rc_alpha_url
-        surface = pcp_missions.write_rc_alpha_surface(
-            self.config.state_dir / "pcp-rc-alpha", mission)
-        return (surface / "index.html").resolve().as_uri()
+        """Serve the PCP-named product checkout. Never a stub page. No Notion."""
+        if mission.rc_alpha_url and mission.rc_alpha_url.startswith("http"):
+            try:
+                body = pcp_missions._fetch(mission.rc_alpha_url)
+            except Exception:
+                body = ""
+            if body and not pcp_missions.is_stub_rc_body(body):
+                return mission.rc_alpha_url
+        checkout = pcp_missions.resolve_product_checkout(self.config.vault_root, mission)
+        if checkout is None:
+            return ""
+        return pcp_missions.serve_product_rc(
+            checkout, state_dir=self.config.state_dir, package_id=mission.package_id)
 
     def _pcp_mission_status_lines(self) -> tuple[tuple[str, ...], str]:
         rows = self.pcp_missions.list()
