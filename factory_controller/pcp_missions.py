@@ -400,7 +400,12 @@ def serve_product_rc(web_root: Path, *, state_dir: str | Path, package_id: str,
             prior = {}
         url = str(prior.get("url") or "")
         pid = int(prior.get("pid") or 0)
-        if url and _pid_alive(pid) and str(prior.get("candidate_head") or "") == candidate_head:
+        prior_root = Path(str(prior.get("root") or "")).resolve()
+        if (
+            url and _pid_alive(pid)
+            and str(prior.get("candidate_head") or "") == candidate_head
+            and prior_root == root
+        ):
             try:
                 body = _fetch(url)
             except (OSError, urllib.error.URLError, TimeoutError, ValueError):

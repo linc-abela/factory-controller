@@ -550,6 +550,76 @@ class SF272RenderedE2ETests(unittest.TestCase):
         self.assertIn("antigravity", calls[0])
         self.assertNotEqual(result.get("harness"), "node")
 
+    def test_serve_does_not_reuse_a_different_root(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            work = root / "work"
+            sealed = root / "sealed"
+            work.mkdir()
+            sealed.mkdir()
+            marker = {
+                "candidate_head": "abc123",
+                "package_id": "x",
+                "mission_key": "m",
+            }
+            for folder in (work, sealed):
+                (folder / "index.html").write_text(
+                    "<!doctype html><title>x</title><p>ok</p>\n",
+                    encoding="utf-8")
+                (folder / ".factory-candidate.json").write_text(
+                    json.dumps(marker), encoding="utf-8")
+            dirty = pcp_missions.serve_product_rc(
+                work, state_dir=root, package_id="x",
+                candidate_head="abc123", lane="pcp-e2e")
+            first = json.loads(
+                (root / "pcp-e2e" / "x.json").read_text(encoding="utf-8"))
+            sealed_url = pcp_missions.serve_product_rc(
+                sealed, state_dir=root, package_id="x",
+                candidate_head="abc123", lane="pcp-e2e")
+            second = json.loads(
+                (root / "pcp-e2e" / "x.json").read_text(encoding="utf-8"))
+            _kill_pid(int(first.get("pid") or 0))
+            _kill_pid(int(second.get("pid") or 0))
+            self.assertTrue(dirty)
+            self.assertTrue(sealed_url)
+            self.assertNotEqual(dirty, sealed_url)
+            self.assertEqual(Path(second["root"]).resolve(), sealed.resolve())
+
+    def test_worktree_bound_e2e_is_invalidated(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            work = root / "work"
+            work.mkdir()
+            (root / "pcp-e2e").mkdir()
+            (root / "pcp-e2e" / "x.json").write_text(json.dumps({
+                "url": "http://127.0.0.1:9/",
+                "pid": 1,
+                "root": str(work),
+                "candidate_head": "deadbeef",
+            }), encoding="utf-8")
+            evidence = {
+                "functional_e2e": {
+                    "result": "PASS",
+                    "url": "http://127.0.0.1:9/",
+                    "candidate_head": "deadbeef",
+                },
+                "rc_alpha": {"url": "http://127.0.0.1:10/"},
+            }
+            self.assertTrue(golden_path._e2e_served_worktree(
+                evidence, root, "x", work))
+
+
+def _kill_pid(pid: int) -> None:
+    if pid <= 1:
+        return
+    try:
+        os.killpg(pid, 15)
+    except (ProcessLookupError, PermissionError, OSError):
+        try:
+            os.kill(pid, 15)
+        except (ProcessLookupError, PermissionError, OSError):
+            pass
+
 
 if __name__ == "__main__":
     unittest.main()

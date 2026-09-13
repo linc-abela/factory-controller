@@ -224,6 +224,9 @@ def run(mission: Any, *, vault_root: str | Path,
     evidence = {**seed_evidence(mission), **(mission.evidence or {})}
     evidence = apply_owner_reject(dict(evidence))
     work = Path(state_dir) / "pcp-pipeline" / mission.package_id / "work"
+    if _e2e_served_worktree(evidence, Path(state_dir), mission.package_id, work):
+        evidence.pop("functional_e2e", None)
+        evidence.pop("rc_alpha", None)
     work.mkdir(parents=True, exist_ok=True)
     if not (evidence.get("hermes") or {}).get("routing"):
         evidence["hermes"] = executors.hermes(mission)
@@ -452,7 +455,8 @@ class FleetExecutors:
             if attempts:
                 attempts[-1]["next_selected"] = profile.as_dict()
             attempts.append(self._one_attempt(
-                capability, mission, work, profile, choice, prompt_for, succeeded))
+                capability, mission, work, profile, choice, prompt_for,
+                succeeded, context=ctx))
             if succeeded():
                 return attempts
             receipt_status = attempts[-1]["availability_result"]
@@ -460,7 +464,8 @@ class FleetExecutors:
                 continue
             if receipt_status == COMPLETED and _git_dirty(work):
                 attempts.append(self._one_attempt(
-                    capability, mission, work, profile, choice, prompt_for, succeeded))
+                    capability, mission, work, profile, choice, prompt_for,
+                    succeeded, context=ctx))
                 if succeeded():
                     return attempts
                 if attempts[-1]["availability_result"] in _RERUN:
@@ -470,9 +475,11 @@ class FleetExecutors:
 
     def _one_attempt(
         self, capability, mission, work, profile, choice, prompt_for, succeeded,
+        context: Mapping[str, Any] | None = None,
     ) -> dict[str, Any]:
         started = time.time()
-        receipt = self._harness.run(profile, prompt_for(profile), work)
+        inspect = Path((context or {}).get("inspect_dir") or work)
+        receipt = self._harness.run(profile, prompt_for(profile), inspect)
         ended = time.time()
         if _git_dirty(work):
             self._set_incumbent(work, profile.key)
@@ -605,6 +612,22 @@ class FleetExecutors:
         url = pcp_missions.serve_product_rc(
             exported, state_dir=self.state_dir, package_id=mission.package_id,
             candidate_head=candidate_head, lane="pcp-e2e")
+        served = Path(self.state_dir) / "pcp-e2e" / ("%s.json" % mission.package_id)
+        served_root = ""
+        try:
+            served_root = str(json.loads(
+                served.read_text(encoding="utf-8")).get("root") or "")
+        except (OSError, ValueError):
+            served_root = ""
+        if not url or Path(served_root).resolve() != exported.resolve():
+            return {
+                "candidate": candidate_head,
+                "candidate_head": candidate_head,
+                "result": "FAIL",
+                "detail": "rendered E2E URL is not the sealed candidate export",
+                "scenarios": [],
+                "url": url,
+            }
         receipt = work / AG_RECEIPT
         if receipt.is_file():
             receipt.unlink()
@@ -617,6 +640,10 @@ class FleetExecutors:
         routing = self._routing(work)
 
         def succeeded() -> bool:
+            exported_body = _ag_receipt(exported)
+            if exported_body and not _ag_receipt(work):
+                (work / AG_RECEIPT).write_text(
+                    json.dumps(exported_body, indent=2) + "\n", encoding="utf-8")
             body = _ag_receipt(work)
             return (
                 body.get("result") == "PASS"
@@ -626,11 +653,17 @@ class FleetExecutors:
         attempts = self._execute_capability(
             CAP_QA, mission, work,
             prompt_for=lambda profile: _e2e_prompt(
-                mission, work, candidate_head, url, profile, architecture,
+                mission, exported, candidate_head, url, profile, architecture,
                 routing.get("repair") or {}),
             succeeded=succeeded,
-            context={"difficulty": "medium", "rendered": True},
+            context={
+                "difficulty": "medium",
+                "rendered": True,
+                "inspect_dir": str(exported),
+            },
         )
+        if _ag_receipt(exported) and not _ag_receipt(work):
+            shutil.copy2(exported / AG_RECEIPT, work / AG_RECEIPT)
         _capture_ag_receipt(work, attempts, candidate_head, mission)
         selected = _final_profile(attempts)
         body = _ag_receipt(work)
@@ -874,6 +907,26 @@ def _e2e_prompt(mission: Any, work: Path, candidate_head: str, url: str,
            mission.mission_key, candidate_head, url or "(missing rendered URL)",
            work, arch_e2e, defects, receipt, candidate_head)
     )
+
+
+def _e2e_served_worktree(evidence: Mapping[str, Any], state_dir: Path,
+                         package_id: str, work: Path) -> bool:
+    """True when a recorded AG PASS hit the dirty pipeline checkout."""
+
+    e2e = evidence.get("functional_e2e") or {}
+    if e2e.get("result") != "PASS":
+        return False
+    receipt = Path(state_dir) / "pcp-e2e" / ("%s.json" % package_id)
+    try:
+        prior = json.loads(receipt.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return False
+    root = Path(str(prior.get("root") or "")).resolve()
+    if not work.exists():
+        return False
+    if root != work.resolve():
+        return False
+    return str(prior.get("url") or "") == str(e2e.get("url") or "")
 
 
 def _export_head(work: Path, dest: Path, head: str) -> bool:
