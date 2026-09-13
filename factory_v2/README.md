@@ -20,7 +20,8 @@ canonical names `ADMITTED`, `BUILDING`, `VERIFYING`, `REWORK_REQUIRED`,
 From this repository (Python 3.11+, stdlib only):
 
 ```sh
-python3 -m unittest tests.test_factory_v2_lifecycle tests.test_factory_v2_contracts
+python3 -m unittest tests.test_factory_v2_lifecycle tests.test_factory_v2_contracts tests.test_factory_v2_conformance_protocol
+python3 validation/conformance_controller.py --request request.json
 python3 -m factory_v2 admit-pcp path/to/canonical-pcp-handoff.json
 python3 -m factory_v2 --simulated admit-pcp path/to/canonical-pcp-handoff.json
 python3 -m factory_v2 tick msn-<pcp-hash-prefix>

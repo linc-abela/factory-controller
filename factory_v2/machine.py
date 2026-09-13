@@ -28,9 +28,17 @@ from factory_v2.store import Store
 class GateError(RuntimeError):
     """Illegal lifecycle transition or missing gate evidence."""
 
+    def __init__(self, message: str, *, code: str = "GATE_ERROR"):
+        super().__init__(message)
+        self.code = code
+
 
 class InvariantError(PermissionError):
     """Protected Factory invariant violated independently of prompts."""
+
+    def __init__(self, message: str, *, code: str = "INVARIANT"):
+        super().__init__(message)
+        self.code = code
 
 
 class Controller:
@@ -61,7 +69,7 @@ class Controller:
         try:
             admitted = load_pcp(pcp)
         except ContractError as exc:
-            raise GateError(str(exc)) from exc
+            raise GateError(str(exc), code=getattr(exc, "code", "PCP_MALFORMED")) from exc
         h = pcp_hash(admitted)
         existing = self.store.get_by_hash(h)
         if existing is not None:
@@ -168,10 +176,16 @@ class Controller:
         if snap.approved is None:
             raise InvariantError("Distribution requires an Owner-approved candidate tuple")
         if substitute is not None and substitute.key() != snap.approved.key():
-            raise InvariantError("Distribution cannot replace the approved candidate")
+            raise InvariantError(
+                "Distribution cannot replace the approved candidate",
+                code="ARTIFACT_SUBSTITUTION",
+            )
         result = self.distributor.distribute(snap.approved, snap.mission_id)
         if result.candidate.key() != snap.approved.key():
-            raise InvariantError("Distribution cannot replace the approved candidate")
+            raise InvariantError(
+                "Distribution cannot replace the approved candidate",
+                code="ARTIFACT_SUBSTITUTION",
+            )
         return self.store.apply_state(
             snap.mission_id,
             MissionState.DISTRIBUTED,
@@ -326,7 +340,10 @@ class Controller:
 
     def _bound(self, verdict: Verdict, expected: CandidateIdentity, channel: str) -> None:
         if verdict.candidate.key() != expected.key():
-            raise InvariantError(f"{channel} verifier cannot substitute a different candidate")
+            raise InvariantError(
+                f"{channel} verifier cannot substitute a different candidate",
+                code="STALE_VERIFIER_CANDIDATE",
+            )
         if verdict.kind not in {channel, "review", "qa"}:
             raise InvariantError(f"{channel} verdict channel required")
         if channel == "review" and verdict.kind != "review":

@@ -36,6 +36,10 @@ PROFILE_ID = "factory-engineering"
 class ContractError(ValueError):
     """Canonical schema or semantic validation failed."""
 
+    def __init__(self, message: str, *, code: str = "CONTRACT_INVALID"):
+        super().__init__(message)
+        self.code = code
+
 
 def contracts_dir() -> Path:
     pinned = Path(__file__).resolve().parent / "canonical_contracts"
@@ -117,15 +121,34 @@ def _semantic(document: dict[str, Any]) -> list[str]:
     return errors
 
 
+def classify_pcp_failure(data: dict[str, Any], message: str) -> str:
+    """Map Gate 1 validation failures onto the black-box protocol codes."""
+    lower = message.lower()
+    if "owner_approval" in lower or "owner approve" in lower:
+        if "owner_approval" not in data:
+            return "OWNER_APPROVAL_REQUIRED"
+        decision = (data.get("owner_approval") or {}).get("decision")
+        if decision != "APPROVE":
+            return "OWNER_APPROVAL_INVALID" if decision else "OWNER_APPROVAL_REQUIRED"
+        return "OWNER_APPROVAL_INVALID"
+    if "source" in lower or "immutable_revision" in lower or "revision" in lower:
+        return "PCP_SOURCE_IDENTITY_INVALID"
+    return "PCP_MALFORMED"
+
+
 def load_pcp(data: dict[str, Any]) -> dict[str, Any]:
     """Gate 1: admit only a schema-valid Owner-APPROVE PCP handoff."""
     try:
         validate_document("pcp-handoff.schema.json", data)
     except ContractError as exc:
-        raise ContractError(f"PCP Gate 1 rejected: {exc}") from exc
+        raise ContractError(
+            f"PCP Gate 1 rejected: {exc}",
+            code=classify_pcp_failure(data if isinstance(data, dict) else {}, str(exc)),
+        ) from exc
     approval = data.get("owner_approval") or {}
     if approval.get("decision") != "APPROVE":
-        raise ContractError("PCP Gate 1 rejected: Owner APPROVE evidence required")
+        code = "OWNER_APPROVAL_REQUIRED" if not approval else "OWNER_APPROVAL_INVALID"
+        raise ContractError("PCP Gate 1 rejected: Owner APPROVE evidence required", code=code)
     return data
 
 
