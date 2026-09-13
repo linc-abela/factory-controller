@@ -23,7 +23,9 @@ from awe_worker.ledger import AWELedger
 from awe_worker.model import AWEWorkItem, ExecutionSlot
 from awe_worker.observation import MemoryTaskSource
 from awe_worker.projection import (
+    DASHBOARD_MODEL_MISMATCH,
     DASHBOARD_STATUS_MISMATCH,
+    DISPATCH_PHYSICAL_MISMATCH,
     DISPATCH_SLOT_AMBIGUOUS,
     DUPLICATE_DASHBOARD_CURRENT,
     FAIL_CLOSED,
@@ -348,6 +350,117 @@ class ProjectionDiagnosticTests(unittest.TestCase):
         report = evaluate_claim_preflight(None)
         self.assertEqual(report.verdict, FAIL_CLOSED)
         self.assertEqual(report.findings[0].code, UNKNOWN_PROJECTION_SNAPSHOT)
+
+
+class ClaimScopeRegressionTests(unittest.TestCase):
+    SLOT = "codex/gpt-5.6-sol/high"
+
+    @staticmethod
+    def snapshot():
+        return {
+            "physical": [{"task_id": "ACTIVE", "lane": "Codex", "status": "Queue",
+                          "execution_profile": "Codex -> GPT-5.6 Sol / High"}],
+            "dashboard": [{"task_id": "ACTIVE", "lane": "Codex", "status": "Queue",
+                           "current": True, "model_effort": "GPT-5.6 Sol / High"}],
+            "dispatch": {"harness": "Codex", "dispatch_state": "EXECUTABLE",
+                         "task_id": "ACTIVE", "expected_lifecycle_state": "Queue",
+                         "execution_profile": "Codex -> GPT-5.6 Sol / High"},
+        }
+
+    def claim(self, snapshot):
+        return evaluate_claim_preflight(snapshot, "ACTIVE", self.SLOT)
+
+    def test_equivalent_lane_qualified_physical_and_unqualified_dashboard(self):
+        snapshot = self.snapshot()
+        self.assertTrue(self.claim(snapshot).ok)
+        self.assertTrue(diagnose_snapshot(snapshot).ok)
+
+    def test_unrelated_historical_unknown_remains_visible_but_does_not_veto_claim(self):
+        snapshot = self.snapshot()
+        snapshot["physical"].append({"task_id": "ARCHIVED", "lane": "Codex",
+                                      "status": "Processed", "execution_profile": ""})
+        snapshot["dashboard"].append({"task_id": "ARCHIVED", "lane": "Codex",
+                                       "status": "Processed", "current": False,
+                                       "model_effort": "GPT-5.6 Sol / High"})
+        self.assertIn(UNKNOWN_PHYSICAL_TRUTH,
+                      {finding.code for finding in diagnose_snapshot(snapshot).findings})
+        claim = self.claim(snapshot)
+        self.assertTrue(claim.ok)
+        self.assertEqual(claim.findings, ())
+        self.assertIn(UNKNOWN_PHYSICAL_TRUTH,
+                      {finding.code for finding in claim.diagnostic_debt})
+        self.assertTrue(claim.as_dict()["diagnostic_debt"])
+
+    def test_worker_claims_and_wakes_with_unrelated_historical_debt(self):
+        snapshot = self.snapshot()
+        snapshot["physical"].append({"task_id": "ARCHIVED", "lane": "Codex",
+                                      "status": "Processed", "execution_profile": ""})
+        snapshot["dashboard"].append({"task_id": "ARCHIVED", "lane": "Codex",
+                                       "status": "Processed", "current": False,
+                                       "model_effort": "GPT-5.6 Sol / High"})
+        task = AWEWorkItem(task_id="ACTIVE", title="active", lane="Codex", role="developer",
+                           status="Queue", model="GPT-5.6 Sol", effort="High", sequence=1)
+        adapter = MockHarnessAdapter("codex")
+        ledger = AWELedger(":memory:")
+        worker = AWEAutonomousWorker(
+            ledger=ledger,
+            source=MemoryTaskSource([task], projection_snapshot=snapshot),
+            harness_adapters={"codex": adapter}, target_repo=".",
+        )
+        summary = worker.run_cycle(worker_id="claim-scope", target_slot=task.slot)
+        self.assertEqual(summary.claimed_task, "ACTIVE")
+        self.assertTrue(summary.wake_receipt.success)
+        self.assertEqual([item.task_id for item in adapter.woken_tasks], ["ACTIVE"])
+        self.assertEqual(ledger.get_claim("ACTIVE")["state"], "in_progress")
+
+    def test_active_unknown_or_duplicated_physical_truth_refused(self):
+        for mutation in ("missing", "duplicate"):
+            with self.subTest(mutation=mutation):
+                snapshot = self.snapshot()
+                if mutation == "missing":
+                    snapshot["physical"][0]["execution_profile"] = ""
+                else:
+                    snapshot["physical"].append(dict(snapshot["physical"][0]))
+                self.assertIn(UNKNOWN_PHYSICAL_TRUTH,
+                              {finding.code for finding in self.claim(snapshot).findings})
+
+    def test_true_model_effort_and_lane_disagreements_refused(self):
+        for field, value in (
+            ("model_effort", "GPT-5.6 Luna / High"),
+            ("model_effort", "GPT-5.6 Sol / Max"),
+            ("model_effort", "Cursor -> GPT-5.6 Sol / High"),
+            ("lane", "Cursor"),
+        ):
+            with self.subTest(field=field, value=value):
+                snapshot = self.snapshot()
+                snapshot["dashboard"][0][field] = value
+                report = self.claim(snapshot)
+                self.assertEqual(report.verdict, FAIL_CLOSED)
+                self.assertIn(DASHBOARD_MODEL_MISMATCH,
+                              {finding.code for finding in report.findings})
+
+    def test_dispatch_stale_duplicate_current_and_competing_unknown_refused(self):
+        for mutation, code in (
+            ("stale", DISPATCH_PHYSICAL_MISMATCH),
+            ("duplicate", DUPLICATE_DASHBOARD_CURRENT),
+            ("unknown", INCOMPLETE_EXECUTION_PROFILE),
+            ("conflicting_lane", INCOMPLETE_EXECUTION_PROFILE),
+        ):
+            with self.subTest(mutation=mutation):
+                snapshot = self.snapshot()
+                if mutation == "stale":
+                    snapshot["dispatch"]["expected_lifecycle_state"] = "In Progress"
+                elif mutation == "duplicate":
+                    snapshot["dashboard"].append({**snapshot["dashboard"][0], "task_id": "OTHER"})
+                elif mutation == "conflicting_lane":
+                    snapshot["dashboard"].append({"task_id": "OTHER", "lane": "Cursor",
+                                                  "status": "Queue", "current": True,
+                                                  "model_effort": "Codex -> GPT-5.6 Sol / High"})
+                else:
+                    snapshot["dashboard"].append({"task_id": "OTHER", "lane": "Codex",
+                                                  "status": "Queue", "current": True,
+                                                  "model_effort": "unparseable"})
+                self.assertIn(code, {finding.code for finding in self.claim(snapshot).findings})
 
     def test_cli_claim_without_snapshot_does_not_claim(self):
         stdout = io.StringIO()

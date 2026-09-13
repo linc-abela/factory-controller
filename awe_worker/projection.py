@@ -55,10 +55,6 @@ def _truthy(value: Any) -> bool:
     return text in {"1", "TRUE", "YES", "__YES__", "Y"}
 
 
-def _profile_key(value: str | None) -> str:
-    return " ".join(_norm(value).lower().replace("→", "->").replace("—", "-").split())
-
-
 @dataclass(frozen=True)
 class PhysicalTask:
     task_id: str
@@ -109,6 +105,7 @@ class Finding:
 class DiagnosticReport:
     verdict: str
     findings: tuple[Finding, ...] = field(default_factory=tuple)
+    diagnostic_debt: tuple[Finding, ...] = field(default_factory=tuple)
 
     @property
     def ok(self) -> bool:
@@ -119,6 +116,7 @@ class DiagnosticReport:
             "ok": self.ok,
             "verdict": self.verdict,
             "findings": [asdict(item) for item in self.findings],
+            "diagnostic_debt": [asdict(item) for item in self.diagnostic_debt],
             "human": self.as_text(),
             "authoritative": "physical_awe",
             "mutates": False,
@@ -127,10 +125,16 @@ class DiagnosticReport:
     def as_text(self) -> str:
         lines = [f"AWE projection diagnostic: {self.verdict}"]
         if not self.findings:
-            lines.append(
-                "Physical AWE, Dashboard, and Dispatch agree. "
-                "Projection drift does not block a claim."
-            )
+            if self.diagnostic_debt:
+                lines.append(
+                    "Selected claim binding agrees; "
+                    f"{len(self.diagnostic_debt)} unrelated diagnostic finding(s) remain."
+                )
+            else:
+                lines.append(
+                    "Physical AWE, Dashboard, and Dispatch agree. "
+                    "Projection drift does not block a claim."
+                )
             return "\n".join(lines)
         for finding in self.findings:
             prefix = finding.task_id or finding.lane or "projection"
@@ -208,19 +212,78 @@ def evaluate_claim_preflight(
                 ),
             ),
         )
-    report = diagnose_snapshot(snapshot)
     if not selected_task_id and slot is None:
-        return report
+        return diagnose_snapshot(snapshot)
+    # A claim has a narrower authority boundary than whole-snapshot telemetry.
+    # Keep the complete diagnostic, but only slot/task dependencies may veto it.
+    scoped = _claim_scope(snapshot, _norm(selected_task_id), slot)
+    report = diagnose_snapshot(scoped)
     findings = list(report.findings)
     findings.extend(
         _authorized_pointer_findings(
-            snapshot,
+            scoped,
             selected_task_id=_norm(selected_task_id),
             slot=slot,
         )
     )
     verdict = PASS if not findings else FAIL_CLOSED
-    return DiagnosticReport(verdict=verdict, findings=tuple(findings))
+    broad = diagnose_snapshot(snapshot)
+    blocking = set(findings)
+    debt = tuple(finding for finding in broad.findings if finding not in blocking)
+    return DiagnosticReport(verdict=verdict, findings=tuple(findings), diagnostic_debt=debt)
+
+
+def _claim_scope(
+    snapshot: Mapping[str, Any], selected_task_id: str,
+    slot: ExecutionSlot | Mapping[str, Any] | str | None,
+) -> dict[str, Any]:
+    """Retain the selected task and every potentially competing slot binding.
+
+    An unparseable Current/EXECUTABLE identity in the same harness cannot be
+    ruled out as a competitor, so it remains claim-blocking. Historical rows
+    with Current=NO and no selected-task relation remain diagnostic debt.
+    """
+    try:
+        resolved = ExecutionSlot.parse(slot) if slot is not None else None
+    except ValueError:
+        resolved = None
+    physical = tuple(_as_physical(item) for item in (snapshot.get("physical") or ()))
+    dashboard = tuple(_as_dashboard(item) for item in (snapshot.get("dashboard") or ()))
+    dispatch = _as_dispatch_list(snapshot.get("dispatch"))
+    rows = [
+        row for row in dashboard
+        if row.task_id == selected_task_id or (
+            resolved is not None and row.current and (
+                _row_matches_slot(row, resolved)
+                or _exact_slot(row.model_effort) == resolved
+                or (
+                    _lane_key(row.lane) == resolved.harness
+                    and _exact_slot(row.model_effort, row.lane) is None
+                )
+            )
+        )
+    ]
+    pointers = [
+        pointer for pointer in dispatch
+        if pointer.task_id == selected_task_id or (
+            resolved is not None and (
+                _pointer_matches_slot(pointer, resolved)
+                or _exact_slot(pointer.execution_profile) == resolved
+                or (
+                    pointer.executable and _lane_key(pointer.harness) == resolved.harness
+                    and _exact_slot(pointer.execution_profile, pointer.harness) is None
+                )
+            )
+        )
+    ]
+    related_ids = {selected_task_id} | {row.task_id for row in rows} | {
+        pointer.task_id for pointer in pointers
+    }
+    return {
+        "physical": [item for item in physical if item.task_id in related_ids],
+        "dashboard": rows,
+        "dispatch": pointers,
+    }
 
 
 def snapshot_from_work_items(
@@ -527,7 +590,9 @@ def _model_mismatch_findings(
         physical = phys_by_id.get(row.task_id)
         if physical is None or not physical.execution_profile or not row.model_effort:
             continue
-        if _profile_key(physical.execution_profile) != _profile_key(row.model_effort):
+        physical_slot = _exact_slot(physical.execution_profile, physical.lane)
+        dashboard_slot = _exact_slot(row.model_effort, row.lane)
+        if physical_slot != dashboard_slot or physical_slot is None:
             findings.append(
                 Finding(
                     code=DASHBOARD_MODEL_MISMATCH,
@@ -609,13 +674,16 @@ def _exact_slot(profile: str, harness: str = "") -> ExecutionSlot | None:
         return None
     try:
         if "->" in text:
-            return ExecutionSlot.parse(text)
-        parts = [p.strip() for p in text.split("/") if p.strip()]
-        if len(parts) >= 3:
-            return ExecutionSlot.parse("/".join(parts[:3]))
-        if len(parts) >= 2 and harness:
-            return ExecutionSlot.parse(f"{harness}/{parts[0]}/{parts[1]}")
-        return None
+            lane, rest = text.split("->", 1)
+            parts = [lane.strip()] + [p.strip() for p in rest.split("/")]
+        else:
+            parts = [p.strip() for p in text.split("/")]
+            if len(parts) == 2 and harness:
+                parts.insert(0, harness)
+        if len(parts) != 3 or not all(parts):
+            return None
+        parsed = ExecutionSlot.parse({"harness": parts[0], "model": parts[1], "effort": parts[2]})
+        return parsed if not harness or parsed.harness == _lane_key(harness) else None
     except ValueError:
         return None
 
@@ -856,4 +924,3 @@ def _authorized_pointer_findings(
             )
         )
     return findings
-
