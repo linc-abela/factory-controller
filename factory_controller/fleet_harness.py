@@ -15,17 +15,6 @@ from typing import Any
 
 from .capability_map import Profile
 
-_AG_E2E_SCHEMA = (
-    '{"type":"object","properties":{'
-    '"result":{"type":"string"},'
-    '"candidate_head":{"type":"string"},'
-    '"scenarios":{"type":"array","items":{"type":"string"}},'
-    '"defects":{"type":"array","items":{"type":"string"}},'
-    '"detail":{"type":"string"},'
-    '"mission_key":{"type":"string"},'
-    '"run_id":{"type":"string"}'
-    '}}'
-)
 AVAILABLE = "AVAILABLE"
 QUOTA_EXHAUSTED = "QUOTA_EXHAUSTED"
 TEMPORARILY_UNAVAILABLE = "TEMPORARILY_UNAVAILABLE"
@@ -119,15 +108,14 @@ class FleetHarness:
                 profile, TEMPORARILY_UNAVAILABLE, -1, "", "",
                 "HARNESS_BINARY_MISSING")
         cmd = [
-            binary, "--print",
+            binary,
             "--model", provider_model_id(profile),
             "--effort", profile.effort,
             "--dangerously-skip-permissions",
             "--add-dir", str(cwd),
             "--print-timeout", "15m0s",
             "--output-format", "json",
-            "--json-schema", _AG_E2E_SCHEMA,
-            prompt,
+            "--print", prompt,
         ]
         return self._spawn(profile, cmd, cwd)
 

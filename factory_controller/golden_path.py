@@ -916,20 +916,32 @@ def _extract_json(text: str) -> dict[str, Any]:
     text = text.strip()
     if not text:
         return {}
+    body: dict[str, Any] = {}
     try:
-        body = json.loads(text)
-        return body if isinstance(body, dict) else {}
+        parsed = json.loads(text)
+        if isinstance(parsed, dict):
+            body = parsed
     except ValueError:
-        pass
-    start = text.find("{")
-    end = text.rfind("}")
-    if start >= 0 and end > start:
+        start = text.find("{")
+        end = text.rfind("}")
+        if start >= 0 and end > start:
+            try:
+                parsed = json.loads(text[start:end + 1])
+                if isinstance(parsed, dict):
+                    body = parsed
+            except ValueError:
+                return {}
+    if not body:
+        return {}
+    inner = body.get("response")
+    if isinstance(inner, str) and inner.strip().startswith("{"):
         try:
-            body = json.loads(text[start:end + 1])
-            return body if isinstance(body, dict) else {}
+            nested = json.loads(inner)
+            if isinstance(nested, dict):
+                return nested
         except ValueError:
-            return {}
-    return {}
+            pass
+    return body
 
 
 def _ag_receipt(work: Path) -> dict[str, Any]:
