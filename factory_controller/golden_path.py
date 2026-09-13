@@ -2,6 +2,9 @@
 
 RC-alpha is valid only when every required link exists for the same PCP
 mission. An existing checkout or reachable URL is never itself RC-alpha.
+
+Hermes routes by capability: classify the work, query the Capability
+Mapping, inspect live availability, and execute the selected profile.
 """
 
 from __future__ import annotations
@@ -10,8 +13,20 @@ import json
 import os
 import shutil
 import subprocess
+import time
 from pathlib import Path
 from typing import Any, Mapping, Protocol
+
+from . import capability_map
+from . import capability_resolver
+from .capability_map import CAP_ARCHITECTURE, CAP_IMPLEMENTATION, Profile
+from .fleet_harness import (
+    COMPLETED,
+    FAILED,
+    FleetHarness,
+    QUOTA_EXHAUSTED,
+    TEMPORARILY_UNAVAILABLE,
+)
 
 LINKS = (
     "pcp",
@@ -23,11 +38,8 @@ LINKS = (
     "functional_e2e",
     "rc_alpha",
 )
-
-ARCH_PRIMARY = {"harness": "codex", "model": "gpt-5.6-sol", "effort": "high"}
-ARCH_FALLBACK = {"harness": "cursor", "model": "claude-opus-5", "effort": "high"}
-IMPL_ROUTE = {"harness": "codex", "model": "gpt-5.6-luna", "effort": "max"}
 CANDIDATE_MARKER = ".factory-candidate.json"
+_RERUN = {QUOTA_EXHAUSTED, TEMPORARILY_UNAVAILABLE}
 
 
 class IncompleteChain(ValueError):
@@ -131,20 +143,20 @@ def run(mission: Any, *, vault_root: str | Path,
         evidence["implementation"] = executors.implementation(
             mission, evidence["architecture"], work)
         evidence["lifecycle"] = lifecycle_of(evidence)
-        if not ((evidence["implementation"] or {}).get("head") or
-                (evidence["implementation"] or {}).get("packages")):
+        if not ((evidence.get("implementation") or {}).get("head") or
+                (evidence.get("implementation") or {}).get("packages")):
             return evidence
     if not (evidence.get("integration") or {}).get("candidate_head"):
         evidence["integration"] = executors.integrate(
             mission, evidence["implementation"], work)
         evidence["lifecycle"] = lifecycle_of(evidence)
-        if not (evidence["integration"] or {}).get("candidate_head"):
+        if not (evidence.get("integration") or {}).get("candidate_head"):
             return evidence
     head = evidence["integration"]["candidate_head"]
     if (evidence.get("functional_e2e") or {}).get("result") != "PASS":
         evidence["functional_e2e"] = executors.e2e(mission, work, head)
         evidence["lifecycle"] = lifecycle_of(evidence)
-        if (evidence["functional_e2e"] or {}).get("result") != "PASS":
+        if (evidence.get("functional_e2e") or {}).get("result") != "PASS":
             return evidence
     if not (evidence.get("rc_alpha") or {}).get("url"):
         evidence["rc_alpha"] = executors.deploy(
@@ -162,42 +174,50 @@ def accept_line(evidence: Mapping[str, Any]) -> str:
         rc["url"], evidence["integration"]["candidate_head"])
 
 
-def _quota_exhausted(text: str) -> bool:
-    lowered = text.lower()
-    return any(token in lowered for token in (
-        "insufficient_quota",
-        "quota exceeded",
-        "quota_exceeded",
-        "rate limit exceeded",
-        "usage limit reached",
-        "you've hit your usage limit",
-        "context length exceeded",
-    ))
-
-
-def _run(cmd: list[str], *, cwd: Path | None = None, timeout: int = 120
-         ) -> subprocess.CompletedProcess[str]:
-    return subprocess.run(
-        cmd, cwd=cwd, capture_output=True, text=True, timeout=timeout)
-
-
 class FleetExecutors:
-    """Live Hermes/fleet executors. Architecture and implementation wake Codex."""
+    """Live Hermes/fleet executors. Profiles come from the Capability Mapping."""
 
-    def __init__(self, *, vault_root: str | Path, state_dir: str | Path) -> None:
+    def __init__(
+        self,
+        *,
+        vault_root: str | Path,
+        state_dir: str | Path,
+        catalog: capability_map.CapabilityMap | None = None,
+        harness: FleetHarness | None = None,
+    ) -> None:
         self.vault_root = Path(vault_root)
         self.state_dir = Path(state_dir)
+        self._catalog = catalog
+        self._harness = harness or FleetHarness()
+
+    def catalog(self) -> capability_map.CapabilityMap:
+        if self._catalog is None:
+            self._catalog = capability_map.load(self.vault_root)
+        return self._catalog
 
     def hermes(self, mission: Any) -> dict[str, Any]:
         from . import pcp_missions
         prototype = pcp_missions.locate_prototype(self.vault_root, mission)
+        catalog = self.catalog()
         return {
             "owner": "hermes",
             "mission_key": mission.mission_key,
             "routing": {
-                "architecture": dict(ARCH_PRIMARY),
-                "architecture_fallback": dict(ARCH_FALLBACK),
-                "implementation": dict(IMPL_ROUTE),
+                "source": catalog.source,
+                "capabilities": {
+                    "architecture": CAP_ARCHITECTURE,
+                    "implementation": CAP_IMPLEMENTATION,
+                },
+                "eligible": {
+                    "architecture": [
+                        profile.as_dict()
+                        for profile in catalog.for_capability(CAP_ARCHITECTURE)
+                    ],
+                    "implementation": [
+                        profile.as_dict()
+                        for profile in catalog.for_capability(CAP_IMPLEMENTATION)
+                    ],
+                },
             },
             "plan": [
                 "architecture", "implementation", "integration",
@@ -211,59 +231,143 @@ class FleetExecutors:
         self._prepare_work(mission, work)
         intake_head = _git_head(work)
         artifact = work / "architecture.json"
-        prompt = _architecture_prompt(mission, hermes, work)
-        sol = self._codex("gpt-5.6-sol", "high", prompt, work)
         if artifact.is_file():
-            body = json.loads(artifact.read_text(encoding="utf-8"))
-            return {
-                "artifact": str(artifact),
-                **ARCH_PRIMARY,
-                "sol": sol,
-                "fallback": None,
-                "body": body,
-                "intake_head": intake_head,
-            }
-        if sol.get("quota"):
-            fallback = self._cursor_opus(prompt, work)
-            if artifact.is_file():
-                body = json.loads(artifact.read_text(encoding="utf-8"))
-                return {
-                    "artifact": str(artifact),
-                    **ARCH_FALLBACK,
-                    "sol": sol,
-                    "fallback": fallback,
-                    "body": body,
-                    "intake_head": intake_head,
-                }
-            return {"sol": sol, "fallback": fallback, "intake_head": intake_head}
-        return {"sol": sol, "intake_head": intake_head}
+            return self._architecture_result(
+                artifact, intake_head, attempts=[], selected=None)
+        attempts = self._execute_capability(
+            CAP_ARCHITECTURE, mission, work,
+            prompt_for=lambda profile: _architecture_prompt(
+                mission, hermes, work, profile),
+            succeeded=lambda: artifact.is_file(),
+            context={"difficulty": "high"},
+        )
+        selected = _final_profile(attempts)
+        if artifact.is_file():
+            return self._architecture_result(
+                artifact, intake_head, attempts, selected)
+        return {
+            "attempts": attempts,
+            "intake_head": intake_head,
+            "live": self._live(work),
+        }
 
     def implementation(self, mission: Any,
                        architecture: Mapping[str, Any], work: Path) -> dict[str, Any]:
-        existing = self._implementation_result(architecture, work, {})
+        existing = self._implementation_result(architecture, work, None)
         if existing.get("head"):
             return existing
-        if _git_dirty(work):
-            receipt = self._codex(
-                "gpt-5.6-luna", "max",
-                _implementation_commit_prompt(mission, architecture, work), work)
-            result = self._implementation_result(architecture, work, receipt)
-            if result.get("head"):
-                return result
-        prompt = _implementation_prompt(mission, architecture, work)
-        receipt = self._codex("gpt-5.6-luna", "max", prompt, work)
-        result = self._implementation_result(architecture, work, receipt)
-        if result.get("head") or not _git_dirty(work):
-            return result
-        follow = self._codex(
-            "gpt-5.6-luna", "max",
-            _implementation_commit_prompt(mission, architecture, work), work)
-        result = self._implementation_result(architecture, work, follow)
-        result["continuation_receipt"] = follow
+        attempts = self._execute_capability(
+            CAP_IMPLEMENTATION, mission, work,
+            prompt_for=lambda profile: (
+                _implementation_commit_prompt(mission, architecture, work, profile)
+                if _git_dirty(work)
+                else _implementation_prompt(mission, architecture, work, profile)
+            ),
+            succeeded=lambda: bool(
+                self._implementation_result(architecture, work, None).get("head")),
+            context={
+                "difficulty": "high",
+                "incumbent": self._routing(work).get("incumbent") or "",
+            },
+        )
+        selected = _final_profile(attempts)
+        result = self._implementation_result(architecture, work, selected)
+        result["attempts"] = attempts
+        result["live"] = self._live(work)
         return result
 
-    def _implementation_result(self, architecture: Mapping[str, Any], work: Path,
-                               receipt: Mapping[str, Any]) -> dict[str, Any]:
+    def _execute_capability(
+        self,
+        capability: str,
+        mission: Any,
+        work: Path,
+        *,
+        prompt_for,
+        succeeded,
+        context: Mapping[str, Any],
+    ) -> list[dict[str, Any]]:
+        attempts: list[dict[str, Any]] = []
+        for _ in range(8):
+            live = self._live(work)
+            ctx = dict(context)
+            ctx["incumbent"] = self._routing(work).get("incumbent") or ctx.get("incumbent") or ""
+            choice = capability_resolver.resolve(
+                capability, self.catalog(), live, context=ctx)
+            if choice is None:
+                return attempts
+            profile = choice.profile
+            if attempts:
+                attempts[-1]["next_selected"] = profile.as_dict()
+            attempts.append(self._one_attempt(
+                capability, mission, work, profile, choice, prompt_for, succeeded))
+            if succeeded():
+                return attempts
+            receipt_status = attempts[-1]["availability_result"]
+            if receipt_status in _RERUN:
+                continue
+            if receipt_status == COMPLETED and _git_dirty(work):
+                attempts.append(self._one_attempt(
+                    capability, mission, work, profile, choice, prompt_for, succeeded))
+                if succeeded():
+                    return attempts
+                if attempts[-1]["availability_result"] in _RERUN:
+                    continue
+            return attempts
+        return attempts
+
+    def _one_attempt(
+        self, capability, mission, work, profile, choice, prompt_for, succeeded,
+    ) -> dict[str, Any]:
+        started = time.time()
+        receipt = self._harness.run(profile, prompt_for(profile), work)
+        ended = time.time()
+        if _git_dirty(work):
+            self._set_incumbent(work, profile.key)
+        if receipt.status in _RERUN:
+            self._mark(work, profile, receipt.status)
+        return {
+            "capability": capability,
+            "mission_key": getattr(mission, "mission_key", ""),
+            "candidate": profile.as_dict(),
+            "runner": profile.harness,
+            "model": profile.model,
+            "effort": profile.effort,
+            "availability_result": receipt.status,
+            "quota_result": receipt.status == QUOTA_EXHAUSTED,
+            "started_at": started,
+            "ended_at": ended,
+            "completion": _completion(receipt.status, succeeded()),
+            "reselection_reason": choice.reason,
+            "excluded": list(choice.excluded),
+            "next_selected": None,
+            "final_producer": succeeded(),
+            "branch": _git_branch(work),
+            "head": _git_head(work),
+            "artifact": str(work / "architecture.json")
+            if (work / "architecture.json").is_file() else "",
+            "receipt": receipt.as_dict(),
+        }
+
+    def _architecture_result(
+        self, artifact: Path, intake_head: str,
+        attempts: list[dict[str, Any]], selected: Profile | None,
+    ) -> dict[str, Any]:
+        body = json.loads(artifact.read_text(encoding="utf-8"))
+        route = selected.as_dict() if selected is not None else (
+            attempts[-1]["candidate"] if attempts else {})
+        return {
+            "artifact": str(artifact),
+            **{k: route[k] for k in ("harness", "model", "effort") if k in route},
+            "body": body,
+            "intake_head": intake_head,
+            "attempts": attempts,
+            "producer": route,
+        }
+
+    def _implementation_result(
+        self, architecture: Mapping[str, Any], work: Path,
+        selected: Profile | None,
+    ) -> dict[str, Any]:
         impl_file = work / "implementation.json"
         head = _git_head(work)
         intake = str(architecture.get("intake_head") or "")
@@ -271,32 +375,34 @@ class FleetExecutors:
             root = _git(["rev-list", "--max-parents=0", "HEAD"], work)
             if root.returncode == 0:
                 intake = (root.stdout.strip().splitlines() or [""])[0]
+        route = selected.as_dict() if selected is not None else {}
+        package = {
+            "id": "core",
+            **{k: route[k] for k in ("harness", "model", "effort") if k in route},
+            "branch": _git_branch(work),
+            "head": head,
+            "acceptance": "",
+        }
         if impl_file.is_file():
             body = json.loads(impl_file.read_text(encoding="utf-8"))
-            return {
-                "packages": body.get("packages") or [{
-                    "id": "core",
-                    **IMPL_ROUTE,
-                    "branch": body.get("branch") or _git_branch(work),
-                    "head": body.get("head") or head,
-                    "acceptance": body.get("acceptance") or "",
-                }],
+            package.update({
+                "branch": body.get("branch") or package["branch"],
                 "head": body.get("head") or head,
-                "runner_receipt": receipt,
+                "acceptance": body.get("acceptance") or "",
+            })
+            return {
+                "packages": body.get("packages") or [package],
+                "head": body.get("head") or head,
+                "producer": route,
             }
         if head and intake and head != intake:
+            package["acceptance"] = "post-intake git head"
             return {
-                "packages": [{
-                    "id": "core",
-                    **IMPL_ROUTE,
-                    "branch": _git_branch(work),
-                    "head": head,
-                    "acceptance": "post-intake git head",
-                }],
+                "packages": [package],
                 "head": head,
-                "runner_receipt": receipt,
+                "producer": route,
             }
-        return {"runner_receipt": receipt}
+        return {"producer": route}
 
     def integrate(self, mission: Any,
                   implementation: Mapping[str, Any], work: Path) -> dict[str, Any]:
@@ -337,7 +443,6 @@ class FleetExecutors:
                 detail = (proc.stdout + proc.stderr)[-4000:]
         marker = work / CANDIDATE_MARKER
         if not marker.is_file():
-            # Implementation must leave a candidate marker; tests/live fleet write it.
             if result == "PASS":
                 result = "FAIL"
                 detail = "missing %s" % CANDIDATE_MARKER
@@ -389,9 +494,7 @@ class FleetExecutors:
         prototype = pcp_missions.locate_prototype(self.vault_root, mission)
         if prototype is not None:
             if prototype.resolve() != work.resolve():
-                if any(work.iterdir()):
-                    pass
-                else:
+                if not any(work.iterdir()):
                     shutil.copytree(prototype, work, dirs_exist_ok=True,
                                     ignore=shutil.ignore_patterns(".git"))
         if not any(work.iterdir()):
@@ -402,52 +505,75 @@ class FleetExecutors:
         _git(["add", "-A"], work)
         _git(["commit", "-m", "factory intake snapshot"], work)
 
-    def _codex(self, model: str, effort: str, prompt: str, cwd: Path) -> dict[str, Any]:
-        binary = shutil.which("codex")
-        if not binary:
-            return {"ok": False, "error": "HARNESS_BINARY_MISSING", "detail": "codex not on PATH"}
-        cmd = [binary, "exec", "-m", model, "-c",
-               "model_reasoning_effort=%s" % effort, prompt]
-        try:
-            proc = subprocess.run(
-                cmd, cwd=cwd, capture_output=True, text=True, timeout=2400)
-        except subprocess.TimeoutExpired as exc:
-            return {"ok": False, "error": "TIMEOUT", "detail": str(exc)[:500]}
-        text = (proc.stdout or "") + "\n" + (proc.stderr or "")
-        quota = _quota_exhausted(text)
-        return {
-            "ok": proc.returncode == 0 and not quota,
-            "quota": quota,
-            "returncode": proc.returncode,
-            "stdout_tail": (proc.stdout or "")[-4000:],
-            "stderr_tail": (proc.stderr or "")[-2000:],
-            "harness": "codex",
-            "model": model,
-            "effort": effort,
-        }
+    def _routing_path(self, work: Path) -> Path:
+        return work.parent / "routing.json"
 
-    def _cursor_opus(self, prompt: str, cwd: Path) -> dict[str, Any]:
-        binary = shutil.which("cursor") or (
-            "/Applications/Cursor.app/Contents/Resources/app/bin/cursor")
-        if not os.path.exists(binary):
-            return {
-                "ok": False,
-                "error": "HARNESS_WAKE_PATH_UNAVAILABLE:cursor",
-                "detail": "Cursor CLI missing",
-            }
-        cmd = [binary, "agent", "-p", "--model", "claude-opus-5", prompt]
+    def _routing(self, work: Path) -> dict[str, Any]:
+        path = self._routing_path(work)
+        if not path.is_file():
+            return {"live": {}, "incumbent": ""}
         try:
-            proc = subprocess.run(
-                cmd, cwd=cwd, capture_output=True, text=True, timeout=2400)
-        except (OSError, subprocess.TimeoutExpired) as exc:
-            return {"ok": False, "error": "WAKE_SUBPROCESS_FAILED", "detail": str(exc)[:500]}
-        return {
-            "ok": proc.returncode == 0,
-            "returncode": proc.returncode,
-            "stdout_tail": (proc.stdout or "")[-4000:],
-            "stderr_tail": (proc.stderr or "")[-2000:],
-            **ARCH_FALLBACK,
-        }
+            body = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            return {"live": {}, "incumbent": ""}
+        if not isinstance(body, dict):
+            return {"live": {}, "incumbent": ""}
+        body.setdefault("live", {})
+        body.setdefault("incumbent", "")
+        return body
+
+    def _live(self, work: Path) -> dict[str, str]:
+        live = self._routing(work).get("live") or {}
+        return {str(key): str(value) for key, value in live.items()}
+
+    def _mark(self, work: Path, profile: Profile, status: str) -> None:
+        body = self._routing(work)
+        live = dict(body.get("live") or {})
+        live[profile.key] = status
+        body["live"] = live
+        self._routing_path(work).write_text(
+            json.dumps(body, indent=2) + "\n", encoding="utf-8")
+
+    def _set_incumbent(self, work: Path, key: str) -> None:
+        body = self._routing(work)
+        body["incumbent"] = key
+        self._routing_path(work).write_text(
+            json.dumps(body, indent=2) + "\n", encoding="utf-8")
+
+
+def _final_profile(attempts: list[dict[str, Any]]) -> Profile | None:
+    for attempt in reversed(attempts):
+        if attempt.get("final_producer") or attempt.get("availability_result") == COMPLETED:
+            candidate = attempt.get("candidate") or {}
+            try:
+                return Profile(
+                    capability=str(candidate.get("capability") or ""),
+                    role=str(candidate.get("role") or "member"),
+                    harness=str(candidate.get("harness") or ""),
+                    model=str(candidate.get("model") or ""),
+                    effort=str(candidate.get("effort") or ""),
+                    purpose=str(candidate.get("purpose") or ""),
+                    quota_continuity=bool(candidate.get("quota_continuity")),
+                )
+            except TypeError:
+                return None
+    return None
+
+
+def _completion(status: str, succeeded: bool) -> str:
+    if succeeded:
+        return "completed"
+    if status in _RERUN:
+        return "interrupted"
+    if status == FAILED:
+        return "failed"
+    return status.lower()
+
+
+def _run(cmd: list[str], *, cwd: Path | None = None, timeout: int = 120
+         ) -> subprocess.CompletedProcess[str]:
+    return subprocess.run(
+        cmd, cwd=cwd, capture_output=True, text=True, timeout=timeout)
 
 
 def _git(args: list[str], cwd: Path) -> subprocess.CompletedProcess[str]:
@@ -478,11 +604,10 @@ def _git_dirty(cwd: Path) -> bool:
     return proc.returncode == 0 and bool(proc.stdout.strip())
 
 
-def _architecture_prompt(mission: Any,
-                         hermes: Mapping[str, Any], work: Path) -> str:
+def _architecture_prompt(mission: Any, hermes: Mapping[str, Any],
+                         work: Path, profile: Profile) -> str:
     return (
-        "You are the Factory Architect (Codex GPT-5.6 Sol / High) for mission "
-        "%s (%s).\n"
+        "You are the Factory Architect (%s %s / %s) for mission %s (%s).\n"
         "Write %s/architecture.json covering: prototype reuse decision, "
         "subsystem boundaries, invariants, implementation delta from the "
         "Lab prototype, implementation packages, dependencies, deterministic "
@@ -491,34 +616,36 @@ def _architecture_prompt(mission: Any,
         "Prototype input (evaluate; do not label it RC-alpha): %s\n"
         "Do not implement the product. Do not serve or rewrite the prototype "
         "as RC-alpha. The JSON artifact is the only required output.\n"
-        % (mission.mission_key, mission.package_id, work,
+        % (profile.harness, profile.model, profile.effort,
+           mission.mission_key, mission.package_id, work,
            hermes.get("prototype_input") or "(none)")
     )
 
 
-def _implementation_prompt(mission: Any,
-                           architecture: Mapping[str, Any], work: Path) -> str:
+def _implementation_prompt(mission: Any, architecture: Mapping[str, Any],
+                           work: Path, profile: Profile) -> str:
     return (
-        "You are the Factory Developer Fleet (Codex GPT-5.6 Luna / Max) for "
-        "mission %s (%s).\n"
+        "You are the Factory Developer Fleet (%s %s / %s) for mission %s (%s).\n"
         "Implement the architecture delta in %s. Commit on an isolated branch. "
-        "Write implementation.json with packages[{id,runner,model,effort,branch,head,acceptance}]. "
+        "Write implementation.json with packages"
+        "[{id,runner,model,effort,branch,head,acceptance}]. "
         "Write %s with {\"candidate_head\": \"<HEAD sha>\"}.\n"
         "Architecture artifact: %s\n"
         "Do not present the pre-intake prototype as RC-alpha.\n"
-        % (mission.mission_key, mission.package_id, work, CANDIDATE_MARKER,
+        % (profile.harness, profile.model, profile.effort,
+           mission.mission_key, mission.package_id, work, CANDIDATE_MARKER,
            architecture.get("artifact") or "")
     )
 
 
-def _implementation_commit_prompt(mission: Any,
-                                 architecture: Mapping[str, Any], work: Path) -> str:
+def _implementation_commit_prompt(mission: Any, architecture: Mapping[str, Any],
+                                  work: Path, profile: Profile) -> str:
     return (
-        "Continue the same Factory implementation mission %s. "
+        "Continue the same Factory implementation mission %s as %s %s / %s. "
         "Uncommitted work already exists in %s. Do not restart. "
         "Commit the architecture delta on an isolated branch so HEAD differs "
         "from intake %s. Write implementation.json and %s with the new HEAD. "
         "Then stop.\n"
-        % (mission.mission_key, work, architecture.get("intake_head") or "",
-           CANDIDATE_MARKER)
+        % (mission.mission_key, profile.harness, profile.model, profile.effort,
+           work, architecture.get("intake_head") or "", CANDIDATE_MARKER)
     )

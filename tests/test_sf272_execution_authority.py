@@ -23,6 +23,8 @@ from factory_controller.store import MissionStore
 
 SLOT = ExecutionSlot("cursor", "grok-4.6", "high")
 FAKE_HEAD = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+FAKE_ARCH = {"harness": "test", "model": "architect", "effort": "high"}
+FAKE_DEV = {"harness": "test", "model": "developer", "effort": "medium"}
 
 
 class _FakeFleet:
@@ -34,8 +36,13 @@ class _FakeFleet:
         return {
             "owner": "hermes",
             "routing": {
-                "architecture": dict(golden_path.ARCH_PRIMARY),
-                "implementation": dict(golden_path.IMPL_ROUTE),
+                "source": "FACTORY/roadmap/phase-2-agent-capability-mapping.md",
+                "capabilities": {
+                    "architecture": "architecture / technical design",
+                    "implementation": "developer fleet",
+                },
+                "architecture": dict(FAKE_ARCH),
+                "implementation": dict(FAKE_DEV),
             },
             "plan": ["architecture", "implementation", "integration",
                      "functional_e2e", "rc_alpha"],
@@ -58,9 +65,8 @@ class _FakeFleet:
         artifact.write_text(json.dumps(body), encoding="utf-8")
         return {
             "artifact": str(artifact),
-            **golden_path.ARCH_PRIMARY,
+            **FAKE_ARCH,
             "body": body,
-            "sol": {"ok": True, "quota": False},
         }
 
     def implementation(self, mission, architecture, work: Path):
@@ -78,7 +84,7 @@ class _FakeFleet:
         return {
             "packages": [{
                 "id": "core",
-                **golden_path.IMPL_ROUTE,
+                **FAKE_DEV,
                 "branch": "sf/mission/impl",
                 "head": self.head,
                 "acceptance": "delta committed after intake",
@@ -379,10 +385,13 @@ class SF272PCPMissionQueueTests(unittest.TestCase):
         self.assertFalse(pcp_missions.is_stub_rc_body(body))
         self.assertEqual(golden_path.missing_links(casino.evidence), ())
         self.assertEqual(
-            casino.evidence["architecture"]["model"], "gpt-5.6-sol")
+            casino.evidence["hermes"]["routing"]["capabilities"]["architecture"],
+            "architecture / technical design")
+        self.assertEqual(
+            casino.evidence["architecture"]["model"], "architect")
         self.assertEqual(
             casino.evidence["implementation"]["packages"][0]["model"],
-            "gpt-5.6-luna")
+            "developer")
         mission, created = self.store.submit(
             {
                 "work_item_id": "lodus-casino:build",
