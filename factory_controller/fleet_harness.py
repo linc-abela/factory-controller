@@ -91,8 +91,14 @@ class FleetHarness:
             return self._receipt(
                 profile, TEMPORARILY_UNAVAILABLE, -1, "", "",
                 "HARNESS_BINARY_MISSING")
-        cmd = [binary, "exec", "-m", profile.model, "-c",
-               "model_reasoning_effort=%s" % profile.effort, prompt]
+        cmd = [
+            binary, "exec",
+            "--skip-git-repo-check",
+            "--sandbox", "workspace-write",
+            "--dangerously-bypass-approvals-and-sandbox",
+            "-m", profile.model, "-c",
+            "model_reasoning_effort=%s" % profile.effort, prompt,
+        ]
         return self._spawn(profile, cmd, cwd)
 
     def _antigravity(self, profile: Profile, prompt: str, cwd: Path) -> HarnessReceipt:
