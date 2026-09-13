@@ -21,6 +21,7 @@ class GrokBuildAdapter:
 
     name = "Grok Build"
     harness_mode = "real"
+    executor_type = "grok_build"
 
     def __init__(
         self,

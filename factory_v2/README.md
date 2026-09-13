@@ -3,9 +3,13 @@
 Status: **bootstrap spine, not production-ready.**
 
 This package is the deterministic Factory v2 Controller on branch `factory-v2`.
-Cursor is a bootstrap tool only. Target architecture:
+Cursor remains a bootstrap tool, not a permanent architecture mandate.
+Long-term target may return to Grok Build. Temporary Factory v2 runtime:
 
-`Laboratory -> approved PCP -> Controller -> Nous Hermes -> Grok Build -> Antigravity review + QA -> Verified RC -> Owner Gate -> Antigravity Distribution`
+`Laboratory -> approved PCP -> Controller -> Nous Hermes -> Cursor CLI -> Antigravity review + QA -> Verified RC -> Owner Gate -> Antigravity Distribution`
+
+The `EngineeringExecutor` abstraction is unchanged. Grok Build stays present and
+selectable. Do not treat Cursor as permanently mandated.
 
 Canonical contracts consumed (not edited): SFV2-002
 `factory-vault` PR #75 head `727882072a382f3146654d3fdb2b9b18bea19825`, snapshotted at
@@ -49,7 +53,7 @@ Rework:
 
 - `VERIFYING` review or QA FAIL -> `ENGINEERING` (same mission/lineage, new candidate tuple, full re-verify)
 - `OWNER_VALIDATION` REJECT -> `ENGINEERING` (same mission/lineage, new candidate tuple, full re-verify)
-- Extra state `BLOCKED` is fail-closed (missing Hermes/Grok/Antigravity runtime or credentials)
+- Extra state `BLOCKED` is fail-closed (missing Hermes/executor/Antigravity runtime or credentials)
 - Extra state `DISTRIBUTED` is recorded after an immutable handoff
 
 Candidate identity is always `(candidate_id, source_revision, artifact_hash, artifact_uri)`.
@@ -58,20 +62,35 @@ Candidate identity is always `(candidate_id, source_revision, artifact_hash, art
 
 | Contract | Target | Official interface |
 |---|---|---|
-| `EngineeringManager` | NousResearch Hermes Agent | `hermes chat --oneshot` in the admitted sandbox with the SFV2-002 `factory-engineering` profile. Hermes coordinates Grok via the official grok skill/terminal and writes `hermes-result.json`. Controller does not call Grok. |
-| `EngineeringExecutor` | Grok Build | Invoked **by Hermes** (or a labeled simulated Hermes campaign): `grok --no-auto-update -p … --cwd <sandbox> --output-format json` |
+| `EngineeringManager` | NousResearch Hermes Agent | `hermes chat --oneshot` in the admitted sandbox with the SFV2-002 `factory-engineering` profile. Hermes decomposes the mission and delegates coding through the selected executor. Controller does not call the executor. |
+| `EngineeringExecutor` (temporary default) | Cursor CLI | Invoked **by Hermes**: `agent -p … --output-format json --workspace <sandbox> --trust --sandbox enabled --model <configurable, default auto>` |
+| `EngineeringExecutor` (selectable rollback) | Grok Build | `FACTORY_V2_ENGINEERING_EXECUTOR=grok` restores `grok --no-auto-update -p … --cwd <sandbox> --output-format json` |
 | `Verifier.review` / `Verifier.qa` | Antigravity (separate verdicts) | `antigravity review\|qa` bound to the candidate tuple |
 | `DistributionExecutor` | Antigravity Production | `antigravity distribute --profile production` bound to the approved tuple |
 
 Lifecycle code in `factory_v2/machine.py` does not contain vendor CLI strings.
 Hermes is not reimplemented (no session/memory/subagent/skills runtime here).
 
-Grok auth (real): `XAI_API_KEY` or `GROK_DEPLOYMENT_KEY` or `~/.grok/auth.json`.
+Executor switch (temporary Cursor default, Grok remains installed):
+
+```sh
+export FACTORY_V2_ENGINEERING_EXECUTOR=cursor   # default
+export FACTORY_V2_CURSOR_MODEL=auto             # default; do not hardcode in Controller
+# rollback:
+export FACTORY_V2_ENGINEERING_EXECUTOR=grok
+```
+
+Cursor CLI auth (real): existing `agent login` session, or `CURSOR_API_KEY` /
+`CURSOR_AUTH_TOKEN` when explicitly configured. Headless shape is
+`agent -p "<prompt>" --output-format json --workspace <sandbox> --trust --sandbox enabled --model <id>`.
+Absence of CLI or auth is a truthful `BLOCKED` state. Never persist tokens.
+
+Grok auth (rollback): `XAI_API_KEY` or `GROK_DEPLOYMENT_KEY` or `~/.grok/auth.json`.
 Absence is a truthful `BLOCKED` state, not a simulated PASS.
 
 ## Sandbox boundary
 
-OS/workspace containment: each mission gets `sandboxes/<mission_id>/`. Real Hermes is launched with `--in` that directory. Real Grok is launched with `--cwd` there. The Controller does not pass Hermes `--yolo` or Grok `--always-approve`.
+OS/workspace containment: each mission gets `sandboxes/<mission_id>/`. Real Hermes is launched with `--in` that directory. Real Cursor CLI is launched with `--workspace` there. Real Grok (rollback) is launched with `--cwd` there. The Controller does not pass Hermes `--yolo`, Cursor `--force`/`--yolo`, or Grok `--always-approve`.
 
 Prompt-level allow/deny rules are **not** the security boundary. They are advisory. The actual bound is the per-mission workspace directory plus host OS permissions on that tree. The general Hermes process is not granted unrestricted host authority by this adapter.
 

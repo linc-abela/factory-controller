@@ -8,6 +8,7 @@ from pathlib import Path
 
 from factory_v2.adapters.antigravity import AntigravityDistributor, AntigravityVerifier
 from factory_v2.adapters.hermes import NousHermesAdapter
+from factory_v2.adapters.selection import build_executor, selected_executor_kind
 from factory_v2.adapters.simulated import (
     ScriptedDistributor,
     ScriptedGrok,
@@ -38,8 +39,13 @@ def _controller(*, simulated: bool) -> Controller:
         verifier = ScriptedVerifier({"sim-artifact-1": (True, True)})
         distributor = ScriptedDistributor()
     else:
-        print("harness_mode=real  (fail-closed if Hermes/Grok/Antigravity are unavailable)")
-        manager = NousHermesAdapter()
+        kind = selected_executor_kind()
+        executor = build_executor(kind)
+        print(
+            f"harness_mode=real  executor={kind}  "
+            "(fail-closed if Hermes/executor/Antigravity are unavailable)"
+        )
+        manager = NousHermesAdapter(executor=executor)
         verifier = AntigravityVerifier()
         distributor = AntigravityDistributor()
     return Controller(store, manager, verifier, distributor, workspace)

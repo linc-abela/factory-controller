@@ -17,8 +17,8 @@ from pathlib import Path
 from typing import Any
 
 from factory_v2.adapters.antigravity import AntigravityDistributor, AntigravityVerifier
-from factory_v2.adapters.grok_build import GrokBuildAdapter
 from factory_v2.adapters.hermes import NousHermesAdapter
+from factory_v2.adapters.selection import build_executor, selected_executor_kind
 from factory_v2.adapters.simulated import (
     ScriptedDistributor,
     ScriptedGrok,
@@ -76,8 +76,8 @@ class World:
             )
             self.distributor = ScriptedDistributor()
         else:
-            self.executor = GrokBuildAdapter()
-            self.manager = NousHermesAdapter()
+            self.executor = build_executor()
+            self.manager = NousHermesAdapter(executor=self.executor)
             self.verifier = AntigravityVerifier()
             self.distributor = AntigravityDistributor()
         self.ctl = Controller(
@@ -89,10 +89,16 @@ class World:
 
     def runtime_truth(self) -> dict[str, Any]:
         simulated = self.mode == "deterministic"
+        kind = "scripted" if simulated else selected_executor_kind()
+        executor_mode = getattr(
+            self.executor, "harness_mode", "simulated" if simulated else "real"
+        )
         return {
             "simulated": simulated,
             "hermes": getattr(self.manager, "harness_mode", "simulated" if simulated else "real"),
-            "grok": getattr(self.executor, "harness_mode", "simulated" if simulated else "real"),
+            "executor": kind,
+            "executor_type": getattr(self.executor, "executor_type", "scripted"),
+            "grok": executor_mode,
             "antigravity": getattr(self.verifier, "harness_mode", "simulated" if simulated else "real"),
         }
 

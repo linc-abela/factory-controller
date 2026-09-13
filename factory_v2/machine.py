@@ -46,7 +46,7 @@ class Controller:
 
     Depends only on capability contracts. Harness CLI strings belong in adapters.
     External work-exchange projections are not runtime inputs.
-    Controller does not call Grok; Hermes coordinates that executor.
+    Controller does not call the EngineeringExecutor; Hermes coordinates it.
     """
 
     def __init__(
@@ -241,7 +241,9 @@ class Controller:
                 },
             )
         if not result.executor_called:
-            raise InvariantError("Engineering Manager must delegate coding through Grok Build")
+            raise InvariantError(
+                "Engineering Manager must delegate coding through the EngineeringExecutor"
+            )
         seq = self.store.next_sequence(snap.mission_id)
         snap = self.store.record_candidate(
             snap.mission_id,

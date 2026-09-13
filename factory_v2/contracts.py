@@ -15,7 +15,7 @@ from factory_v2.models import (
 
 @runtime_checkable
 class EngineeringExecutor(Protocol):
-    """Coding/implementation capability. Target: Grok Build."""
+    """Coding/implementation capability. Temporary default: Cursor CLI."""
 
     name: str
     harness_mode: str
@@ -29,7 +29,8 @@ class EngineeringExecutor(Protocol):
 class EngineeringManager(Protocol):
     """Engineering Manager capability. Target: Nous Hermes Agent.
 
-    Hermes coordinates Grok Build. Controller does not call the executor.
+    Hermes coordinates the selected EngineeringExecutor. Controller does not
+    call the executor.
     """
 
     name: str
