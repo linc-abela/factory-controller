@@ -28,7 +28,10 @@ HANDOFF_ONLY_FIELDS = frozenset({"g5_promotion", "factory_handoff"})
 LIFECYCLE = (
     "DETECTED",
     "CLARITY_REQUIRED",
+    "HERMES",
+    "ARCHITECTURE",
     "IMPLEMENT",
+    "INTEGRATION",
     "FUNCTIONAL_E2E",
     "RC_ALPHA",
     "OWNER_VALIDATION",
@@ -55,6 +58,7 @@ CREATE TABLE IF NOT EXISTS pcp_missions (
   rc_beta_url TEXT NOT NULL DEFAULT '',
   clarification TEXT NOT NULL DEFAULT '',
   payload_json TEXT NOT NULL,
+  evidence_json TEXT NOT NULL DEFAULT '{}',
   created_at REAL NOT NULL,
   updated_at REAL NOT NULL
 );
@@ -75,6 +79,7 @@ class PCPMission:
     rc_alpha_url: str = ""
     rc_beta_url: str = ""
     clarification: str = ""
+    evidence: dict[str, Any] | None = None
 
     def as_row(self) -> dict[str, Any]:
         return {
@@ -235,7 +240,7 @@ def clarity_check(package: Mapping[str, Any]) -> tuple[str, str, dict[str, Any] 
             % ", ".join(intake.mission["open_decisions"]),
             intake.as_row(),
         )
-    return "IMPLEMENT", "", intake.as_row()
+    return "HERMES", "", intake.as_row()
 
 
 def mission_key(canonical_path: str, package_digest: str) -> str:
@@ -263,10 +268,10 @@ def _web_root(checkout: Path) -> Path | None:
     return None
 
 
-def resolve_product_checkout(vault_root: str | Path, mission: PCPMission, *,
-                             project_roots: tuple[Path, ...] | None = None
-                             ) -> Path | None:
-    """Locate the product bytes named by the promoted PCP. Notion is unused."""
+def locate_prototype(vault_root: str | Path, mission: PCPMission, *,
+                     project_roots: tuple[Path, ...] | None = None
+                     ) -> Path | None:
+    """Locate Lab prototype bytes as Architecture *input*. Never RC-alpha."""
 
     names: list[str] = []
     pcp_path = Path(vault_root) / mission.canonical_path
@@ -290,10 +295,21 @@ def resolve_product_checkout(vault_root: str | Path, mission: PCPMission, *,
             continue
         seen.add(name)
         for root in roots:
-            web = _web_root(root / name)
-            if web is not None:
-                return web
+            candidates = []
+            exact = root / name
+            if exact.is_dir():
+                candidates.append(exact)
+            candidates.extend(sorted(
+                (path for path in root.glob(name + "-*") if path.is_dir()),
+                key=lambda path: path.name, reverse=True))
+            for candidate in candidates:
+                web = _web_root(candidate)
+                if web is not None:
+                    return web
     return None
+
+
+resolve_product_checkout = locate_prototype  # architecture input only; never RC-alpha
 
 
 def write_rc_alpha_surface(root: str | Path, mission: PCPMission) -> Path:
@@ -343,10 +359,20 @@ def _free_port() -> int:
         return int(sock.getsockname()[1])
 
 
-def serve_product_rc(web_root: Path, *, state_dir: str | Path, package_id: str) -> str:
-    """Serve existing product bytes on loopback. Never invents a stub page."""
+def serve_product_rc(web_root: Path, *, state_dir: str | Path, package_id: str,
+                     candidate_head: str) -> str:
+    """Serve a sealed Factory candidate. Prototype checkouts are not valid."""
 
+    if not candidate_head or not str(candidate_head).strip():
+        return ""
     root = Path(web_root).resolve()
+    marker = root / ".factory-candidate.json"
+    try:
+        identity = json.loads(marker.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return ""
+    if identity.get("candidate_head") != candidate_head:
+        return ""
     if _web_root(root) is None and not (root / "index.html").is_file():
         return ""
     receipt_dir = Path(state_dir) / "pcp-rc-alpha"
@@ -359,7 +385,7 @@ def serve_product_rc(web_root: Path, *, state_dir: str | Path, package_id: str) 
             prior = {}
         url = str(prior.get("url") or "")
         pid = int(prior.get("pid") or 0)
-        if url and _pid_alive(pid):
+        if url and _pid_alive(pid) and str(prior.get("candidate_head") or "") == candidate_head:
             try:
                 body = _fetch(url)
             except (OSError, urllib.error.URLError, TimeoutError, ValueError):
@@ -393,10 +419,25 @@ def serve_product_rc(web_root: Path, *, state_dir: str | Path, package_id: str) 
         proc.terminate()
         return ""
     receipt.write_text(
-        json.dumps({"url": url, "pid": proc.pid, "root": str(root)}, indent=2) + "\n",
+        json.dumps({
+            "url": url, "pid": proc.pid, "root": str(root),
+            "candidate_head": candidate_head,
+        }, indent=2) + "\n",
         encoding="utf-8",
     )
     return url
+
+
+def _parse_evidence(row) -> dict[str, Any]:
+    try:
+        raw = row["evidence_json"]
+    except (KeyError, IndexError, TypeError):
+        return {}
+    try:
+        body = json.loads(raw or "{}")
+    except (TypeError, ValueError):
+        return {}
+    return body if isinstance(body, dict) else {}
 
 
 class PCPMissionPlane:
@@ -408,6 +449,11 @@ class PCPMissionPlane:
         self.clock = clock or store.clock
         with store.transaction() as db:
             db.executescript(SCHEMA)
+            cols = {row[1] for row in db.execute("PRAGMA table_info(pcp_missions)")}
+            if "evidence_json" not in cols:
+                db.execute(
+                    "ALTER TABLE pcp_missions ADD COLUMN evidence_json TEXT NOT NULL DEFAULT '{}'"
+                )
 
     def sync(self, *, source_revision: str = "") -> tuple[PCPMission, ...]:
         admitted: list[PCPMission] = []
@@ -452,17 +498,29 @@ class PCPMissionPlane:
                 (int(hold), now, mission_key_value),
             )
 
-    def set_rc_url(self, mission_key_value: str, *, alpha: str = "", beta: str = "") -> None:
+    def set_rc_url(self, mission_key_value: str, *, alpha: str = "", beta: str = "",
+                   evidence: Mapping[str, Any] | None = None) -> None:
+        from .golden_path import IncompleteChain, missing_links
+
         now = self.clock()
         with self._store.transaction() as db:
             row = db.execute(
-                "SELECT lifecycle FROM pcp_missions WHERE mission_key=?",
+                "SELECT lifecycle, evidence_json FROM pcp_missions WHERE mission_key=?",
                 (mission_key_value,),
             ).fetchone()
             if row is None:
                 return
+            stored = {}
+            try:
+                stored = json.loads(row["evidence_json"] or "{}")
+            except ValueError:
+                stored = {}
+            merged = {**stored, **(evidence or {})}
             lifecycle = row["lifecycle"]
             if alpha:
+                missing = missing_links(merged)
+                if missing:
+                    raise IncompleteChain(missing)
                 lifecycle = "OWNER_VALIDATION"
             if beta:
                 lifecycle = "OWNER_SIGNOFF"
@@ -498,12 +556,29 @@ class PCPMissionPlane:
             )
             return True
 
-    def advance(self, *, worker_id: str = "factory-pcp",
-                rc_alpha_for=None) -> tuple[PCPMission, ...]:
-        """Admit clear PCPs as Controller missions and record RC-alpha when ready.
+    def record_evidence(self, mission_key_value: str, evidence: Mapping[str, Any],
+                        *, lifecycle: str = "") -> None:
+        from .golden_path import lifecycle_of
 
-        ``rc_alpha_for(mission) -> url`` is optional Factory processing. Notion
-        is never consulted. Duplicate path+digest stays one mission.
+        now = self.clock()
+        body = json.dumps(dict(evidence), sort_keys=True)
+        next_lifecycle = lifecycle or lifecycle_of(evidence)
+        with self._store.transaction() as db:
+            db.execute(
+                """UPDATE pcp_missions
+                   SET evidence_json=?, lifecycle=?, updated_at=?
+                   WHERE mission_key=?""",
+                (body, next_lifecycle, now, mission_key_value),
+            )
+
+    def advance(self, *, worker_id: str = "factory-pcp",
+                process=None) -> tuple[PCPMission, ...]:
+        """Admit clear PCPs and run Hermes golden-path processing.
+
+        ``process(mission) -> evidence`` is Factory/Hermes continuation. A URL
+        inside evidence is recorded as RC-alpha only when the eight-link chain
+        is complete. Notion is never consulted. Duplicate path+digest stays
+        one mission. ``rc_alpha_for`` checkout serving is gone.
         """
 
         self.sync()
@@ -527,13 +602,15 @@ class PCPMissionPlane:
                 continue
             if not self.claim(row.mission_key, worker_id):
                 continue
-            url = ""
-            if callable(rc_alpha_for):
-                url = rc_alpha_for(row) or ""
-            elif row.rc_alpha_url:
-                url = row.rc_alpha_url
-            if url:
-                self.set_rc_url(row.mission_key, alpha=url)
+            if callable(process):
+                evidence = process(row) or {}
+                self.record_evidence(row.mission_key, evidence)
+                url = str((evidence.get("rc_alpha") or {}).get("url") or "")
+                if url:
+                    try:
+                        self.set_rc_url(row.mission_key, alpha=url, evidence=evidence)
+                    except Exception:
+                        pass
             advanced.append(
                 next(item for item in self.list() if item.mission_key == row.mission_key)
             )
@@ -581,4 +658,5 @@ class PCPMissionPlane:
             rc_alpha_url=row["rc_alpha_url"] or "",
             rc_beta_url=row["rc_beta_url"] or "",
             clarification=row["clarification"] or "",
+            evidence=_parse_evidence(row),
         )

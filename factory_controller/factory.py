@@ -492,7 +492,7 @@ class FactoryLifecycle:
             "scope": "first internal dogfood",
         })
         self._provision_store(contract, entry, doctor)
-        self.pcp_missions.advance(rc_alpha_for=self._pcp_rc_alpha)
+        self.pcp_missions.advance(process=self._pcp_process)
         readings = self._refresh_capacity(contract)
         doctor, capability_preview = self._admit_required_capability(
             contract, doctor, approval_ref)
@@ -2405,7 +2405,7 @@ class FactoryLifecycle:
         """
 
         self._require_owner()
-        self.pcp_missions.advance(rc_alpha_for=self._pcp_rc_alpha)
+        self.pcp_missions.advance(process=self._pcp_process)
         contract, entry = self._load_contract_and_portfolio()
         grant = self.shift.grant()
         control = self.supervisor.control()
@@ -3104,20 +3104,18 @@ class FactoryLifecycle:
                 "for Owner review. It is kept in durable history and does not "
                 "block this product." % portfolio_mission.mission_ref)
 
-    def _pcp_rc_alpha(self, mission):
-        """Serve the PCP-named product checkout. Never a stub page. No Notion."""
-        if mission.rc_alpha_url and mission.rc_alpha_url.startswith("http"):
-            try:
-                body = pcp_missions._fetch(mission.rc_alpha_url)
-            except Exception:
-                body = ""
-            if body and not pcp_missions.is_stub_rc_body(body):
-                return mission.rc_alpha_url
-        checkout = pcp_missions.resolve_product_checkout(self.config.vault_root, mission)
-        if checkout is None:
-            return ""
-        return pcp_missions.serve_product_rc(
-            checkout, state_dir=self.config.state_dir, package_id=mission.package_id)
+    def _pcp_process(self, mission):
+        """Hermes golden path. Prototype checkouts are input, never RC-alpha."""
+        from . import golden_path
+        return golden_path.run(
+            mission,
+            vault_root=self.config.vault_root,
+            state_dir=self.config.state_dir,
+            executors=golden_path.FleetExecutors(
+                vault_root=self.config.vault_root,
+                state_dir=self.config.state_dir,
+            ),
+        )
 
     def _pcp_mission_status_lines(self) -> tuple[tuple[str, ...], str]:
         rows = self.pcp_missions.list()

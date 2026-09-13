@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import os
+import shutil
 import tempfile
 import unittest
 from pathlib import Path
@@ -16,11 +17,107 @@ from awe_worker.observation import MemoryTaskSource
 from awe_worker.scheduler import AWEScheduledRunner
 from awe_worker.harness import MockHarnessAdapter
 from awe_worker.worker import AWEAutonomousWorker
-from factory_controller import pcp, pcp_missions
+from factory_controller import golden_path, pcp, pcp_missions
 from factory_controller.store import MissionStore
 
 
 SLOT = ExecutionSlot("cursor", "grok-4.6", "high")
+FAKE_HEAD = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+
+
+class _FakeFleet:
+    def __init__(self, prototype: Path) -> None:
+        self.prototype = prototype
+        self.head = FAKE_HEAD
+
+    def hermes(self, mission):
+        return {
+            "owner": "hermes",
+            "routing": {
+                "architecture": dict(golden_path.ARCH_PRIMARY),
+                "implementation": dict(golden_path.IMPL_ROUTE),
+            },
+            "plan": ["architecture", "implementation", "integration",
+                     "functional_e2e", "rc_alpha"],
+            "prototype_input": str(self.prototype),
+        }
+
+    def architecture(self, mission, hermes, work: Path):
+        work.mkdir(parents=True, exist_ok=True)
+        artifact = work / "architecture.json"
+        body = {
+            "prototype_reuse": "REUSE_WITH_DELTA",
+            "required_delta": "post-intake implementation delta",
+            "subsystems": ["ui"],
+            "invariants": ["prototype URL is not RC-alpha"],
+            "implementation_packages": [{"id": "core"}],
+            "verification": ["page contains post-intake delta"],
+            "functional_e2e": ["playable finite shoe remains"],
+            "rc_alpha": "serve integrated candidate only",
+        }
+        artifact.write_text(json.dumps(body), encoding="utf-8")
+        return {
+            "artifact": str(artifact),
+            **golden_path.ARCH_PRIMARY,
+            "body": body,
+            "sol": {"ok": True, "quota": False},
+        }
+
+    def implementation(self, mission, architecture, work: Path):
+        work.mkdir(parents=True, exist_ok=True)
+        if self.prototype.is_dir():
+            for item in self.prototype.iterdir():
+                if item.is_file():
+                    shutil.copy2(item, work / item.name)
+        html = (work / "index.html").read_text(encoding="utf-8")
+        (work / "index.html").write_text(
+            html.replace("</p>", " post-intake implementation delta</p>"),
+            encoding="utf-8")
+        (work / golden_path.CANDIDATE_MARKER).write_text(
+            json.dumps({"candidate_head": self.head}), encoding="utf-8")
+        return {
+            "packages": [{
+                "id": "core",
+                **golden_path.IMPL_ROUTE,
+                "branch": "sf/mission/impl",
+                "head": self.head,
+                "acceptance": "delta committed after intake",
+            }],
+            "head": self.head,
+        }
+
+    def integrate(self, mission, implementation, work: Path):
+        return {
+            "candidate_head": self.head,
+            "included_heads": [self.head],
+            "mission_key": mission.mission_key,
+        }
+
+    def e2e(self, mission, work: Path, candidate_head: str):
+        body = (work / "index.html").read_text(encoding="utf-8")
+        ok = "post-intake implementation delta" in body
+        return {
+            "candidate": candidate_head,
+            "scenarios": ["playable finite shoe", "post-intake delta"],
+            "result": "PASS" if ok else "FAIL",
+        }
+
+    def deploy(self, mission, work: Path, candidate_head: str, state_dir: Path):
+        sealed = state_dir / "pcp-candidates" / candidate_head[:12]
+        if sealed.exists():
+            shutil.rmtree(sealed)
+        sealed.mkdir(parents=True)
+        for item in work.iterdir():
+            if item.is_file():
+                shutil.copy2(item, sealed / item.name)
+        (sealed / golden_path.CANDIDATE_MARKER).write_text(json.dumps({
+            "candidate_head": candidate_head,
+            "package_id": mission.package_id,
+        }), encoding="utf-8")
+        url = pcp_missions.serve_product_rc(
+            sealed, state_dir=state_dir, package_id=mission.package_id,
+            candidate_head=candidate_head)
+        return {"url": url, "candidate_head": candidate_head, "deployment": str(sealed)}
 
 
 def _task(task_id="SF-272", status="Queue"):
@@ -192,7 +289,7 @@ class SF272PCPMissionQueueTests(unittest.TestCase):
         rows = self.plane.sync()
         ids = {row.package_id: row for row in rows}
         self.assertIn("lodus-casino", ids)
-        self.assertEqual(ids["lodus-casino"].lifecycle, "IMPLEMENT")
+        self.assertEqual(ids["lodus-casino"].lifecycle, "HERMES")
         self.assertEqual(ids["vague-product"].lifecycle, "CLARITY_REQUIRED")
         self.assertTrue(ids["vague-product"].clarification)
         self.assertEqual(
@@ -217,35 +314,22 @@ class SF272PCPMissionQueueTests(unittest.TestCase):
         self.plane.set_hold(casino.mission_key, True)
         self.assertFalse(self.plane.claim(casino.mission_key, "worker-a"))
 
-    def test_rc_url_advances_lifecycle_to_owner_validation(self):
+    def test_rc_url_without_provenance_is_rejected(self):
         self.plane.sync()
         casino = next(row for row in self.plane.list() if row.package_id == "lodus-casino")
-        self.plane.set_rc_url(casino.mission_key, alpha="https://example.test/rc-alpha")
+        with self.assertRaises(golden_path.IncompleteChain):
+            self.plane.set_rc_url(casino.mission_key, alpha="https://example.test/rc-alpha")
         row = next(item for item in self.plane.list() if item.mission_key == casino.mission_key)
-        self.assertEqual(row.lifecycle, "OWNER_VALIDATION")
-        self.assertEqual(row.rc_alpha_url, "https://example.test/rc-alpha")
-
-    def test_kyriedachi_extra_fields_do_not_block_factory_intake(self):
-        src = Path(
-            "/Users/Shared/Projects/factory-vault-SF-272/PRODUCTS/"
-            "kyriedachi-life/pcp-v1.1.0.json"
-        )
-        dest = self.vault / "PRODUCTS" / "kyriedachi-life"
-        dest.mkdir()
-        dest.joinpath("pcp-v1.1.0.json").write_text(
-            src.read_text(encoding="utf-8"), encoding="utf-8")
-        rows = {row.package_id: row for row in self.plane.sync()}
-        self.assertIn("lodus-kyriedachi-life", rows)
-        self.assertEqual(rows["lodus-kyriedachi-life"].lifecycle, "IMPLEMENT")
-        self.assertFalse(rows["lodus-kyriedachi-life"].clarification)
+        self.assertEqual(row.lifecycle, "HERMES")
+        self.assertEqual(row.rc_alpha_url, "")
 
     def test_missing_checkout_does_not_invent_a_stub_rc(self):
-        rows = self.plane.advance(rc_alpha_for=lambda mission: "")
+        rows = self.plane.advance(process=lambda mission: {})
         casino = next(row for row in rows if row.package_id == "lodus-casino")
-        self.assertEqual(casino.lifecycle, "IMPLEMENT")
+        self.assertEqual(casino.lifecycle, "HERMES")
         self.assertEqual(casino.rc_alpha_url, "")
 
-    def test_handoff_checkout_is_served_as_working_rc(self):
+    def test_existing_checkout_is_not_rc_alpha(self):
         checkout = self.root / "projects" / "prototype-casino"
         checkout.mkdir(parents=True)
         (checkout / "index.html").write_text(
@@ -259,52 +343,72 @@ class SF272PCPMissionQueueTests(unittest.TestCase):
             "source_repository": "linc-abela/prototype-casino",
         }
         pcp_path.write_text(json.dumps(body), encoding="utf-8")
-        found = pcp_missions.resolve_product_checkout(
+        found = pcp_missions.locate_prototype(
             self.vault, casino, project_roots=(self.root / "projects",))
         self.assertEqual(found, checkout)
         url = pcp_missions.serve_product_rc(
-            found, state_dir=self.root / "state", package_id=casino.package_id)
-        self.addCleanup(lambda: self._stop_rc(self.root / "state", casino.package_id))
-        self.assertTrue(url.startswith("http://127.0.0.1:"))
-        fetched = pcp_missions._fetch(url)
-        self.assertIn("playable finite shoe", fetched)
-        self.assertFalse(pcp_missions.is_stub_rc_body(fetched))
+            found, state_dir=self.root / "state", package_id=casino.package_id,
+            candidate_head="deadbeef")
+        self.assertEqual(url, "")
+        rows = self.plane.advance(process=lambda mission: {
+            "rc_alpha": {"url": "http://127.0.0.1:9/", "root": str(checkout)},
+        })
+        casino = next(row for row in rows if row.package_id == "lodus-casino")
+        self.assertEqual(casino.rc_alpha_url, "")
+        self.assertNotEqual(casino.lifecycle, "OWNER_VALIDATION")
 
-    def test_golden_path_admits_controller_mission_and_working_rc(self):
+    def test_golden_path_requires_hermes_architecture_implementation(self):
         checkout = self.root / "projects" / "lodus-casino"
         checkout.mkdir(parents=True)
         (checkout / "index.html").write_text(
             "<!doctype html><title>lodus-casino</title><p>finite-shoe higher/lower</p>\n",
             encoding="utf-8")
-
-        def rc_alpha_for(mission):
-            found = pcp_missions.resolve_product_checkout(
-                self.vault, mission, project_roots=(self.root / "projects",))
-            if found is None:
-                return ""
-            return pcp_missions.serve_product_rc(
-                found, state_dir=self.root / "state", package_id=mission.package_id)
-
-        rows = self.plane.advance(rc_alpha_for=rc_alpha_for)
+        executors = _FakeFleet(checkout)
+        def process(mission):
+            return golden_path.run(
+                mission, vault_root=self.vault, state_dir=self.root / "state",
+                executors=executors)
+        rows = self.plane.advance(process=process)
         casino = next(row for row in rows if row.package_id == "lodus-casino")
         self.addCleanup(lambda: self._stop_rc(self.root / "state", "lodus-casino"))
         self.assertEqual(casino.lifecycle, "OWNER_VALIDATION")
         self.assertTrue(casino.rc_alpha_url)
         body = pcp_missions._fetch(casino.rc_alpha_url)
         self.assertIn("finite-shoe higher/lower", body)
+        self.assertIn("post-intake implementation delta", body)
         self.assertFalse(pcp_missions.is_stub_rc_body(body))
+        self.assertEqual(golden_path.missing_links(casino.evidence), ())
+        self.assertEqual(
+            casino.evidence["architecture"]["model"], "gpt-5.6-sol")
+        self.assertEqual(
+            casino.evidence["implementation"]["packages"][0]["model"],
+            "gpt-5.6-luna")
         mission, created = self.store.submit(
             {
                 "work_item_id": "lodus-casino:build",
                 "project_id": "lodus-casino",
                 "source_pcp": casino.canonical_path,
                 "package_digest": casino.package_digest,
-                "lifecycle": "IMPLEMENT",
+                "lifecycle": "HERMES",
             },
             casino.mission_key,
         )
         self.assertFalse(created)
         self.assertEqual(mission["project_id"], "lodus-casino")
+
+    def test_kyriedachi_extra_fields_do_not_block_factory_intake(self):
+        src = Path(
+            "/Users/Shared/Projects/factory-vault-SF-272/PRODUCTS/"
+            "kyriedachi-life/pcp-v1.1.0.json"
+        )
+        dest = self.vault / "PRODUCTS" / "kyriedachi-life"
+        dest.mkdir()
+        dest.joinpath("pcp-v1.1.0.json").write_text(
+            src.read_text(encoding="utf-8"), encoding="utf-8")
+        rows = {row.package_id: row for row in self.plane.sync()}
+        self.assertIn("lodus-kyriedachi-life", rows)
+        self.assertEqual(rows["lodus-kyriedachi-life"].lifecycle, "HERMES")
+        self.assertFalse(rows["lodus-kyriedachi-life"].clarification)
 
 
 if __name__ == "__main__":
