@@ -376,16 +376,29 @@ class FleetExecutors:
     def implementation(self, mission: Any,
                        architecture: Mapping[str, Any], work: Path,
                        repair: Mapping[str, Any] | None = None) -> dict[str, Any]:
+        rejected = str((repair or {}).get("rejected_head") or "")
+        current = _git_head(work)
+        if repair and current and current != rejected:
+            selected = None
+            result = self._implementation_result(architecture, work, selected)
+            result["head"] = current
+            result["live"] = self._live(work)
+            result["repair"] = dict(repair)
+            result["acceptance"] = result.get("acceptance") or "post-reject git head"
+            return result
         if not repair:
             existing = self._implementation_result(architecture, work, None)
             if existing.get("head"):
                 return existing
-        rejected = str((repair or {}).get("rejected_head") or "")
 
         def _new_head() -> bool:
-            result = self._implementation_result(architecture, work, None)
-            head = str(result.get("head") or "")
-            return bool(head) and (not rejected or head != rejected)
+            head = _git_head(work)
+            if not head:
+                return False
+            if rejected:
+                return head != rejected
+            intake = str(architecture.get("intake_head") or "")
+            return (not intake) or head != intake
 
         attempts = self._execute_capability(
             CAP_IMPLEMENTATION, mission, work,
@@ -575,8 +588,22 @@ class FleetExecutors:
                 "scenarios": [],
             }
         from . import pcp_missions
+        exported = Path(self.state_dir) / "pcp-e2e-export" / candidate_head[:12]
+        if not _export_head(work, exported, candidate_head):
+            return {
+                "candidate": candidate_head,
+                "candidate_head": candidate_head,
+                "result": "FAIL",
+                "detail": "could not export committed candidate for rendered E2E",
+                "scenarios": [],
+            }
+        (exported / CANDIDATE_MARKER).write_text(json.dumps({
+            "candidate_head": candidate_head,
+            "package_id": mission.package_id,
+            "mission_key": mission.mission_key,
+        }, indent=2) + "\n", encoding="utf-8")
         url = pcp_missions.serve_product_rc(
-            work, state_dir=self.state_dir, package_id=mission.package_id,
+            exported, state_dir=self.state_dir, package_id=mission.package_id,
             candidate_head=candidate_head, lane="pcp-e2e")
         receipt = work / AG_RECEIPT
         if receipt.is_file():
@@ -604,6 +631,7 @@ class FleetExecutors:
             succeeded=succeeded,
             context={"difficulty": "medium", "rendered": True},
         )
+        _capture_ag_receipt(work, attempts, candidate_head, mission)
         selected = _final_profile(attempts)
         body = _ag_receipt(work)
         scenarios = list(body.get("scenarios") or [])
@@ -642,9 +670,8 @@ class FleetExecutors:
     def deploy(self, mission: Any, work: Path,
                candidate_head: str, state_dir: Path) -> dict[str, Any]:
         sealed = state_dir / "pcp-candidates" / candidate_head[:12]
-        if sealed.exists():
-            shutil.rmtree(sealed)
-        shutil.copytree(work, sealed, ignore=shutil.ignore_patterns(".git"))
+        if not _export_head(work, sealed, candidate_head):
+            return {}
         marker = sealed / CANDIDATE_MARKER
         marker.write_text(json.dumps({
             "candidate_head": candidate_head,
@@ -847,6 +874,62 @@ def _e2e_prompt(mission: Any, work: Path, candidate_head: str, url: str,
            mission.mission_key, candidate_head, url or "(missing rendered URL)",
            work, arch_e2e, defects, receipt, candidate_head)
     )
+
+
+def _export_head(work: Path, dest: Path, head: str) -> bool:
+    if not head:
+        return False
+    if dest.exists():
+        shutil.rmtree(dest)
+    dest.mkdir(parents=True)
+    archive = subprocess.run(
+        ["git", "archive", "--format=tar", head],
+        cwd=work, capture_output=True, timeout=60)
+    if archive.returncode != 0 or not archive.stdout:
+        return False
+    proc = subprocess.run(
+        ["tar", "-xf", "-"], cwd=dest, input=archive.stdout,
+        capture_output=True, timeout=60)
+    return proc.returncode == 0 and any(dest.iterdir())
+
+
+def _capture_ag_receipt(work: Path, attempts: list[dict[str, Any]],
+                        candidate_head: str, mission: Any) -> None:
+    if _ag_receipt(work):
+        return
+    for attempt in reversed(attempts):
+        receipt = (attempt.get("receipt") or {})
+        text = "%s\n%s" % (receipt.get("stdout_tail") or "",
+                           receipt.get("stderr_tail") or "")
+        body = _extract_json(text)
+        if not body:
+            continue
+        body.setdefault("candidate_head", candidate_head)
+        body.setdefault("mission_key", getattr(mission, "mission_key", ""))
+        body.setdefault("result", "FAIL")
+        (work / AG_RECEIPT).write_text(
+            json.dumps(body, indent=2) + "\n", encoding="utf-8")
+        return
+
+
+def _extract_json(text: str) -> dict[str, Any]:
+    text = text.strip()
+    if not text:
+        return {}
+    try:
+        body = json.loads(text)
+        return body if isinstance(body, dict) else {}
+    except ValueError:
+        pass
+    start = text.find("{")
+    end = text.rfind("}")
+    if start >= 0 and end > start:
+        try:
+            body = json.loads(text[start:end + 1])
+            return body if isinstance(body, dict) else {}
+        except ValueError:
+            return {}
+    return {}
 
 
 def _ag_receipt(work: Path) -> dict[str, Any]:
