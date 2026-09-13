@@ -3,6 +3,7 @@ from __future__ import annotations
 from typing import Protocol, runtime_checkable
 
 from factory_v2.models import (
+    CandidateIdentity,
     DistributionResult,
     EngineeringResult,
     ExecutorResult,
@@ -26,7 +27,10 @@ class EngineeringExecutor(Protocol):
 
 @runtime_checkable
 class EngineeringManager(Protocol):
-    """Engineering Manager capability. Target: Nous Hermes Agent."""
+    """Engineering Manager capability. Target: Nous Hermes Agent.
+
+    Hermes coordinates Grok Build. Controller does not call the executor.
+    """
 
     name: str
     harness_mode: str
@@ -44,9 +48,9 @@ class Verifier(Protocol):
     name: str
     harness_mode: str
 
-    def review(self, ctx: MissionContext, artifact_id: str) -> Verdict: ...
+    def review(self, ctx: MissionContext, candidate: CandidateIdentity) -> Verdict: ...
 
-    def qa(self, ctx: MissionContext, artifact_id: str) -> Verdict: ...
+    def qa(self, ctx: MissionContext, candidate: CandidateIdentity) -> Verdict: ...
 
 
 @runtime_checkable
@@ -56,4 +60,6 @@ class DistributionExecutor(Protocol):
     name: str
     harness_mode: str
 
-    def distribute(self, artifact_id: str, mission_id: str) -> DistributionResult: ...
+    def distribute(
+        self, candidate: CandidateIdentity, mission_id: str
+    ) -> DistributionResult: ...

@@ -1,0 +1,130 @@
+{
+  "contract_type": "factory.v2.verified_rc",
+  "contract_version": "1.0.0",
+  "mission_id": "mission.demo",
+  "rc": {
+    "rc_id": "rc.demo",
+    "version": "1.0.0",
+    "immutable_revision": "2222222222222222222222222222222222222222"
+  },
+  "candidate": {
+    "candidate_id": "candidate-b",
+    "source_revision": "2222222222222222222222222222222222222222",
+    "artifact_hash": "sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+    "artifact_uri": "git+https://example.invalid/factory-v2@2222222"
+  },
+  "engineering_tests": [
+    {
+      "test_id": "contract-fixtures",
+      "command": "python3 SOFTWARE-FACTORY-V2/contracts/validate_contracts.py",
+      "result": "PASS",
+      "run_at": "2026-09-14T03:20:00Z",
+      "evidence": [
+        {
+          "kind": "test-run",
+          "uri": "vault://evidence/contract-fixtures.json",
+          "revision": "2222222222222222222222222222222222222222",
+          "content_hash": "sha256:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+          "immutable": true
+        }
+      ]
+    },
+    {
+      "test_id": "schema-json-parse",
+      "command": "python3 -m json.tool SOFTWARE-FACTORY-V2/contracts/verified-rc.schema.json",
+      "result": "PASS",
+      "run_at": "2026-09-14T03:21:00Z",
+      "evidence": [
+        {
+          "kind": "test-run",
+          "uri": "vault://evidence/schema-parse.json",
+          "revision": "2222222222222222222222222222222222222222",
+          "content_hash": "sha256:eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+          "immutable": true
+        }
+      ]
+    }
+  ],
+  "code_review": {
+    "kind": "adversarial_code_security_invariant",
+    "verdict": "PASS",
+    "candidate": {
+      "candidate_id": "candidate-b",
+      "source_revision": "2222222222222222222222222222222222222222",
+      "artifact_hash": "sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+      "artifact_uri": "git+https://example.invalid/factory-v2@2222222"
+    },
+    "verifier": {
+      "identity": "antigravity:reviewer-1",
+      "runtime": {
+        "harness": "Antigravity",
+        "version": "2026.09",
+        "provenance_ref": {
+          "kind": "review-run",
+          "uri": "vault://evidence/review-pass.json",
+          "revision": "2222222222222222222222222222222222222222",
+          "content_hash": "sha256:ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+          "immutable": true
+        }
+      },
+      "independence": {
+        "independent_from_producer": true,
+        "independent_from_candidate_author": true
+      }
+    },
+    "evidence": [
+      {
+        "kind": "review-result",
+        "uri": "vault://evidence/review-pass.json",
+        "revision": "2222222222222222222222222222222222222222",
+        "content_hash": "sha256:1111111111111111111111111111111111111111111111111111111111111111",
+        "immutable": true
+      }
+    ]
+  },
+  "qa_e2e": {
+    "kind": "qa_regression_e2e",
+    "verdict": "PASS",
+    "candidate": {
+      "candidate_id": "candidate-b",
+      "source_revision": "2222222222222222222222222222222222222222",
+      "artifact_hash": "sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+      "artifact_uri": "git+https://example.invalid/factory-v2@2222222"
+    },
+    "verifier": {
+      "identity": "antigravity:qa-1",
+      "runtime": {
+        "harness": "Antigravity",
+        "version": "2026.09",
+        "provenance_ref": {
+          "kind": "qa-run",
+          "uri": "vault://evidence/qa-pass.json",
+          "revision": "2222222222222222222222222222222222222222",
+          "content_hash": "sha256:2222222222222222222222222222222222222222222222222222222222222222",
+          "immutable": true
+        }
+      },
+      "independence": {
+        "independent_from_producer": true,
+        "independent_from_candidate_author": true
+      }
+    },
+    "evidence": [
+      {
+        "kind": "qa-result",
+        "uri": "vault://evidence/qa-pass.json",
+        "revision": "2222222222222222222222222222222222222222",
+        "content_hash": "sha256:3333333333333333333333333333333333333333333333333333333333333333",
+        "immutable": true
+      }
+    ]
+  },
+  "eligibility": {
+    "status": "VERIFIED_RC",
+    "eligible_for_owner_gate": true
+  },
+  "owner_gate": {
+    "status": "AWAITING_OWNER",
+    "decision": "PENDING"
+  }
+}

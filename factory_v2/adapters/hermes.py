@@ -6,16 +6,17 @@ import shutil
 import subprocess
 from pathlib import Path
 
-from factory_v2.contracts import EngineeringExecutor
-from factory_v2.models import EngineeringResult, MissionContext, WorkItem
+from factory_v2.canonical import PROFILE_ID
+from factory_v2.models import CandidateIdentity, EngineeringResult, MissionContext
 
 
 class NousHermesAdapter:
-    """Thin EngineeringManager over official Nous Hermes (`hermes chat --oneshot`).
+    """Thin EngineeringManager over official Nous Hermes.
 
-    Does not reimplement session/memory/subagents/skills. Official CLI only.
-    Hermes receives the approved PCP + durable mission context, then must
-    delegate coding through the EngineeringExecutor (Grok Build) boundary.
+    Hermes, not Controller Python, coordinates Grok Build through the
+    factory-engineering profile / official grok skill. This adapter only
+    launches Hermes in the admitted sandbox and validates the structured
+    result file. It never calls Grok itself.
     """
 
     name = "Nous Hermes Agent"
@@ -23,12 +24,10 @@ class NousHermesAdapter:
 
     def __init__(
         self,
-        executor: EngineeringExecutor,
         *,
         env: dict[str, str] | None = None,
         binary: str = "hermes",
     ):
-        self.executor = executor
         self._env = env if env is not None else dict(os.environ)
         self._binary = binary
 
@@ -40,25 +39,35 @@ class NousHermesAdapter:
                 reason="hermes runtime unavailable",
                 harness_mode="real",
                 manager_name=self.name,
-                executor_name=self.executor.name,
+                executor_name="Grok Build",
                 executor_called=False,
             )
-        query = {
+        workspace = Path(ctx.workspace_path)
+        workspace.mkdir(parents=True, exist_ok=True)
+        (workspace / "pcp-handoff.json").write_text(
+            json.dumps(ctx.pcp, indent=2), encoding="utf-8"
+        )
+        request = {
             "role": "Engineering Manager",
+            "profile_id": PROFILE_ID,
             "mission_id": ctx.mission_id,
+            "lineage_id": ctx.lineage_id,
             "pcp_hash": ctx.pcp_hash,
-            "pcp": ctx.pcp,
+            "attempt_number": ctx.attempt_number,
+            "rework_sequence": ctx.rework_sequence,
             "defects": list(ctx.defects),
             "workspace": ctx.workspace_path,
             "instruction": (
-                "Interpret the approved PCP. Plan bounded coding work. "
-                "Do not approve PCP, waive verification, approve an RC, "
-                "or promote Production. Return JSON "
-                '{"objective": "..."} only.'
+                "Use the factory-engineering skill. Coordinate Grok Build "
+                "inside this sandbox via the official grok skill / terminal. "
+                "Write hermes-result.json with hermes_session_id, "
+                "grok_session_ref, and candidate tuple. Do not approve PCP, "
+                "waive verification, approve an RC, or promote Production."
             ),
         }
-        query_file = Path(ctx.workspace_path) / "hermes-query.json"
-        query_file.write_text(json.dumps(query, indent=2), encoding="utf-8")
+        query_file = workspace / "hermes-query.json"
+        query_file.write_text(json.dumps(request, indent=2), encoding="utf-8")
+        result_file = workspace / "hermes-result.json"
         try:
             proc = subprocess.run(
                 [
@@ -86,7 +95,7 @@ class NousHermesAdapter:
                 reason=f"hermes launch failed: {exc}",
                 harness_mode="real",
                 manager_name=self.name,
-                executor_name=self.executor.name,
+                executor_name="Grok Build",
                 executor_called=False,
             )
         if proc.returncode != 0:
@@ -95,45 +104,67 @@ class NousHermesAdapter:
                 reason=f"hermes failed: {proc.stderr[-500:]}",
                 harness_mode="real",
                 manager_name=self.name,
-                executor_name=self.executor.name,
+                executor_name="Grok Build",
                 executor_called=False,
             )
-        objective = _objective(proc.stdout, ctx)
-        work = WorkItem(objective=objective, defects=ctx.defects)
-        executed = self.executor.implement(ctx, work)
-        if executed.blocked or not executed.artifact_id:
+        payload = _result(result_file, proc.stdout)
+        if payload is None:
             return EngineeringResult(
                 blocked=True,
-                reason=executed.reason or "executor blocked",
-                harness_mode=executed.harness_mode,
+                reason="hermes returned no structured candidate result",
+                harness_mode="real",
                 manager_name=self.name,
-                executor_name=self.executor.name,
-                executor_called=True,
+                executor_name="Grok Build",
+                executor_called=False,
+            )
+        try:
+            candidate = CandidateIdentity(
+                candidate_id=payload["candidate"]["candidate_id"],
+                source_revision=payload["candidate"]["source_revision"],
+                artifact_hash=payload["candidate"]["artifact_hash"],
+                artifact_uri=payload["candidate"]["artifact_uri"],
+            )
+        except (KeyError, TypeError) as exc:
+            return EngineeringResult(
+                blocked=True,
+                reason=f"hermes candidate tuple missing: {exc}",
+                harness_mode="real",
+                manager_name=self.name,
+                executor_name="Grok Build",
+                executor_called=False,
             )
         return EngineeringResult(
-            candidate_artifact_id=executed.artifact_id,
-            harness_mode=self.harness_mode,
+            candidate=candidate,
+            hermes_session_id=str(payload.get("hermes_session_id") or f"hermes-{ctx.mission_id}"),
+            grok_session_ref=str(payload.get("grok_session_ref") or ""),
+            harness_mode="real",
             manager_name=self.name,
-            executor_name=self.executor.name,
+            executor_name="Grok Build",
             executor_called=True,
         )
 
 
-def _objective(stdout: str, ctx: MissionContext) -> str:
-    text = stdout.strip()
-    if text:
+def _result(path: Path, stdout: str) -> dict | None:
+    if path.is_file():
         try:
-            data = json.loads(text)
-            if isinstance(data, dict) and data.get("objective"):
-                return str(data["objective"])
+            data = json.loads(path.read_text(encoding="utf-8"))
+            if isinstance(data, dict) and isinstance(data.get("candidate"), dict):
+                return data
         except json.JSONDecodeError:
-            start = text.rfind("{")
-            end = text.rfind("}")
-            if start >= 0 and end > start:
-                try:
-                    data = json.loads(text[start : end + 1])
-                    if isinstance(data, dict) and data.get("objective"):
-                        return str(data["objective"])
-                except json.JSONDecodeError:
-                    pass
-    return ctx.pcp.get("intent") or ctx.pcp.get("title") or "implement admitted PCP"
+            return None
+    text = stdout.strip()
+    if not text:
+        return None
+    try:
+        data = json.loads(text)
+    except json.JSONDecodeError:
+        start, end = text.rfind("{"), text.rfind("}")
+        if start < 0 or end <= start:
+            return None
+        try:
+            data = json.loads(text[start : end + 1])
+        except json.JSONDecodeError:
+            return None
+    if isinstance(data, dict) and isinstance(data.get("candidate"), dict):
+        return data
+    return None

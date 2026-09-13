@@ -4,7 +4,7 @@ import os
 import shutil
 import subprocess
 
-from factory_v2.models import DistributionResult, MissionContext, Verdict
+from factory_v2.models import CandidateIdentity, DistributionResult, MissionContext, Verdict
 
 
 class AntigravityVerifier:
@@ -17,29 +17,37 @@ class AntigravityVerifier:
         self._env = env if env is not None else dict(os.environ)
         self._binary = binary
 
-    def review(self, ctx: MissionContext, artifact_id: str) -> Verdict:
-        return self._run("review", ctx, artifact_id)
+    def review(self, ctx: MissionContext, candidate: CandidateIdentity) -> Verdict:
+        return self._run("review", ctx, candidate)
 
-    def qa(self, ctx: MissionContext, artifact_id: str) -> Verdict:
-        return self._run("qa", ctx, artifact_id)
+    def qa(self, ctx: MissionContext, candidate: CandidateIdentity) -> Verdict:
+        return self._run("qa", ctx, candidate)
 
-    def _run(self, kind: str, ctx: MissionContext, artifact_id: str) -> Verdict:
+    def _run(self, kind: str, ctx: MissionContext, candidate: CandidateIdentity) -> Verdict:
         binary = shutil.which(self._binary, path=self._env.get("PATH"))
+        identity = "antigravity:reviewer-1" if kind == "review" else "antigravity:qa-1"
         if binary is None:
             return Verdict(
                 kind=kind,
-                artifact_id=artifact_id,
+                candidate=candidate,
                 passed=False,
                 defects=(f"antigravity binary unavailable for {kind}",),
                 harness_mode="real",
+                verifier_identity=identity,
             )
         try:
             proc = subprocess.run(
                 [
                     binary,
                     kind,
-                    "--artifact",
-                    artifact_id,
+                    "--candidate-id",
+                    candidate.candidate_id,
+                    "--source-revision",
+                    candidate.source_revision,
+                    "--artifact-hash",
+                    candidate.artifact_hash,
+                    "--artifact-uri",
+                    candidate.artifact_uri,
                     "--workspace",
                     ctx.workspace_path,
                     "--mission",
@@ -54,24 +62,27 @@ class AntigravityVerifier:
         except OSError as exc:
             return Verdict(
                 kind=kind,
-                artifact_id=artifact_id,
+                candidate=candidate,
                 passed=False,
                 defects=(f"antigravity {kind} launch failed: {exc}",),
                 harness_mode="real",
+                verifier_identity=identity,
             )
         if proc.returncode != 0:
             return Verdict(
                 kind=kind,
-                artifact_id=artifact_id,
+                candidate=candidate,
                 passed=False,
                 defects=(proc.stderr.strip() or f"antigravity {kind} failed",),
                 harness_mode="real",
+                verifier_identity=identity,
             )
         return Verdict(
             kind=kind,
-            artifact_id=artifact_id,
+            candidate=candidate,
             passed=True,
             harness_mode="real",
+            verifier_identity=identity,
         )
 
 
@@ -86,7 +97,9 @@ class AntigravityDistributor:
         self._env = env if env is not None else dict(os.environ)
         self._binary = binary
 
-    def distribute(self, artifact_id: str, mission_id: str) -> DistributionResult:
+    def distribute(
+        self, candidate: CandidateIdentity, mission_id: str
+    ) -> DistributionResult:
         binary = shutil.which(self._binary, path=self._env.get("PATH"))
         if binary is None:
             raise RuntimeError("antigravity production binary unavailable")
@@ -96,8 +109,14 @@ class AntigravityDistributor:
                 "distribute",
                 "--profile",
                 "production",
-                "--artifact",
-                artifact_id,
+                "--candidate-id",
+                candidate.candidate_id,
+                "--source-revision",
+                candidate.source_revision,
+                "--artifact-hash",
+                candidate.artifact_hash,
+                "--artifact-uri",
+                candidate.artifact_uri,
                 "--mission",
                 mission_id,
             ],
@@ -110,7 +129,7 @@ class AntigravityDistributor:
         if proc.returncode != 0:
             raise RuntimeError(proc.stderr.strip() or "antigravity distribute failed")
         return DistributionResult(
-            artifact_id=artifact_id,
+            candidate=candidate,
             harness_mode="real",
-            receipt=proc.stdout.strip() or f"distributed:{artifact_id}",
+            receipt=proc.stdout.strip() or f"distributed:{candidate.candidate_id}",
         )

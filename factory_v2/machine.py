@@ -1,17 +1,26 @@
 from __future__ import annotations
 
-import hashlib
-import json
 from pathlib import Path
-from uuid import uuid4
 
+from factory_v2.canonical import (
+    ContractError,
+    load_pcp,
+    mission_id_for,
+    pcp_hash,
+)
 from factory_v2.contracts import (
     DistributionExecutor,
-    EngineeringExecutor,
     EngineeringManager,
     Verifier,
 )
-from factory_v2.models import MissionContext, MissionSnapshot, PCP
+from factory_v2.emit import (
+    emit_distribution_handoff,
+    emit_engineering_mission,
+    emit_verification,
+    emit_verified_rc,
+    owner_history_entry,
+)
+from factory_v2.models import CandidateIdentity, MissionContext, MissionSnapshot, Verdict
 from factory_v2.states import MissionState
 from factory_v2.store import Store
 
@@ -24,47 +33,41 @@ class InvariantError(PermissionError):
     """Protected Factory invariant violated independently of prompts."""
 
 
-def pcp_hash(pcp: PCP) -> str:
-    body = json.dumps(pcp.as_dict(), sort_keys=True, separators=(",", ":"))
-    return hashlib.sha256(body.encode()).hexdigest()
-
-
-def mission_id_for(hash_: str) -> str:
-    return f"msn-{hash_[:32]}"
-
-
 class Controller:
     """Deterministic v2 lifecycle authority.
 
     Depends only on capability contracts. Harness CLI strings belong in adapters.
     External work-exchange projections are not runtime inputs.
+    Controller does not call Grok; Hermes coordinates that executor.
     """
 
     def __init__(
         self,
         store: Store,
         manager: EngineeringManager,
-        executor: EngineeringExecutor,
         verifier: Verifier,
         distributor: DistributionExecutor,
         workspace_root: str | Path,
     ):
         self.store = store
         self.manager = manager
-        self.executor = executor
         self.verifier = verifier
         self.distributor = distributor
         self.workspace_root = Path(workspace_root)
         self.workspace_root.mkdir(parents=True, exist_ok=True)
 
-    def admit_pcp(self, pcp: PCP) -> MissionSnapshot:
-        """Gate 1: an already-approved PCP becomes exactly one durable mission."""
-        h = pcp_hash(pcp)
+    def admit_pcp(self, pcp: dict) -> MissionSnapshot:
+        """Gate 1: schema-valid Owner-APPROVE PCP becomes exactly one durable mission."""
+        try:
+            admitted = load_pcp(pcp)
+        except ContractError as exc:
+            raise GateError(str(exc)) from exc
+        h = pcp_hash(admitted)
         existing = self.store.get_by_hash(h)
         if existing is not None:
             return existing
         mid = mission_id_for(h)
-        snap = self.store.insert_mission(mid, h, pcp.as_dict())
+        snap = self.store.insert_mission(mid, mid, h, admitted)
         (self.workspace_root / mid).mkdir(parents=True, exist_ok=True)
         return snap
 
@@ -87,7 +90,7 @@ class Controller:
                 snap.mission_id,
                 MissionState.OWNER_VALIDATION,
                 event_kind="presented_to_owner",
-                payload={"artifact_id": snap.current_artifact_id},
+                payload={"candidate": None if snap.current is None else snap.current.as_dict()},
             )
         if snap.state is MissionState.BLOCKED:
             return snap
@@ -99,9 +102,7 @@ class Controller:
             return snap
         raise GateError(f"no tick from {snap.state.value}")
 
-    def owner_decide(
-        self, mission_id: str, decision: str, reason: str = ""
-    ) -> MissionSnapshot:
+    def owner_decide(self, mission_id: str, decision: str, reason: str = "") -> MissionSnapshot:
         snap = self.get(mission_id)
         if snap.state is not MissionState.OWNER_VALIDATION:
             raise GateError(
@@ -111,53 +112,81 @@ class Controller:
         if cand is None or cand.review_verdict != "pass" or cand.qa_verdict != "pass":
             raise InvariantError("failed or stale candidate cannot be Owner-approved")
         decision = decision.upper()
+        identity = cand.identity
         if decision == "REJECT":
-            return self.store.apply_state(
+            nxt = snap.attempt_number + 1
+            snap = self.store.apply_state(
                 snap.mission_id,
                 MissionState.ENGINEERING,
                 owner_decision="REJECT",
                 event_kind="owner_reject",
-                payload={"artifact_id": cand.artifact_id, "reason": reason},
+                payload={"candidate": identity.as_dict(), "reason": reason},
                 candidate_status="rejected_by_owner",
                 clear_current=True,
+                owner_entry=owner_history_entry(identity, "REJECT", reason),
+                rework_entry={
+                    "from_attempt": snap.attempt_number,
+                    "to_attempt": nxt,
+                    "trigger": "OWNER_REJECT",
+                    "same_mission": True,
+                    "same_lineage": True,
+                    "feedback": reason or "Owner rejected the verified RC",
+                },
+                attempt_number=nxt,
+                rework_sequence=snap.rework_sequence + 1,
             )
+            emit_engineering_mission(self._ws(snap), snap)
+            return snap
         if decision == "APPROVE":
-            return self.store.apply_state(
+            rc_id = snap.rc_id or f"rc-{identity.candidate_id}"
+            snap = self.store.apply_state(
                 snap.mission_id,
                 MissionState.DISTRIBUTION_READY,
                 owner_decision="APPROVE",
-                approved_artifact_id=cand.artifact_id,
+                approved=identity,
+                rc_id=rc_id,
                 event_kind="owner_approve",
-                payload={"artifact_id": cand.artifact_id, "reason": reason},
+                payload={"candidate": identity.as_dict(), "reason": reason},
                 candidate_status="approved",
+                owner_entry=owner_history_entry(identity, "APPROVE", reason),
             )
+            emit_engineering_mission(self._ws(snap), snap)
+            emit_distribution_handoff(self._ws(snap), snap, identity, rc_id)
+            return snap
         raise GateError(f"unknown Owner decision {decision!r}")
 
-    def distribute(self, mission_id: str, substitute_artifact: str | None = None) -> MissionSnapshot:
+    def distribute(
+        self,
+        mission_id: str,
+        substitute: CandidateIdentity | None = None,
+    ) -> MissionSnapshot:
         snap = self.get(mission_id)
         if snap.state is not MissionState.DISTRIBUTION_READY:
             raise GateError(
                 f"Distribution requires DISTRIBUTION_READY, not {snap.state.value}"
             )
-        if not snap.approved_artifact_id:
-            raise InvariantError("Distribution requires an Owner-approved artifact")
-        if substitute_artifact and substitute_artifact != snap.approved_artifact_id:
+        if snap.approved is None:
+            raise InvariantError("Distribution requires an Owner-approved candidate tuple")
+        if substitute is not None and substitute.key() != snap.approved.key():
             raise InvariantError("Distribution cannot replace the approved candidate")
-        result = self.distributor.distribute(
-            snap.approved_artifact_id, snap.mission_id
-        )
-        if result.artifact_id != snap.approved_artifact_id:
+        result = self.distributor.distribute(snap.approved, snap.mission_id)
+        if result.candidate.key() != snap.approved.key():
             raise InvariantError("Distribution cannot replace the approved candidate")
         return self.store.apply_state(
             snap.mission_id,
             MissionState.DISTRIBUTED,
             event_kind="distributed",
             payload={
-                "artifact_id": result.artifact_id,
+                "candidate": result.candidate.as_dict(),
                 "receipt": result.receipt,
                 "harness_mode": result.harness_mode,
             },
         )
+
+    def _ws(self, snap: MissionSnapshot) -> Path:
+        path = self.workspace_root / snap.mission_id
+        path.mkdir(parents=True, exist_ok=True)
+        return path
 
     def _context(self, snap: MissionSnapshot) -> MissionContext:
         defects: list[str] = []
@@ -169,17 +198,21 @@ class Controller:
                     defects.append(payload["reason"])
         return MissionContext(
             mission_id=snap.mission_id,
+            lineage_id=snap.lineage_id,
             pcp_hash=snap.pcp_hash,
             pcp=snap.pcp,
-            workspace_path=str(self.workspace_root / snap.mission_id),
+            workspace_path=str(self._ws(snap)),
+            attempt_number=snap.attempt_number,
+            rework_sequence=snap.rework_sequence,
+            hermes_session_id=snap.hermes_session_id,
             defects=tuple(defects),
-            current_artifact_id=snap.current_artifact_id,
+            current=snap.current,
         )
 
     def _engineer(self, snap: MissionSnapshot) -> MissionSnapshot:
         ctx = self._context(snap)
         result = self.manager.run_campaign(ctx)
-        if result.blocked or not result.candidate_artifact_id:
+        if result.blocked or result.candidate is None:
             return self.store.apply_state(
                 snap.mission_id,
                 MissionState.BLOCKED,
@@ -194,72 +227,117 @@ class Controller:
                 },
             )
         if not result.executor_called:
-            raise InvariantError("Engineering Manager must delegate coding through the executor")
+            raise InvariantError("Engineering Manager must delegate coding through Grok Build")
         seq = self.store.next_sequence(snap.mission_id)
-        cid = result.candidate_id or f"cand-{seq}-{uuid4().hex[:8]}"
-        self.store.record_candidate(
-            snap.mission_id, cid, result.candidate_artifact_id, seq
+        snap = self.store.record_candidate(
+            snap.mission_id,
+            result.candidate,
+            seq,
+            attempt_id=f"att-{seq}",
+            hermes_session_id=result.hermes_session_id or f"hermes-{snap.mission_id}",
+            grok_session_ref=result.grok_session_ref or f"grok-{result.candidate.candidate_id}",
         )
-        return self.get(snap.mission_id)
+        emit_engineering_mission(self._ws(snap), snap)
+        return snap
 
     def _verify(self, snap: MissionSnapshot) -> MissionSnapshot:
         cand = self._current(snap)
         if cand is None:
             raise GateError("VERIFYING requires a bound candidate")
         ctx = self._context(snap)
-        review = self.verifier.review(ctx, cand.artifact_id)
-        if review.artifact_id != cand.artifact_id:
-            raise InvariantError("verifier cannot substitute a different artifact")
-        if review.kind != "review":
-            raise InvariantError("review verdict channel required")
+        review = self.verifier.review(ctx, cand.identity)
+        self._bound(review, cand.identity, "review")
         if not review.passed:
-            return self.store.apply_state(
-                snap.mission_id,
-                MissionState.ENGINEERING,
-                event_kind="review_fail",
-                payload={
-                    "artifact_id": cand.artifact_id,
-                    "defects": list(review.defects),
-                    "harness_mode": review.harness_mode,
-                },
+            emit_verification(self._ws(snap), snap, cand.identity, review, None)
+            snap = self._rework(
+                snap,
+                "review_fail",
+                review,
                 candidate_status="review_failed",
                 review_verdict="fail",
-                clear_current=True,
             )
-        qa = self.verifier.qa(ctx, cand.artifact_id)
-        if qa.artifact_id != cand.artifact_id:
-            raise InvariantError("verifier cannot substitute a different artifact")
-        if qa.kind != "qa":
-            raise InvariantError("qa verdict channel required")
+            emit_engineering_mission(self._ws(snap), snap)
+            return snap
+        qa = self.verifier.qa(ctx, cand.identity)
+        self._bound(qa, cand.identity, "qa")
+        emit_verification(self._ws(snap), snap, cand.identity, review, qa)
         if not qa.passed:
-            return self.store.apply_state(
-                snap.mission_id,
-                MissionState.ENGINEERING,
-                event_kind="qa_fail",
-                payload={
-                    "artifact_id": cand.artifact_id,
-                    "defects": list(qa.defects),
-                    "harness_mode": qa.harness_mode,
-                },
+            snap = self._rework(
+                snap,
+                "qa_fail",
+                qa,
                 candidate_status="qa_failed",
                 review_verdict="pass",
                 qa_verdict="fail",
-                clear_current=True,
             )
-        return self.store.apply_state(
+            emit_engineering_mission(self._ws(snap), snap)
+            return snap
+        rc = emit_verified_rc(
+            self._ws(snap),
+            snap,
+            cand.identity,
+            review,
+            qa,
+            (),
+        )
+        snap = self.store.apply_state(
             snap.mission_id,
             MissionState.VERIFIED_RC,
             event_kind="verified_rc",
-            payload={"artifact_id": cand.artifact_id},
+            payload={"candidate": cand.identity.as_dict(), "rc_id": rc["rc"]["rc_id"]},
             candidate_status="verified",
             review_verdict="pass",
             qa_verdict="pass",
+            rc_id=rc["rc"]["rc_id"],
+        )
+        emit_engineering_mission(self._ws(snap), snap)
+        return snap
+
+    def _rework(
+        self,
+        snap: MissionSnapshot,
+        kind: str,
+        verdict: Verdict,
+        **kwargs,
+    ) -> MissionSnapshot:
+        nxt = snap.attempt_number + 1
+        return self.store.apply_state(
+            snap.mission_id,
+            MissionState.ENGINEERING,
+            event_kind=kind,
+            payload={
+                "candidate": verdict.candidate.as_dict(),
+                "defects": list(verdict.defects),
+                "harness_mode": verdict.harness_mode,
+            },
+            clear_current=True,
+            rework_entry={
+                "from_attempt": snap.attempt_number,
+                "to_attempt": nxt,
+                "trigger": "VERIFIER_REJECT",
+                "same_mission": True,
+                "same_lineage": True,
+                "feedback": "; ".join(verdict.defects) or kind,
+            },
+            attempt_number=nxt,
+            rework_sequence=snap.rework_sequence + 1,
+            **kwargs,
         )
 
+    def _bound(self, verdict: Verdict, expected: CandidateIdentity, channel: str) -> None:
+        if verdict.candidate.key() != expected.key():
+            raise InvariantError(f"{channel} verifier cannot substitute a different candidate")
+        if verdict.kind not in {channel, "review", "qa"}:
+            raise InvariantError(f"{channel} verdict channel required")
+        if channel == "review" and verdict.kind != "review":
+            raise InvariantError("review verdict channel required")
+        if channel == "qa" and verdict.kind != "qa":
+            raise InvariantError("qa verdict channel required")
+
     def _current(self, snap: MissionSnapshot):
-        if not snap.current_candidate_id:
+        if snap.current is None:
             return None
         for c in snap.candidates:
-            if c.candidate_id == snap.current_candidate_id:
+            if c.identity.key() == snap.current.key():
                 return c
         return None

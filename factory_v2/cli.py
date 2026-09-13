@@ -7,7 +7,6 @@ import sys
 from pathlib import Path
 
 from factory_v2.adapters.antigravity import AntigravityDistributor, AntigravityVerifier
-from factory_v2.adapters.grok_build import GrokBuildAdapter
 from factory_v2.adapters.hermes import NousHermesAdapter
 from factory_v2.adapters.simulated import (
     ScriptedDistributor,
@@ -15,8 +14,8 @@ from factory_v2.adapters.simulated import (
     ScriptedHermes,
     ScriptedVerifier,
 )
+from factory_v2.canonical import ContractError, load_pcp_file
 from factory_v2.machine import Controller, GateError, InvariantError
-from factory_v2.models import PCP
 from factory_v2.store import Store
 
 DEFAULT_HOME = Path(os.environ.get("FACTORY_V2_HOME", Path.home() / ".factory-v2"))
@@ -40,21 +39,10 @@ def _controller(*, simulated: bool) -> Controller:
         distributor = ScriptedDistributor()
     else:
         print("harness_mode=real  (fail-closed if Hermes/Grok/Antigravity are unavailable)")
-        executor = GrokBuildAdapter()
-        manager = NousHermesAdapter(executor)
+        manager = NousHermesAdapter()
         verifier = AntigravityVerifier()
         distributor = AntigravityDistributor()
-    return Controller(store, manager, executor, verifier, distributor, workspace)
-
-
-def _pcp_from_file(path: str) -> PCP:
-    data = json.loads(Path(path).read_text(encoding="utf-8"))
-    return PCP(
-        title=data["title"],
-        intent=data["intent"],
-        product=data.get("product", ""),
-        extra={k: v for k, v in data.items() if k not in {"title", "intent", "product"}},
-    )
+    return Controller(store, manager, verifier, distributor, workspace)
 
 
 def _print(snap) -> None:
@@ -62,16 +50,19 @@ def _print(snap) -> None:
         json.dumps(
             {
                 "mission_id": snap.mission_id,
+                "lineage_id": snap.lineage_id,
                 "state": snap.state.value,
                 "pcp_hash": snap.pcp_hash,
-                "current_artifact_id": snap.current_artifact_id,
-                "approved_artifact_id": snap.approved_artifact_id,
+                "current": None if snap.current is None else snap.current.as_dict(),
+                "approved": None if snap.approved is None else snap.approved.as_dict(),
                 "owner_decision": snap.owner_decision,
                 "blocked_reason": snap.blocked_reason,
+                "attempt_number": snap.attempt_number,
+                "rework_sequence": snap.rework_sequence,
+                "hermes_session_id": snap.hermes_session_id,
                 "candidates": [
                     {
-                        "candidate_id": c.candidate_id,
-                        "artifact_id": c.artifact_id,
+                        "candidate": c.identity.as_dict(),
                         "review": c.review_verdict,
                         "qa": c.qa_verdict,
                         "status": c.status,
@@ -95,7 +86,7 @@ def main(argv: list[str] | None = None) -> int:
         help="Use labeled simulated adapters. Default is real (fail-closed).",
     )
     sub = parser.add_subparsers(dest="cmd", required=True)
-    p_admit = sub.add_parser("admit-pcp", help="Gate 1: admit an already-approved PCP")
+    p_admit = sub.add_parser("admit-pcp", help="Gate 1: admit a canonical Owner-approved PCP")
     p_admit.add_argument("pcp_json")
     p_tick = sub.add_parser("tick", help="Advance one legal lifecycle step")
     p_tick.add_argument("mission_id")
@@ -112,7 +103,7 @@ def main(argv: list[str] | None = None) -> int:
     ctl = _controller(simulated=args.simulated)
     try:
         if args.cmd == "admit-pcp":
-            _print(ctl.admit_pcp(_pcp_from_file(args.pcp_json)))
+            _print(ctl.admit_pcp(load_pcp_file(args.pcp_json)))
         elif args.cmd == "tick":
             _print(ctl.tick(args.mission_id))
         elif args.cmd == "status":
@@ -125,7 +116,7 @@ def main(argv: list[str] | None = None) -> int:
             _print(ctl.distribute(args.mission_id))
         else:
             parser.error(args.cmd)
-    except (GateError, InvariantError, KeyError) as exc:
+    except (GateError, InvariantError, ContractError, KeyError) as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 2
     return 0

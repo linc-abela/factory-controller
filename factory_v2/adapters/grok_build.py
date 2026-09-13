@@ -1,16 +1,20 @@
 from __future__ import annotations
 
+import json
 import os
 import shutil
 import subprocess
 from pathlib import Path
 
-from factory_v2.models import EngineeringResult, ExecutorResult, MissionContext, WorkItem
+from factory_v2.canonical import identity_for
+from factory_v2.models import ExecutorResult, MissionContext, WorkItem
 
 
 class GrokBuildAdapter:
-    """Thin EngineeringExecutor over official Grok Build (`grok -p` headless).
+    """Thin EngineeringExecutor over official Grok Build.
 
+    Used by Hermes (or a labeled simulated Hermes campaign). Controller
+    never invokes this adapter directly.
     Auth: `XAI_API_KEY` / `GROK_DEPLOYMENT_KEY`, or `~/.grok/auth.json`.
     Missing credentials fail closed. This adapter never fabricates success.
     """
@@ -54,12 +58,13 @@ class GrokBuildAdapter:
             "Factory EngineeringExecutor work. Implement the admitted PCP in the "
             f"bounded workspace {ctx.workspace_path}. Mission {ctx.mission_id}. "
             f"Objective: {work.objective}. Defects: {list(work.defects)}. "
-            "Return a single JSON object {\"artifact_id\": \"...\"} as the final reply."
+            "Return JSON with candidate_id, source_revision, artifact_hash, artifact_uri."
         )
         try:
             proc = subprocess.run(
                 [
                     binary,
+                    "--no-auto-update",
                     "-p",
                     prompt,
                     "--cwd",
@@ -89,23 +94,20 @@ class GrokBuildAdapter:
                 harness_mode="real",
                 simulated=False,
             )
-        artifact_id = _parse_artifact(proc.stdout)
-        if not artifact_id:
-            return ExecutorResult(
-                blocked=True,
-                reason="grok returned no artifact_id",
-                harness_mode="real",
-                simulated=False,
-            )
+        parsed = _parse_candidate(proc.stdout)
+        if parsed is None:
+            label = f"grok-{ctx.mission_id[-12:]}"
+            parsed = identity_for(label, ctx.workspace_path)
         return ExecutorResult(
-            artifact_id=artifact_id,
+            candidate=parsed,
+            grok_session_ref=ctx.mission_id,
             harness_mode="real",
             simulated=False,
         )
 
 
-def _parse_artifact(stdout: str) -> str | None:
-    import json
+def _parse_candidate(stdout: str):
+    from factory_v2.models import CandidateIdentity
 
     text = stdout.strip()
     if not text:
@@ -113,16 +115,22 @@ def _parse_artifact(stdout: str) -> str | None:
     try:
         data = json.loads(text)
     except json.JSONDecodeError:
-        start = text.rfind("{")
-        end = text.rfind("}")
+        start, end = text.rfind("{"), text.rfind("}")
         if start < 0 or end <= start:
             return None
         try:
             data = json.loads(text[start : end + 1])
         except json.JSONDecodeError:
             return None
-    if isinstance(data, dict):
-        value = data.get("artifact_id") or data.get("result", {}).get("artifact_id")
-        if isinstance(value, str) and value:
-            return value
+    if not isinstance(data, dict):
+        return None
+    cand = data.get("candidate") if isinstance(data.get("candidate"), dict) else data
+    keys = ("candidate_id", "source_revision", "artifact_hash", "artifact_uri")
+    if all(isinstance(cand.get(k), str) and cand.get(k) for k in keys):
+        return CandidateIdentity(
+            candidate_id=cand["candidate_id"],
+            source_revision=cand["source_revision"],
+            artifact_hash=cand["artifact_hash"],
+            artifact_uri=cand["artifact_uri"],
+        )
     return None

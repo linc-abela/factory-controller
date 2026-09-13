@@ -1,0 +1,69 @@
+{
+  "contract_type": "factory.v2.pcp_handoff",
+  "contract_version": "1.0.0",
+  "pcp": {
+    "id": "pcp.demo",
+    "version": "1.0.0",
+    "immutable_revision": "1111111111111111111111111111111111111111"
+  },
+  "source": {
+    "uri": "vault://PRODUCTS/prototypes/demo/pcp.json",
+    "revision": "1111111111111111111111111111111111111111",
+    "content_hash": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+  },
+  "owner_approval": {
+    "decision": "APPROVE",
+    "owner_id": "owner-demo",
+    "approved_at": "2026-09-14T03:00:00Z",
+    "evidence": {
+      "kind": "owner-approval",
+      "uri": "vault://evidence/demo-owner-approval.json",
+      "revision": "1111111111111111111111111111111111111111",
+      "content_hash": "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+      "immutable": true
+    }
+  },
+  "product": {
+    "objective": "Demonstrate a bounded Factory v2 contract handoff.",
+    "user_outcome": "An admitted mission can be executed and independently verified."
+  },
+  "scope": {
+    "in_scope": ["Contract validation", "Evidence identity propagation"],
+    "non_goals": ["Production deployment"],
+    "prohibitions": ["Do not commit credentials", "Do not bypass the Owner Gate"]
+  },
+  "acceptance": {
+    "functional": [
+      {
+        "id": "fn-contract",
+        "statement": "The handoff contains a stable PCP identity.",
+        "verification": "Validate the PCP and source revision equality."
+      }
+    ],
+    "ux_product": []
+  },
+  "referenced_artifacts": [
+    {
+      "kind": "product-brief",
+      "uri": "vault://PRODUCTS/prototypes/demo/brief.md",
+      "revision": "1111111111111111111111111111111111111111",
+      "content_hash": "sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+      "immutable": true
+    }
+  ],
+  "runtime_constraints": {
+    "environments": ["isolated-task-worktree"],
+    "deployment": {
+      "targets": ["none-until-owner-gate"],
+      "artifact_policy": "immutable"
+    },
+    "data": {
+      "classification": "INTERNAL",
+      "retention": "retain evidence for the mission lifetime"
+    },
+    "secrets": {
+      "handling": "external_runtime_only",
+      "required_secrets": ["GROK_AUTH"]
+    }
+  }
+}

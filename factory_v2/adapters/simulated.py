@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+from factory_v2.canonical import identity_for
 from factory_v2.contracts import EngineeringExecutor
 from factory_v2.models import (
+    CandidateIdentity,
     DistributionResult,
     EngineeringResult,
     ExecutorResult,
@@ -42,17 +44,19 @@ class ScriptedGrok:
                 harness_mode="simulated",
                 simulated=True,
             )
-        artifact_id = self.artifacts[self._i]
+        label = self.artifacts[self._i]
         self._i += 1
+        candidate = identity_for(label, ctx.workspace_path)
         return ExecutorResult(
-            artifact_id=artifact_id,
+            candidate=candidate,
+            grok_session_ref=f"grok-{label}",
             harness_mode="simulated",
             simulated=True,
         )
 
 
 class ScriptedHermes:
-    """Deterministic EngineeringManager double. Always delegates to the executor."""
+    """Simulated Nous Hermes campaign: Hermes itself delegates to Grok Build."""
 
     name = "Nous Hermes Agent"
     harness_mode = "simulated"
@@ -64,11 +68,12 @@ class ScriptedHermes:
     def run_campaign(self, ctx: MissionContext) -> EngineeringResult:
         self.calls.append(ctx)
         work = WorkItem(
-            objective=ctx.pcp.get("intent") or ctx.pcp.get("title") or "implement",
+            objective=ctx.pcp.get("product", {}).get("objective") or "implement admitted PCP",
             defects=ctx.defects,
         )
         executed = self.executor.implement(ctx, work)
-        if executed.blocked or not executed.artifact_id:
+        session = ctx.hermes_session_id or f"hermes-{ctx.mission_id}"
+        if executed.blocked or executed.candidate is None:
             return EngineeringResult(
                 blocked=True,
                 reason=executed.reason or "executor blocked",
@@ -76,9 +81,12 @@ class ScriptedHermes:
                 manager_name=self.name,
                 executor_name=self.executor.name,
                 executor_called=True,
+                hermes_session_id=session,
             )
         return EngineeringResult(
-            candidate_artifact_id=executed.artifact_id,
+            candidate=executed.candidate,
+            hermes_session_id=session,
+            grok_session_ref=executed.grok_session_ref,
             harness_mode="simulated",
             manager_name=self.name,
             executor_name=self.executor.name,
@@ -87,38 +95,48 @@ class ScriptedHermes:
 
 
 class ScriptedVerifier:
-    """Map artifact_id -> (review_pass, qa_pass). Separate channels."""
+    """Map candidate_id -> (review_pass, qa_pass). Separate channels."""
 
     name = "Antigravity"
     harness_mode = "simulated"
 
-    def __init__(self, table: dict[str, tuple[bool, bool]]):
+    def __init__(
+        self,
+        table: dict[str, tuple[bool, bool]],
+        *,
+        substitute: CandidateIdentity | None = None,
+    ):
         self.table = table
+        self.substitute = substitute
         self.review_calls: list[str] = []
         self.qa_calls: list[str] = []
 
-    def review(self, ctx: MissionContext, artifact_id: str) -> Verdict:
+    def review(self, ctx: MissionContext, candidate: CandidateIdentity) -> Verdict:
         del ctx
-        self.review_calls.append(artifact_id)
-        passed, _ = self.table[artifact_id]
+        self.review_calls.append(candidate.candidate_id)
+        bound = self.substitute or candidate
+        passed, _ = self.table[candidate.candidate_id]
         return Verdict(
             kind="review",
-            artifact_id=artifact_id,
+            candidate=bound,
             passed=passed,
-            defects=() if passed else (f"review fail on {artifact_id}",),
+            defects=() if passed else (f"review fail on {candidate.candidate_id}",),
             harness_mode="simulated",
+            verifier_identity="antigravity:reviewer-1",
         )
 
-    def qa(self, ctx: MissionContext, artifact_id: str) -> Verdict:
+    def qa(self, ctx: MissionContext, candidate: CandidateIdentity) -> Verdict:
         del ctx
-        self.qa_calls.append(artifact_id)
-        _, passed = self.table[artifact_id]
+        self.qa_calls.append(candidate.candidate_id)
+        bound = self.substitute or candidate
+        _, passed = self.table[candidate.candidate_id]
         return Verdict(
             kind="qa",
-            artifact_id=artifact_id,
+            candidate=bound,
             passed=passed,
-            defects=() if passed else (f"qa fail on {artifact_id}",),
+            defects=() if passed else (f"qa fail on {candidate.candidate_id}",),
             harness_mode="simulated",
+            verifier_identity="antigravity:qa-1",
         )
 
 
@@ -127,14 +145,16 @@ class ScriptedDistributor:
     harness_mode = "simulated"
     profile = "production"
 
-    def __init__(self, replace_with: str | None = None):
+    def __init__(self, replace_with: CandidateIdentity | None = None):
         self.replace_with = replace_with
-        self.calls: list[tuple[str, str]] = []
+        self.calls: list[tuple[CandidateIdentity, str]] = []
 
-    def distribute(self, artifact_id: str, mission_id: str) -> DistributionResult:
-        self.calls.append((artifact_id, mission_id))
+    def distribute(
+        self, candidate: CandidateIdentity, mission_id: str
+    ) -> DistributionResult:
+        self.calls.append((candidate, mission_id))
         return DistributionResult(
-            artifact_id=self.replace_with or artifact_id,
+            candidate=self.replace_with or candidate,
             harness_mode="simulated",
-            receipt=f"sim-dist:{artifact_id}",
+            receipt=f"sim-dist:{candidate.candidate_id}",
         )

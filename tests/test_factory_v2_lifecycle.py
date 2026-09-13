@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import inspect
+import json
 import os
 import tempfile
 import unittest
@@ -14,16 +15,13 @@ from factory_v2.adapters.simulated import (
     ScriptedHermes,
     ScriptedVerifier,
 )
-from factory_v2.machine import Controller, GateError, InvariantError, pcp_hash
-from factory_v2.models import PCP
+from factory_v2.canonical import fixture_path, pcp_hash
+from factory_v2.machine import Controller, GateError, InvariantError
+from factory_v2.models import CandidateIdentity
 from factory_v2.states import MissionState
 from factory_v2.store import Store
 
-PCP = PCP(
-    title="echo-helper",
-    intent="Ship a deterministic echo helper",
-    product="echo",
-)
+PCP = json.loads(fixture_path("valid-approved-pcp.json").read_text(encoding="utf-8"))
 
 
 class World:
@@ -33,6 +31,7 @@ class World:
         table=None,
         executor=None,
         replace_with=None,
+        substitute=None,
     ):
         self.tmp = tempfile.TemporaryDirectory()
         root = Path(self.tmp.name)
@@ -49,13 +48,13 @@ class World:
                 "cand-C": (True, True),
                 "cand-D-red": (False, False),
                 "cand-D": (True, True),
-            }
+            },
+            substitute=substitute,
         )
         self.distributor = ScriptedDistributor(replace_with=replace_with)
         self.ctl = Controller(
             self.store,
             self.manager,
-            self.executor,
             self.verifier,
             self.distributor,
             root / "sandboxes",
@@ -81,6 +80,7 @@ class FactoryV2LifecycleTests(unittest.TestCase):
         a = self.world.ctl.admit_pcp(PCP)
         b = self.world.ctl.admit_pcp(PCP)
         self.assertEqual(a.mission_id, b.mission_id)
+        self.assertEqual(a.lineage_id, a.mission_id)
         self.assertEqual(a.state, MissionState.PCP_APPROVED)
         self.assertEqual(a.pcp_hash, pcp_hash(PCP))
         admitted = [e for e in self.world.ctl.get(a.mission_id).events if e["kind"] == "pcp_admitted"]
@@ -114,24 +114,30 @@ class FactoryV2LifecycleTests(unittest.TestCase):
         self.assertEqual(self.world.executor.name, "Grok Build")
         self.assertEqual(len(self.world.executor.calls), 1)
         self.assertEqual(self.world.executor.calls[0][0], mid)
+        src = inspect.getsource(machine_mod.Controller._engineer)
+        self.assertNotIn("executor.implement", src)
+        self.assertNotIn("self.executor", src)
 
     def test_115_candidate_a_review_fail_returns_same_mission_to_engineering(self):
         mid = self._admit().mission_id
         self.world.ctl.tick(mid)
         snap = self.world.ctl.tick(mid)
         self.assertEqual(snap.mission_id, mid)
+        self.assertEqual(snap.lineage_id, mid)
         self.assertEqual(snap.state, MissionState.ENGINEERING)
         self.assertEqual(snap.candidates[0].artifact_id, "cand-A")
+        self.assertEqual(len(snap.candidates[0].identity.key()), 4)
         self.assertEqual(snap.candidates[0].review_verdict, "fail")
         self.assertEqual(snap.candidates[0].status, "review_failed")
         self.assertEqual(self.world.verifier.qa_calls, [])
+        self.assertEqual(snap.rework_history[-1]["trigger"], "VERIFIER_REJECT")
 
     def test_116_candidate_b_qa_fail_returns_same_mission_to_engineering(self):
         mid = self._admit().mission_id
         self.world.ctl.tick(mid)
-        self.world.ctl.tick(mid)  # A review fail
-        self.world.ctl.tick(mid)  # B produced
-        snap = self.world.ctl.tick(mid)  # B qa fail
+        self.world.ctl.tick(mid)
+        self.world.ctl.tick(mid)
+        snap = self.world.ctl.tick(mid)
         self.assertEqual(snap.mission_id, mid)
         self.assertEqual(snap.state, MissionState.ENGINEERING)
         b = [c for c in snap.candidates if c.artifact_id == "cand-B"][0]
@@ -147,17 +153,19 @@ class FactoryV2LifecycleTests(unittest.TestCase):
         self.assertEqual(c.review_verdict, "pass")
         self.assertEqual(c.qa_verdict, "pass")
         self.assertEqual(c.status, "verified")
+        rc = json.loads((Path(self.world.tmp.name) / "sandboxes" / mid / "verified-rc.json").read_text())
+        self.assertEqual(rc["candidate"]["candidate_id"], "cand-C")
 
     def test_118_failed_a_and_b_cannot_be_owner_approved_or_distributed(self):
         mid = self._admit().mission_id
         self.world.ctl.tick(mid)
-        self.world.ctl.tick(mid)  # A failed
+        self.world.ctl.tick(mid)
         with self.assertRaises(GateError):
             self.world.ctl.owner_decide(mid, "APPROVE")
         with self.assertRaises(GateError):
             self.world.ctl.distribute(mid)
         self.world.ctl.tick(mid)
-        self.world.ctl.tick(mid)  # B failed
+        self.world.ctl.tick(mid)
         with self.assertRaises(GateError):
             self.world.ctl.owner_decide(mid, "APPROVE")
         with self.assertRaises(GateError):
@@ -168,13 +176,15 @@ class FactoryV2LifecycleTests(unittest.TestCase):
 
     def test_119_owner_reject_c_same_mission_new_candidate_full_reverify(self):
         mid = self._to_c(self._admit().mission_id)
-        self.world.ctl.tick(mid)  # OWNER_VALIDATION
+        self.world.ctl.tick(mid)
         snap = self.world.ctl.owner_decide(mid, "REJECT", "change intent")
         self.assertEqual(snap.mission_id, mid)
+        self.assertEqual(snap.lineage_id, mid)
         self.assertEqual(snap.state, MissionState.ENGINEERING)
+        self.assertEqual(snap.owner_history[-1]["decision"], "REJECT")
         before = {c.candidate_id for c in snap.candidates}
-        self.world.ctl.tick(mid)  # D-red
-        after = self.world.ctl.tick(mid)  # must run review again
+        self.world.ctl.tick(mid)
+        after = self.world.ctl.tick(mid)
         self.assertEqual(after.mission_id, mid)
         self.assertGreater(len(after.candidates), len(before))
         new = [c for c in after.candidates if c.candidate_id not in before][0]
@@ -190,7 +200,7 @@ class FactoryV2LifecycleTests(unittest.TestCase):
         self.assertEqual(red.state, MissionState.ENGINEERING)
         with self.assertRaises(GateError):
             self.world.ctl.owner_decide(mid, "APPROVE")
-        self.world.ctl.tick(mid)  # cand-D
+        self.world.ctl.tick(mid)
         green = self.world.ctl.tick(mid)
         self.assertEqual(green.state, MissionState.VERIFIED_RC)
         presented = self.world.ctl.tick(mid)
@@ -204,27 +214,40 @@ class FactoryV2LifecycleTests(unittest.TestCase):
         self.assertEqual(snap.state, MissionState.DISTRIBUTION_READY)
         self.assertEqual(snap.approved_artifact_id, "cand-D")
         self.assertEqual(snap.owner_decision, "APPROVE")
+        other = [c for c in snap.candidates if c.candidate_id == "cand-C"][0].identity
         with self.assertRaises(PermissionError):
             self.world.store.apply_state(
                 mid,
                 MissionState.DISTRIBUTION_READY,
-                approved_artifact_id="cand-C",
+                approved=other,
                 event_kind="tamper",
                 payload={},
             )
+        handoff = json.loads(
+            (Path(self.world.tmp.name) / "sandboxes" / mid / "distribution-handoff.json").read_text()
+        )
+        self.assertEqual(handoff["deployment_artifact"]["candidate_id"], "cand-D")
 
     def test_122_distribution_cannot_replace_approved_candidate(self):
         mid = self._green_d()
-        self.world.ctl.owner_decide(mid, "APPROVE")
+        snap = self.world.ctl.owner_decide(mid, "APPROVE")
+        approved = snap.approved
+        fake = CandidateIdentity(
+            approved.candidate_id,
+            approved.source_revision,
+            "sha256:" + "9" * 64,
+            approved.artifact_uri,
+        )
         with self.assertRaises(InvariantError):
-            self.world.ctl.distribute(mid, substitute_artifact="cand-C")
-        self.world.distributor.replace_with = "other-artifact"
+            self.world.ctl.distribute(mid, substitute=fake)
+        self.world.distributor.replace_with = fake
         with self.assertRaises(InvariantError):
             self.world.ctl.distribute(mid)
         self.world.distributor.replace_with = None
         done = self.world.ctl.distribute(mid)
         self.assertEqual(done.state, MissionState.DISTRIBUTED)
-        self.assertEqual(self.world.distributor.calls[0][0], "cand-D")
+        self.assertEqual(self.world.distributor.calls[0][0].candidate_id, "cand-D")
+        self.assertEqual(self.world.distributor.calls[0][0].key(), approved.key())
 
     def test_123_restart_replay_does_not_duplicate_mission_or_skip_gate(self):
         mid = self._admit().mission_id
@@ -234,7 +257,6 @@ class FactoryV2LifecycleTests(unittest.TestCase):
         restarted = Controller(
             Store(self.world.store.path),
             self.world.manager,
-            self.world.executor,
             self.world.verifier,
             self.world.distributor,
             Path(self.world.tmp.name) / "sandboxes",
@@ -279,12 +301,12 @@ class FactoryV2LifecycleTests(unittest.TestCase):
             self.assertNotIn(needle, src.lower() if needle == "notion" else src)
 
     def _to_c(self, mid: str) -> str:
-        self.world.ctl.tick(mid)  # A produced
-        self.world.ctl.tick(mid)  # A review fail
-        self.world.ctl.tick(mid)  # B produced
-        self.world.ctl.tick(mid)  # B qa fail
-        self.world.ctl.tick(mid)  # C produced
-        snap = self.world.ctl.tick(mid)  # C verified
+        self.world.ctl.tick(mid)
+        self.world.ctl.tick(mid)
+        self.world.ctl.tick(mid)
+        self.world.ctl.tick(mid)
+        self.world.ctl.tick(mid)
+        snap = self.world.ctl.tick(mid)
         self.assertEqual(snap.state, MissionState.VERIFIED_RC)
         return mid
 
@@ -292,10 +314,10 @@ class FactoryV2LifecycleTests(unittest.TestCase):
         mid = self._to_c(self._admit().mission_id)
         self.world.ctl.tick(mid)
         self.world.ctl.owner_decide(mid, "REJECT", "rework")
-        self.world.ctl.tick(mid)  # D-red
         self.world.ctl.tick(mid)
-        self.world.ctl.tick(mid)  # D
-        self.world.ctl.tick(mid)  # VERIFIED_RC
+        self.world.ctl.tick(mid)
+        self.world.ctl.tick(mid)
+        self.world.ctl.tick(mid)
         presented = self.world.ctl.tick(mid)
         self.assertEqual(presented.state, MissionState.OWNER_VALIDATION)
         return mid

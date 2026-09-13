@@ -1,0 +1,225 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "factory-v2/contracts/engineering-mission.schema.json",
+  "title": "Factory v2 Hermes engineering mission",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "contract_type",
+    "contract_version",
+    "mission",
+    "pcp",
+    "current_candidate",
+    "attempt",
+    "lifecycle",
+    "hermes",
+    "grok_build",
+    "verification_requirements",
+    "consolidated_defect_packet",
+    "owner_rc_verdict_history",
+    "rework_history"
+  ],
+  "properties": {
+    "contract_type": { "const": "factory.v2.engineering_mission" },
+    "contract_version": { "const": "1.0.0" },
+    "mission": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["mission_id", "lineage_id", "created_at", "source_pcp_id"],
+      "properties": {
+        "mission_id": { "$ref": "#/$defs/identifier" },
+        "lineage_id": { "$ref": "#/$defs/identifier" },
+        "created_at": { "$ref": "#/$defs/timestamp" },
+        "source_pcp_id": { "$ref": "#/$defs/identifier" }
+      }
+    },
+    "pcp": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["pcp_id", "pcp_version", "revision", "content_hash"],
+      "properties": {
+        "pcp_id": { "$ref": "#/$defs/identifier" },
+        "pcp_version": {
+          "type": "string",
+          "pattern": "^[0-9]+\\.[0-9]+\\.[0-9]+$"
+        },
+        "revision": { "$ref": "#/$defs/revision" },
+        "content_hash": { "$ref": "#/$defs/content_hash" }
+      }
+    },
+    "current_candidate": { "$ref": "#/$defs/candidate" },
+    "attempt": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["attempt_id", "attempt_number", "rework_sequence"],
+      "properties": {
+        "attempt_id": { "$ref": "#/$defs/identifier" },
+        "attempt_number": { "type": "integer", "minimum": 1 },
+        "rework_sequence": { "type": "integer", "minimum": 0 }
+      }
+    },
+    "lifecycle": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["state", "updated_at", "reason"],
+      "properties": {
+        "state": {
+          "enum": [
+            "ADMITTED",
+            "PLANNING",
+            "BUILDING",
+            "VERIFYING",
+            "REWORK_REQUIRED",
+            "OWNER_REVIEW",
+            "DISTRIBUTION_READY",
+            "CLOSED"
+          ]
+        },
+        "updated_at": { "$ref": "#/$defs/timestamp" },
+        "reason": { "type": "string", "minLength": 1 }
+      }
+    },
+    "hermes": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["runtime", "profile_id", "session_id", "coordination_ref"],
+      "properties": {
+        "runtime": { "const": "NousResearch Hermes Agent" },
+        "profile_id": { "$ref": "#/$defs/identifier" },
+        "session_id": { "$ref": "#/$defs/identifier" },
+        "coordination_ref": { "$ref": "#/$defs/evidence_ref" }
+      }
+    },
+    "grok_build": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["executor", "attempts"],
+      "properties": {
+        "executor": { "const": "Grok Build" },
+        "attempts": {
+          "type": "array",
+          "minItems": 1,
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": [
+              "attempt_id",
+              "candidate",
+              "session_ref",
+              "status",
+              "started_at",
+              "completed_at",
+              "evidence"
+            ],
+            "properties": {
+              "attempt_id": { "$ref": "#/$defs/identifier" },
+              "candidate": { "$ref": "#/$defs/candidate" },
+              "session_ref": { "type": "string", "minLength": 1 },
+              "status": {
+                "enum": ["PLANNED", "RUNNING", "COMPLETED", "FAILED", "CANCELLED"]
+              },
+              "started_at": { "$ref": "#/$defs/timestamp" },
+              "completed_at": {
+                "type": ["string", "null"],
+                "format": "date-time"
+              },
+              "evidence": {
+                "type": "array",
+                "items": { "$ref": "#/$defs/evidence_ref" }
+              }
+            }
+          }
+        }
+      }
+    },
+    "verification_requirements": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["deterministic_tests", "code_review", "qa_e2e"],
+      "properties": {
+        "deterministic_tests": { "$ref": "#/$defs/verification_requirement" },
+        "code_review": {
+          "allOf": [
+            { "$ref": "#/$defs/verification_requirement" },
+            { "properties": { "verifier_harness": { "const": "Antigravity" } } }
+          ]
+        },
+        "qa_e2e": {
+          "allOf": [
+            { "$ref": "#/$defs/verification_requirement" },
+            { "properties": { "verifier_harness": { "const": "Antigravity" } } }
+          ]
+        }
+      }
+    },
+    "consolidated_defect_packet": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["status", "defects"],
+      "properties": {
+        "status": { "enum": ["NONE", "OPEN"] },
+        "defects": {
+          "type": "array",
+          "items": { "$ref": "#/$defs/defect" }
+        }
+      }
+    },
+    "owner_rc_verdict_history": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["decision", "candidate", "decided_at", "evidence"],
+        "properties": {
+          "decision": { "enum": ["APPROVE", "REJECT"] },
+          "candidate": { "$ref": "#/$defs/candidate" },
+          "decided_at": { "$ref": "#/$defs/timestamp" },
+          "evidence": { "$ref": "#/$defs/evidence_ref" },
+          "feedback": { "type": "string", "minLength": 1 }
+        }
+      }
+    },
+    "rework_history": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "from_attempt",
+          "to_attempt",
+          "trigger",
+          "same_mission",
+          "same_lineage",
+          "feedback"
+        ],
+        "properties": {
+          "from_attempt": { "type": "integer", "minimum": 1 },
+          "to_attempt": { "type": "integer", "minimum": 1 },
+          "trigger": { "enum": ["VERIFIER_REJECT", "OWNER_REJECT"] },
+          "same_mission": { "const": true },
+          "same_lineage": { "const": true },
+          "feedback": { "type": "string", "minLength": 1 }
+        }
+      }
+    }
+  },
+  "$defs": {
+    "identifier": { "$ref": "common.schema.json#/$defs/identifier" },
+    "revision": { "$ref": "common.schema.json#/$defs/revision" },
+    "content_hash": { "$ref": "common.schema.json#/$defs/content_hash" },
+    "timestamp": { "$ref": "common.schema.json#/$defs/timestamp" },
+    "evidence_ref": { "$ref": "common.schema.json#/$defs/evidence_ref" },
+    "candidate": { "$ref": "common.schema.json#/$defs/candidate" },
+    "defect": { "$ref": "common.schema.json#/$defs/defect" },
+    "verification_requirement": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["required", "evidence_minimum", "verifier_harness"],
+      "properties": {
+        "required": { "const": true },
+        "evidence_minimum": { "type": "integer", "minimum": 1 },
+        "verifier_harness": { "type": "string", "minLength": 1 }
+      }
+    }
+  }
+}
