@@ -1,11 +1,13 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import shutil
 import subprocess
 from pathlib import Path
 
+from factory_v2.canonical import revision_for
 from factory_v2.models import CandidateIdentity, ExecutorResult, MissionContext, WorkItem
 
 
@@ -61,6 +63,7 @@ class CursorCLIExecutor:
         version = _cli_version(binary, self._env)
         if not self.credentials_available():
             return self._blocked("cursor cli unauthenticated")
+        before = _workspace_fingerprint(workspace)
         prompt = (
             "Factory EngineeringExecutor work. Implement the admitted PCP in the "
             f"bounded workspace {workspace}. Mission {ctx.mission_id}. "
@@ -95,10 +98,21 @@ class CursorCLIExecutor:
             return self._blocked(f"cursor cli launch failed: {exc}")
         if proc.returncode != 0:
             return self._blocked(f"cursor cli failed: {proc.stderr[-500:]}")
+        envelope = _parse_envelope(proc.stdout)
+        if envelope is not None and envelope.get("is_error") is True:
+            return self._blocked("cursor cli reported an error result")
         parsed = _parse_candidate(proc.stdout)
         if parsed is None:
+            after = _workspace_fingerprint(workspace)
+            if after == before:
+                return self._blocked("cursor cli returned no structured candidate result")
+            parsed = _identity_from_workspace(workspace, after)
+        if parsed is None:
             return self._blocked("cursor cli returned no structured candidate result")
-        session_ref = ctx.mission_id
+        session_ref = ""
+        if envelope and isinstance(envelope.get("session_id"), str):
+            session_ref = envelope["session_id"]
+        session_ref = session_ref or ctx.mission_id
         self.last_provenance = {
             "executor_type": self.executor_type,
             "cli_path": binary,
@@ -189,7 +203,7 @@ def _observed_model(stdout: str) -> str:
     return ""
 
 
-def _parse_candidate(stdout: str) -> CandidateIdentity | None:
+def _load_json_object(stdout: str) -> dict | None:
     text = stdout.strip()
     if not text:
         return None
@@ -203,7 +217,50 @@ def _parse_candidate(stdout: str) -> CandidateIdentity | None:
             data = json.loads(text[start : end + 1])
         except json.JSONDecodeError:
             return None
-    if not isinstance(data, dict):
+    return data if isinstance(data, dict) else None
+
+
+def _parse_envelope(stdout: str) -> dict | None:
+    data = _load_json_object(stdout)
+    if data is None or data.get("type") != "result":
+        return None
+    return data
+
+
+def _workspace_fingerprint(workspace: Path) -> dict[str, str]:
+    out: dict[str, str] = {}
+    for path in sorted(workspace.rglob("*")):
+        if not path.is_file() or not _countable_workspace_file(path):
+            continue
+        out[str(path.relative_to(workspace))] = hashlib.sha256(path.read_bytes()).hexdigest()
+    return out
+
+
+def _countable_workspace_file(path: Path) -> bool:
+    if path.name == "cursor-executor-provenance.json":
+        return False
+    if path.suffix in {".pyc", ".pyo"}:
+        return False
+    return "__pycache__" not in path.parts
+
+
+def _identity_from_workspace(workspace: Path, fingerprint: dict[str, str]) -> CandidateIdentity | None:
+    if not fingerprint:
+        return None
+    material = "\n".join(f"{name}:{digest}" for name, digest in sorted(fingerprint.items()))
+    digest = hashlib.sha256(material.encode()).hexdigest()
+    first = sorted(fingerprint)[0]
+    return CandidateIdentity(
+        candidate_id=f"cursor-{digest[:12]}",
+        source_revision=revision_for(material),
+        artifact_hash=f"sha256:{digest}",
+        artifact_uri=f"sandbox://{workspace.name}/{first}",
+    )
+
+
+def _parse_candidate(stdout: str) -> CandidateIdentity | None:
+    data = _load_json_object(stdout)
+    if data is None:
         return None
     cand = data.get("candidate") if isinstance(data.get("candidate"), dict) else data
     keys = ("candidate_id", "source_revision", "artifact_hash", "artifact_uri")

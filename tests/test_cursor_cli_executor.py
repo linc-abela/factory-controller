@@ -149,6 +149,32 @@ class CursorCLIExecutorTests(unittest.TestCase):
         self.assertEqual(provenance["auth_mode"], "cli_session")
         self.assertNotIn("CURSOR_API_KEY", json.dumps(provenance))
 
+    def test_official_envelope_binds_workspace_artifact(self):
+        envelope = {
+            "type": "result",
+            "subtype": "success",
+            "is_error": False,
+            "result": "wrote hello.txt",
+            "session_id": "sess-live",
+        }
+        _script(
+            self.bin,
+            "agent",
+            "#!/bin/sh\n"
+            "if [ \"$1\" = status ]; then echo 'Logged in as test'; exit 0; fi\n"
+            "if [ \"$1\" = --version ]; then echo '2026.08.11-test'; exit 0; fi\n"
+            f"mkdir -p \"{self.workspace}/__pycache__\"\n"
+            f"printf '%s\\n' 'hello' > \"{self.workspace}/hello.txt\"\n"
+            f"printf '%s\\n' 'bytecode' > \"{self.workspace}/__pycache__/hello.cpython-314.pyc\"\n"
+            f"echo '{json.dumps(envelope)}'\n"
+            "exit 0\n",
+        )
+        result = CursorCLIExecutor(env=self.env).implement(_ctx(self.workspace), WORK)
+        self.assertFalse(result.blocked)
+        self.assertEqual(result.candidate.artifact_uri.endswith("hello.txt"), True)
+        self.assertEqual(len(result.candidate.key()), 4)
+        self.assertEqual(result.grok_session_ref, "sess-live")
+
     def test_default_selection_is_cursor_and_grok_remains_selectable(self):
         env = dict(self.env)
         env.pop("FACTORY_V2_ENGINEERING_EXECUTOR", None)
