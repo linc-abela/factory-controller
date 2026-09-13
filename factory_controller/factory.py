@@ -42,6 +42,7 @@ from . import pcp
 from . import portfolio
 from . import product
 from . import production
+from . import pcp_missions
 from . import release
 from . import shift as shift_plane
 from . import shift_runtime
@@ -376,6 +377,8 @@ class FactoryLifecycle:
             clock=self.clock,
         )
         self.review_transport = review_transport
+        self.pcp_missions = pcp_missions.PCPMissionPlane(
+            self.store, self.config.vault_root, clock=self.clock)
 
     # -- the frozen improvement objective ------------------------------- #
 
@@ -487,6 +490,7 @@ class FactoryLifecycle:
             "scope": "first internal dogfood",
         })
         self._provision_store(contract, entry, doctor)
+        self.pcp_missions.advance(rc_alpha_for=self._pcp_rc_alpha)
         readings = self._refresh_capacity(contract)
         doctor, capability_preview = self._admit_required_capability(
             contract, doctor, approval_ref)
@@ -2399,6 +2403,7 @@ class FactoryLifecycle:
         """
 
         self._require_owner()
+        self.pcp_missions.advance(rc_alpha_for=self._pcp_rc_alpha)
         contract, entry = self._load_contract_and_portfolio()
         grant = self.shift.grant()
         control = self.supervisor.control()
@@ -3097,6 +3102,37 @@ class FactoryLifecycle:
                 "for Owner review. It is kept in durable history and does not "
                 "block this product." % portfolio_mission.mission_ref)
 
+    def _pcp_rc_alpha(self, mission):
+        """Local RC-alpha surface from a promoted PCP. No Notion."""
+        if mission.rc_alpha_url:
+            return mission.rc_alpha_url
+        surface = pcp_missions.write_rc_alpha_surface(
+            self.config.state_dir / "pcp-rc-alpha", mission)
+        return (surface / "index.html").resolve().as_uri()
+
+    def _pcp_mission_status_lines(self) -> tuple[tuple[str, ...], str]:
+        rows = self.pcp_missions.list()
+        if not rows:
+            return (), "idle"
+        lines = ["Promoted PCP missions:"]
+        state = "running"
+        for row in rows:
+            if row.hold:
+                lines.append("%s HOLD %s" % (row.package_id, row.lifecycle))
+                continue
+            url = row.rc_beta_url or row.rc_alpha_url
+            if url:
+                kind = "RC-beta" if row.rc_beta_url else "RC-alpha"
+                lines.append("%s %s %s: %s" % (row.package_id, row.lifecycle, kind, url))
+                if row.lifecycle in {"OWNER_VALIDATION", "OWNER_SIGNOFF"}:
+                    state = "attention"
+            elif row.lifecycle == "CLARITY_REQUIRED":
+                lines.append("%s needs clarification: %s" % (row.package_id, row.clarification))
+                state = "attention"
+            else:
+                lines.append("%s %s" % (row.package_id, row.lifecycle))
+        return tuple(lines), state
+
     def _owner_brief_status_lines(self) -> tuple[str, ...]:
         if self._product_reading() is not None:
             return ()
@@ -3398,6 +3434,7 @@ class FactoryLifecycle:
                 lines=("BLOCKED: A trusted local Owner identity is unavailable.",),
                 details={"code": "OWNER_IDENTITY_UNAVAILABLE"},
             )
+        self.pcp_missions.sync()
         live = self.shift.grant()
         control = self.supervisor.control()
         supervisor_loaded = self._service_loaded(self.config.supervisor_label)
@@ -3445,6 +3482,9 @@ class FactoryLifecycle:
         if management_reading.get("owner_attention_need"):
             work_state = "attention"
         owner_lines = self._owner_brief_status_lines()
+        pcp_lines, pcp_state = self._pcp_mission_status_lines()
+        if pcp_state == "attention":
+            work_state = "attention"
         return FactoryResult(
             action="status", ok=True, state=state,
             lines=(label,
@@ -3454,12 +3494,14 @@ class FactoryLifecycle:
                    "Primary: " + primary)
             + status_attention
             + owner_lines
+            + pcp_lines
             + work
             + management_lines,
             details={"control": control, "grant": None if live is None else live.as_row(),
                      "bridge": doctor, "work_state": work_state,
                      "management": management_reading,
-                     "owner_state": owner_lines[0] if owner_lines else None},
+                     "owner_state": owner_lines[0] if owner_lines else None,
+                     "pcp_missions": [row.as_row() for row in self.pcp_missions.list()]},
         )
 
     def watch(self, interval_seconds: float = DEFAULT_WATCH_INTERVAL_SECONDS,

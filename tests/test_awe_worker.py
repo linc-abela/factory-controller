@@ -662,7 +662,7 @@ class TwoTierClaimFencingTests(unittest.TestCase):
         self.sor = NotionSourceOfRecord(client=self.mock_client)
         self.mock_adapter = MockHarnessAdapter("antigravity")
 
-    def test_source_of_record_conflict_rolls_back_sqlite_claim(self):
+    def test_source_of_record_conflict_does_not_roll_back_sqlite_claim(self):
         # Notion returns that task was already Done in source of record
         self.mock_client.retrieve_page.return_value = {
             "properties": {"Status": {"select": {"name": "Done"}}}
@@ -677,11 +677,11 @@ class TwoTierClaimFencingTests(unittest.TestCase):
         slot = ExecutionSlot(harness="antigravity", model="gemini-3.8-flash", effort="high")
         summary = worker.run_cycle(worker_id="w1", target_slot=slot, dry_run=False)
 
-        self.assertEqual(summary.health, "conflict")
-        self.assertIn("Source-of-record claim conflict", summary.detail)
-        # Verify SQLite lease was marked blocked/released
+        self.assertEqual(summary.health, "healthy")
+        self.assertIn("notion_projection", summary.detail)
         claim = self.ledger.get_claim("SF-217")
-        self.assertEqual(claim["state"], "blocked")
+        self.assertEqual(claim["state"], "in_progress")
+        self.assertEqual([item.task_id for item in self.mock_adapter.woken_tasks], ["SF-217"])
 
 
 class AWEScheduledRunnerTests(unittest.TestCase):

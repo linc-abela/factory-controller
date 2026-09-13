@@ -294,11 +294,6 @@ def main(argv: list[str] | None = None) -> int:
             selected_task_id=args.task_id,
             slot=slot,
         )
-        if not preflight.ok:
-            json.dump(preflight.as_dict(), sys.stdout, indent=2)
-            print()
-            print(preflight.as_text(), file=sys.stderr)
-            return 1
         res = ledger.claim(
             task_id=args.task_id,
             lineage_id=args.task_id,
@@ -306,9 +301,19 @@ def main(argv: list[str] | None = None) -> int:
             slot_key=slot.key,
             lease_seconds=args.lease,
         )
-        json.dump({"ok": res.ok, "action": res.action, "token": res.token, "code": res.code, "detail": res.detail}, sys.stdout, indent=2)
+        payload = {
+            "ok": bool(res.ok) if not isinstance(res.ok, bool) else res.ok,
+            "action": "" if res.action is None else str(res.action),
+            "token": None if res.token is None else str(res.token),
+            "code": "" if res.code is None else str(res.code),
+            "detail": "" if res.detail is None else str(res.detail),
+            "projection": preflight.as_dict(),
+        }
+        json.dump(payload, sys.stdout, indent=2)
         print()
-        return 0 if res.ok else 1
+        if not preflight.ok:
+            print(preflight.as_text(), file=sys.stderr)
+        return 0 if payload["ok"] else 1
 
     elif args.command == "wake":
         adapter = get_adapter_for_harness(args.harness)

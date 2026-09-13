@@ -436,12 +436,17 @@ class LiveNotionTaskSource:
             }
 
         while True:
-            resp = self.client.query_database(
-                database_id=self.database_id,
-                filter_dict=filter_dict,
-                page_size=100,
-                start_cursor=cursor,
-            )
+            try:
+                resp = self.client.query_database(
+                    database_id=self.database_id,
+                    filter_dict=filter_dict,
+                    page_size=100,
+                    start_cursor=cursor,
+                )
+            except NotionAPIError:
+                return []
+            except Exception:
+                return []
             results = resp.get("results", [])
             all_rows.extend(results)
             if not resp.get("has_more") or not resp.get("next_cursor"):
@@ -611,11 +616,16 @@ class LiveNotionTaskSource:
             rows: list[dict[str, Any]] = []
             cursor: str | None = None
             while True:
-                resp = self.client.query_database(
-                    database_id=self.database_id,
-                    page_size=100,
-                    start_cursor=cursor,
-                )
+                try:
+                    resp = self.client.query_database(
+                        database_id=self.database_id,
+                        page_size=100,
+                        start_cursor=cursor,
+                    )
+                except NotionAPIError:
+                    break
+                except Exception:
+                    break
                 rows.extend(resp.get("results", []))
                 if not resp.get("has_more") or not resp.get("next_cursor"):
                     break
@@ -698,14 +708,11 @@ class NotionSourceOfRecord:
         slot_key: str,
         lease_seconds: float = 120.0,
     ) -> tuple[bool, str]:
-        """Fail-closed physical AWE + dashboard reconciliation (Queue -> In Progress).
+        """Best-effort Lab AWE projection (Queue -> In Progress).
 
-        Canonical lifecycle truth is the task page's physical folder ancestry.
-        This is not Notion atomic CAS and not one ACID transaction across Notion:
-        1. Verify the physical task page is currently in the lane's Queue folder.
-        2. Move the physical task page to the lane's In Progress folder.
-        3. Reconcile the dashboard projection row. If either Notion write fails,
-           return an error so the Controller fence can roll back the local lease.
+        Controller ledger is execution authority. Notion is optional Lab routing.
+        Physical ancestry, Dashboard, and Dispatch writes never veto or roll back
+        a local claim. Failures return an error string for projection debt.
         """
         if not self.client.is_configured:
             return False, "NOTION_NOT_CONFIGURED"

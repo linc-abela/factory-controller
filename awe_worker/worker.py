@@ -88,17 +88,45 @@ class AWEAutonomousWorker:
         self.adapters = default_adapters
 
     def _projection_preflight(self, selected_task_id: str, slot: ExecutionSlot):
-        """Fail closed before any local or source-of-record claim."""
+        """Best-effort Notion/Dashboard/Dispatch telemetry. Never a claim veto."""
         snapshot = self.projection_snapshot
         if snapshot is None:
             provider = getattr(self.observation.source, "projection_snapshot", None)
             if callable(provider):
-                snapshot = provider()
+                try:
+                    snapshot = provider()
+                except Exception:
+                    snapshot = None
         return evaluate_claim_preflight(
             snapshot,
             selected_task_id=selected_task_id,
             slot=slot,
         )
+
+    def _observe_tasks(self) -> list:
+        try:
+            return list(self.observation.observe_all())
+        except Exception:
+            return []
+
+    def _ledger_resume_items(self, slot: ExecutionSlot, now: float) -> list:
+        items = []
+        for row in self.ledger.get_active_claims(now=now):
+            if row.get("slot_key") != slot.key:
+                continue
+            items.append(
+                AWEWorkItem(
+                    task_id=row["task_id"],
+                    title=row["task_id"],
+                    lane=slot.harness,
+                    role="developer",
+                    status=AWEStatus.IN_PROGRESS.value,
+                    model=slot.model,
+                    effort=slot.effort,
+                    sequence=0,
+                )
+            )
+        return items
 
     def run_cycle(
         self,
@@ -129,8 +157,10 @@ class AWEAutonomousWorker:
         # 1. Clean up expired leases to recover stale tasks
         self.ledger.clean_expired_leases(now=ts)
 
-        # 2. Observe all tasks
-        all_tasks = self.observation.observe_all()
+        # 2. Observe tasks from the source; Notion outage cannot hide ledger resumes.
+        all_tasks = self._observe_tasks()
+        if not all_tasks:
+            all_tasks = self._ledger_resume_items(target_slot, ts)
         eligible_tasks = self.observation.filter_eligible(slot=target_slot, tasks=all_tasks)
 
         if not eligible_tasks:
@@ -167,20 +197,9 @@ class AWEAutonomousWorker:
         task = eligible_tasks[0]
 
         preflight = self._projection_preflight(task.task_id, target_slot)
+        projection_debt = ""
         if not preflight.ok:
-            return CycleSummary(
-                worker_id=worker_id,
-                cycle_id=cycle_id,
-                observed_tasks=len(all_tasks),
-                claimed_task=None,
-                grounding_source=None,
-                wake_receipt=None,
-                completion_report=None,
-                gate_decision=None,
-                escalation=None,
-                health="refused",
-                detail=f"PROJECTION_FAIL_CLOSED: {preflight.as_text()}",
-            )
+            projection_debt = f"; projection_debt: {preflight.as_text()}"
 
         if dry_run:
             grounding = self.grounder.ground_task(repo_path=self.target_repo, task=task)
@@ -229,11 +248,14 @@ class AWEAutonomousWorker:
                     now=ts,
                 )
             if self.source_of_record:
-                self.source_of_record.block_task(
-                    task=task,
-                    reason=escalation.reason_code,
-                    detail=escalation.detail,
-                )
+                try:
+                    self.source_of_record.block_task(
+                        task=task,
+                        reason=escalation.reason_code,
+                        detail=escalation.detail,
+                    )
+                except Exception:
+                    pass
             return CycleSummary(
                 worker_id=worker_id,
                 cycle_id=cycle_id,
@@ -273,37 +295,19 @@ class AWEAutonomousWorker:
                 detail=f"Claim refused: {claim_res.code} - {claim_res.detail}",
             )
 
-        # 4b. Fail-closed physical AWE + dashboard reconciliation (not Notion CAS)
+        # 4b. Best-effort Notion projection. Controller ledger is the fence.
         if self.source_of_record and task.status == AWEStatus.QUEUE.value:
-            sor_ok, sor_err = self.source_of_record.claim_task(
-                task=task,
-                worker_id=worker_id,
-                slot_key=task.slot.key,
-                lease_seconds=120.0,
-            )
-            if not sor_ok:
-                # Fencing conflict on Notion source of record! Roll back local lease
-                if claim_res.token:
-                    self.ledger.block(
-                        task.task_id,
-                        claim_res.token,
-                        "SOURCE_OF_RECORD_CONFLICT",
-                        sor_err,
-                        now=ts,
-                    )
-                return CycleSummary(
+            try:
+                sor_ok, sor_err = self.source_of_record.claim_task(
+                    task=task,
                     worker_id=worker_id,
-                    cycle_id=cycle_id,
-                    observed_tasks=len(all_tasks),
-                    claimed_task=task.task_id,
-                    grounding_source=None,
-                    wake_receipt=None,
-                    completion_report=None,
-                    gate_decision=None,
-                    escalation=None,
-                    health="conflict",
-                    detail=f"Source-of-record claim conflict: {sor_err}",
+                    slot_key=task.slot.key,
+                    lease_seconds=120.0,
                 )
+                if not sor_ok:
+                    projection_debt += f"; notion_projection: {sor_err}"
+            except Exception as exc:
+                projection_debt += f"; notion_projection: {exc}"
 
         # 5. Context Broker Grounding (Preferred fast bounded path)
         grounding = self.grounder.ground_task(
@@ -388,5 +392,5 @@ class AWEAutonomousWorker:
             gate_decision=gate_decision,
             escalation=escalation,
             health="healthy" if wake_receipt.success else "harness_unavailable",
-            detail=f"Task {task.task_id} {claim_res.action}; grounding: {grounding.source}; wake: {wake_receipt.error_code or 'ok'}",
+            detail=f"Task {task.task_id} {claim_res.action}; grounding: {grounding.source}; wake: {wake_receipt.error_code or 'ok'}{projection_debt}",
         )

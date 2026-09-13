@@ -442,6 +442,7 @@ class FactoryLifecycleTests(unittest.TestCase):
             bridge_prefix=root / "bridge",
             capability_request_path=root / "first-dogfood-capability-admission-request.json",
             product_checkout_root=root / "apps",
+            vault_root=root / "vault",
         )
         self.config.capability_request_path.write_text(json.dumps({
             "accepted_unknowns": [],

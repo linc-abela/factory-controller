@@ -15,7 +15,7 @@ from pathlib import Path
 from typing import Any, Mapping, Protocol, Sequence
 
 from .dispatch import DISPATCH_PAGE_IDS, DISPATCH_STALE, HeadlessDispatchResolver, NO_EXECUTABLE_TASK
-from .model import CycleSummary, ExecutionSlot
+from .model import AWEStatus, CycleSummary, ExecutionSlot
 from .worker import AWEAutonomousWorker
 
 LIVENESS_SCHEMA = """
@@ -316,7 +316,7 @@ class AWEScheduledRunner:
                 error_parts.append(part)
         error = "; ".join(error_parts)
         if work_state is None:
-            work_state = "active" if slots else ("projection_refused" if error else "no_eligible_work")
+            work_state = "active" if slots else ("dispatch_unavailable" if error else "no_eligible_work")
         self._write_runtime(
             now=ts,
             service_state="running",
@@ -470,7 +470,7 @@ class AWEScheduledRunner:
         if summary.health in {"escalated", "owner_gated"}:
             return "owner_gated"
         if summary.health == "refused":
-            return "projection_refused" if "PROJECTION" in summary.detail else "blocked"
+            return "dispatch_unavailable" if "projection_debt" in summary.detail else "blocked"
         if summary.health == "harness_unavailable":
             return "harness_unavailable"
         return "active"
@@ -531,6 +531,32 @@ class AWEScheduledRunner:
         """Signal the worker loop to stop gracefully."""
         self._stop_requested = True
 
+    def _slots_from_local_authority(self) -> list[ExecutionSlot]:
+        """Controller ledger + local task source, independent of Notion Dispatch."""
+        found: list[ExecutionSlot] = []
+        seen: set[str] = set()
+
+        def add(slot: ExecutionSlot) -> None:
+            if slot.key not in seen:
+                seen.add(slot.key)
+                found.append(slot)
+
+        try:
+            for row in self.worker.ledger.get_active_claims():
+                try:
+                    add(ExecutionSlot.parse(row["slot_key"]))
+                except (KeyError, TypeError, ValueError):
+                    continue
+        except Exception:
+            pass
+        try:
+            for task in self.worker.observation.observe_all():
+                if task.status in (AWEStatus.QUEUE.value, AWEStatus.IN_PROGRESS.value):
+                    add(task.slot)
+        except Exception:
+            pass
+        return found
+
     def _observe_slots(
         self,
         target_slot: ExecutionSlot | None,
@@ -558,15 +584,20 @@ class AWEScheduledRunner:
                 if slot not in slots:
                     slots.append(slot)
         except (TypeError, ValueError, RuntimeError) as exc:
-            return [], f"SLOT_OBSERVATION_FAILED: {exc}"
-
-        diagnostics = getattr(self.slot_provider, "diagnostics", None)
-        detail = ""
-        if callable(diagnostics):
-            data = diagnostics()
-            errors = data.get("errors") if isinstance(data, Mapping) else {}
-            if isinstance(errors, Mapping) and errors:
-                detail = "; ".join(f"{key}: {value}" for key, value in errors.items())
+            slots, detail = [], f"SLOT_OBSERVATION_FAILED: {exc}"
+        else:
+            diagnostics = getattr(self.slot_provider, "diagnostics", None)
+            detail = ""
+            if callable(diagnostics):
+                data = diagnostics()
+                errors = data.get("errors") if isinstance(data, Mapping) else {}
+                if isinstance(errors, Mapping) and errors:
+                    detail = "; ".join(f"{key}: {value}" for key, value in errors.items())
+        if not slots:
+            local = self._slots_from_local_authority()
+            if local:
+                return local, detail or "LOCAL_CONTROLLER_AUTHORITY"
+            return [], detail
         return slots, detail
 
     @staticmethod
@@ -627,7 +658,7 @@ class AWEScheduledRunner:
                             [slot for slot in slots if slot is not None],
                             detail=observation_detail,
                             work_state=(
-                                "projection_refused"
+                                "dispatch_unavailable"
                                 if observation_detail and not slots
                                 else None
                             ),

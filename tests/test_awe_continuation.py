@@ -212,7 +212,7 @@ class ContinuationSupervisorTests(unittest.TestCase):
 
         self.assertEqual(summaries, [])
         self.assertEqual(worker.calls, [])
-        self.assertEqual(runtime.work_state, "projection_refused")
+        self.assertEqual(runtime.work_state, "dispatch_unavailable")
         self.assertIn("HARNESS_WAKE_PATH_UNAVAILABLE:cursor", runtime.last_error)
 
     def test_owner_gated_item_is_reported_without_a_harness_wake(self):

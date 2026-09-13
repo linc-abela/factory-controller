@@ -192,12 +192,11 @@ def evaluate_claim_preflight(
     selected_task_id: str | None = None,
     slot: ExecutionSlot | Mapping[str, Any] | str | None = None,
 ) -> DiagnosticReport:
-    """Read-only gate used before local ledger or source-of-record claim.
+    """Read-only Lab AWE projection diagnostic. Never a Factory or claim veto.
 
-    A missing snapshot is unknown projection truth and must fail closed.
-    When a selected task and slot are supplied, the selected target must bind
-    to the authorized Dashboard Current pointer and Dispatch pointer for that
-    slot. This function never claims, moves pages, or writes Dashboard/Dispatch.
+    Missing, stale, or contradictory Notion/Dashboard/Dispatch snapshots are
+    recorded as findings. Claim, start, and resume use Controller ledger
+    state. This function never claims, moves pages, or writes Notion.
     """
     if snapshot is None:
         return DiagnosticReport(
@@ -206,8 +205,8 @@ def evaluate_claim_preflight(
                 Finding(
                     code=UNKNOWN_PROJECTION_SNAPSHOT,
                     detail=(
-                        "No projection snapshot was supplied to the claim/startup path; "
-                        "unknown physical/Dashboard/Dispatch truth must fail closed"
+                        "No Lab AWE projection snapshot was supplied; "
+                        "record as diagnostic debt. Controller ledger remains authority"
                     ),
                 ),
             ),

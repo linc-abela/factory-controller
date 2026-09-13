@@ -462,7 +462,7 @@ class ClaimScopeRegressionTests(unittest.TestCase):
                                                   "model_effort": "unparseable"})
                 self.assertIn(code, {finding.code for finding in self.claim(snapshot).findings})
 
-    def test_cli_claim_without_snapshot_does_not_claim(self):
+    def test_cli_claim_without_snapshot_still_claims(self):
         stdout = io.StringIO()
         stderr = io.StringIO()
         with patch("awe_worker.cli.AWELedger") as ledger_cls, \
@@ -477,13 +477,14 @@ class ClaimScopeRegressionTests(unittest.TestCase):
                     "cursor/grok-4.6/medium",
                 ]
             )
-        ledger_cls.return_value.claim.assert_not_called()
-        self.assertEqual(code, 1)
+        ledger_cls.return_value.claim.assert_called_once()
+        self.assertEqual(code, 0)
         payload = json.loads(stdout.getvalue())
-        self.assertEqual(payload["verdict"], FAIL_CLOSED)
-        self.assertIn(UNKNOWN_PROJECTION_SNAPSHOT, {item["code"] for item in payload["findings"]})
+        self.assertTrue(payload["ok"])
+        self.assertEqual(payload["projection"]["verdict"], FAIL_CLOSED)
+        self.assertIn(UNKNOWN_PROJECTION_SNAPSHOT, {item["code"] for item in payload["projection"]["findings"]})
 
-    def test_cli_claim_rejects_unknown_physical_without_ledger_claim(self):
+    def test_cli_claim_records_unknown_physical_but_still_claims(self):
         snapshot = {
             "physical": [],
             "dashboard": [_dashboard_queue_current()],
@@ -508,12 +509,13 @@ class ClaimScopeRegressionTests(unittest.TestCase):
                         str(path),
                     ]
                 )
-        ledger_cls.return_value.claim.assert_not_called()
-        self.assertEqual(code, 1)
+        ledger_cls.return_value.claim.assert_called_once()
+        self.assertEqual(code, 0)
         payload = json.loads(stdout.getvalue())
-        self.assertIn(UNKNOWN_PHYSICAL_TRUTH, {item["code"] for item in payload["findings"]})
+        self.assertTrue(payload["ok"])
+        self.assertIn(UNKNOWN_PHYSICAL_TRUTH, {item["code"] for item in payload["projection"]["findings"]})
 
-    def test_worker_cycle_does_not_claim_on_projection_drift(self):
+    def test_worker_cycle_claims_despite_projection_drift(self):
         task = AWEWorkItem(
             task_id="SF-236",
             title="stale",
@@ -534,6 +536,7 @@ class ClaimScopeRegressionTests(unittest.TestCase):
         )
         ledger = AWELedger(":memory:")
         sor = MagicMock()
+        sor.claim_task.return_value = (False, "NOTION_API_ERROR timeout")
         adapter = MockHarnessAdapter("antigravity")
         worker = AWEAutonomousWorker(
             ledger=ledger,
@@ -544,14 +547,14 @@ class ClaimScopeRegressionTests(unittest.TestCase):
         )
         slot = ExecutionSlot(harness="antigravity", model="gemini-3.1-flash", effort="high")
         summary = worker.run_cycle(worker_id="w1", target_slot=slot, dry_run=False)
-        self.assertEqual(summary.health, "refused")
-        self.assertIn("PROJECTION_FAIL_CLOSED", summary.detail)
-        self.assertIsNone(summary.claimed_task)
-        self.assertIsNone(ledger.get_claim("SF-236"))
-        sor.claim_task.assert_not_called()
-        self.assertEqual(adapter.woken_tasks, [])
+        self.assertEqual(summary.claimed_task, "SF-236")
+        self.assertNotEqual(summary.health, "refused")
+        self.assertIn("projection_debt", summary.detail)
+        self.assertIsNotNone(ledger.get_claim("SF-236"))
+        sor.claim_task.assert_called_once()
+        self.assertEqual([item.task_id for item in adapter.woken_tasks], ["SF-236"])
 
-    def test_worker_cycle_does_not_claim_on_unknown_physical_truth(self):
+    def test_worker_cycle_claims_on_unknown_physical_truth(self):
         task = AWEWorkItem(
             task_id="SF-236",
             title="missing physical",
@@ -572,18 +575,19 @@ class ClaimScopeRegressionTests(unittest.TestCase):
         )
         ledger = AWELedger(":memory:")
         sor = MagicMock()
+        sor.claim_task.return_value = (True, "")
+        adapter = MockHarnessAdapter("antigravity")
         worker = AWEAutonomousWorker(
             ledger=ledger,
             source=source,
             source_of_record=sor,
-            harness_adapters={"antigravity": MockHarnessAdapter("antigravity")},
+            harness_adapters={"antigravity": adapter},
             target_repo=".",
         )
         slot = ExecutionSlot(harness="antigravity", model="gemini-3.1-flash", effort="high")
         summary = worker.run_cycle(worker_id="w1", target_slot=slot, dry_run=False)
-        self.assertEqual(summary.health, "refused")
-        self.assertIsNone(ledger.get_claim("SF-236"))
-        sor.claim_task.assert_not_called()
+        self.assertEqual(summary.claimed_task, "SF-236")
+        self.assertIsNotNone(ledger.get_claim("SF-236"))
         codes = {finding.code for finding in evaluate_claim_preflight(source.projection_snapshot()).findings}
         self.assertIn(UNKNOWN_PHYSICAL_TRUTH, codes)
 
@@ -800,7 +804,7 @@ class AuthorizedPointerBindingTests(unittest.TestCase):
         self.assertEqual(report.verdict, FAIL_CLOSED)
         self.assertIn(NO_CURRENT_POINTER, {finding.code for finding in report.findings})
 
-    def test_worker_does_not_claim_sf239_when_sf238_is_review_current(self):
+    def test_worker_claims_queue_sibling_when_review_row_is_stale_current(self):
         snapshot = _sf238_review_current_yes_sf239_queue_current_no()
         tasks = [
             AWEWorkItem(
@@ -838,11 +842,9 @@ class AuthorizedPointerBindingTests(unittest.TestCase):
         )
         slot = ExecutionSlot.parse(CURSOR_MEDIUM)
         summary = worker.run_cycle(worker_id="w1", target_slot=slot, dry_run=False)
-        self.assertEqual(summary.health, "refused")
-        self.assertIsNone(summary.claimed_task)
-        self.assertIsNone(ledger.get_claim("SF-239"))
+        self.assertEqual(summary.claimed_task, "SF-239")
+        self.assertIsNotNone(ledger.get_claim("SF-239"))
         self.assertIsNone(ledger.get_claim("SF-238"))
-        sor.claim_task.assert_not_called()
 
     def test_worker_resumes_in_progress_current_without_claiming_queue_sibling(self):
         snapshot = {
@@ -948,10 +950,11 @@ class AuthorizedPointerBindingTests(unittest.TestCase):
                         str(path),
                     ]
                 )
-        ledger_cls.return_value.claim.assert_not_called()
-        self.assertEqual(code, 1)
+        ledger_cls.return_value.claim.assert_called_once()
+        self.assertEqual(code, 0)
         payload = json.loads(stdout.getvalue())
-        codes = {item["code"] for item in payload["findings"]}
+        self.assertTrue(payload["ok"])
+        codes = {item["code"] for item in payload["projection"]["findings"]}
         self.assertIn(SELECTED_TASK_MISMATCH, codes)
         self.assertIn(NO_EXECUTABLE_TASK, codes)
 
@@ -1216,10 +1219,10 @@ class AuthorizedPointerBindingTests(unittest.TestCase):
             target_slot=ExecutionSlot.parse(CURSOR_MEDIUM),
             dry_run=False,
         )
-        self.assertEqual(summary.health, "refused")
-        self.assertIsNone(ledger.get_claim("SF-238"))
+        self.assertEqual(summary.claimed_task, "SF-238")
+        self.assertIsNotNone(ledger.get_claim("SF-238"))
         sor.claim_task.assert_not_called()
-        self.assertEqual(adapter.woken_tasks, [])
+        self.assertEqual([item.task_id for item in adapter.woken_tasks], ["SF-238"])
 
 
 def _rich(text: str) -> list[dict]:
@@ -1367,11 +1370,10 @@ class LivePhysicalProfileIndependenceTests(unittest.TestCase):
             target_slot=ExecutionSlot.parse(CURSOR_MEDIUM),
             dry_run=False,
         )
-        self.assertEqual(summary.health, "refused")
-        self.assertIsNone(ledger.get_claim("SF-238"))
-        sor.claim_task.assert_not_called()
-        self.assertEqual(adapter.woken_tasks, [])
-        mock_client.update_page.assert_not_called()
+        self.assertEqual(summary.claimed_task, "SF-238")
+        self.assertIsNotNone(ledger.get_claim("SF-238"))
+        self.assertEqual([item.task_id for item in adapter.woken_tasks], ["SF-238"])
+        sor.claim_task.assert_called()
 
 
 if __name__ == "__main__":
