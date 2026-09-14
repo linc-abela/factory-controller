@@ -24,6 +24,16 @@ from factory_v2.models import CandidateIdentity, MissionContext, MissionSnapshot
 from factory_v2.states import MissionState
 from factory_v2.store import Store
 
+AUTONOMOUS_DRIVE_STATES = frozenset(
+    {
+        MissionState.PCP_APPROVED,
+        MissionState.ENGINEERING,
+        MissionState.VERIFYING,
+        MissionState.VERIFIED_RC,
+    }
+)
+TERMINAL_STATES = frozenset({MissionState.DISTRIBUTED})
+
 
 class GateError(RuntimeError):
     """Illegal lifecycle transition or missing gate evidence."""
@@ -78,6 +88,33 @@ class Controller:
         snap = self.store.insert_mission(mid, mid, h, admitted)
         (self.workspace_root / mid).mkdir(parents=True, exist_ok=True)
         return snap
+
+    def submit_pcp(self, pcp: dict) -> MissionSnapshot:
+        """Event-driven intake: admit once, then start Engineering without a manual tick."""
+        snap = self.admit_pcp(pcp)
+        return self.drive_until_pause(snap.mission_id)
+
+    def drive_until_pause(self, mission_id: str, *, max_steps: int = 32) -> MissionSnapshot:
+        """Advance until Owner Gate 2, BLOCKED, or a terminal state."""
+        snap = self.get(mission_id)
+        for _ in range(max_steps):
+            if snap.state not in AUTONOMOUS_DRIVE_STATES:
+                return snap
+            snap = self.tick(mission_id)
+        raise InvariantError(
+            f"autonomous drive exceeded {max_steps} steps for {mission_id}"
+        )
+
+    def resume_incomplete(self) -> tuple[MissionSnapshot, ...]:
+        """Restart recovery: resume non-terminal admitted work; never rerun terminal missions."""
+        resumed: list[MissionSnapshot] = []
+        for snap in self.store.list_missions():
+            if snap.state in TERMINAL_STATES:
+                continue
+            if snap.state not in AUTONOMOUS_DRIVE_STATES:
+                continue
+            resumed.append(self.drive_until_pause(snap.mission_id))
+        return tuple(resumed)
 
     def get(self, mission_id: str) -> MissionSnapshot:
         snap = self.store.get(mission_id)

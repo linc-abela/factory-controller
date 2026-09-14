@@ -6,7 +6,7 @@ case "${1:-}" in
   # is: the ledger it has to reach is a host path, and the containerised
   # fall-through below would silently open a different one.
   v2) shift || true; exec python3 -m factory_v2 "$@" ;;
-  v2-test) exec python3 -m unittest tests.test_factory_v2_lifecycle tests.test_factory_v2_contracts ;;
+  v2-test) exec python3 -m unittest tests.test_factory_v2_lifecycle tests.test_factory_v2_contracts tests.test_factory_v2_pcp_intake ;;
   factory|release) exec python3 -m factory_controller.cli "$@" ;;
   awe-worker) shift || true; exec python3 -m awe_worker.cli "$@" ;;
   review)

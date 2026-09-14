@@ -6,7 +6,7 @@ This package is the deterministic Factory v2 Controller on branch `factory-v2`.
 Cursor remains a bootstrap tool, not a permanent architecture mandate.
 Long-term target may return to Grok Build. Temporary Factory v2 runtime:
 
-`Laboratory -> approved PCP -> Controller -> Nous Hermes -> Cursor CLI -> Antigravity review + QA -> Verified RC -> Owner Gate -> Antigravity Distribution`
+`Laboratory -> approved PCP event (POST /v1/pcp) -> Controller serve -> Nous Hermes -> Cursor CLI -> Antigravity review + QA -> Verified RC -> Owner Gate -> Antigravity Distribution`
 
 The `EngineeringExecutor` abstraction is unchanged. Grok Build stays present and
 selectable. Do not treat Cursor as permanently mandated.
@@ -24,8 +24,23 @@ canonical names `ADMITTED`, `BUILDING`, `VERIFYING`, `REWORK_REQUIRED`,
 From this repository (Python 3.11+, stdlib only):
 
 ```sh
-python3 -m unittest tests.test_factory_v2_lifecycle tests.test_factory_v2_contracts tests.test_factory_v2_conformance_protocol
+python3 -m unittest tests.test_factory_v2_lifecycle tests.test_factory_v2_contracts tests.test_factory_v2_conformance_protocol tests.test_factory_v2_pcp_intake
 python3 validation/conformance_controller.py --request request.json
+python3 -m factory_v2 serve
+python3 -m factory_v2 --simulated serve --port 8790
+```
+
+Normal Factory v2 path is event-driven intake:
+
+1. `python3 -m factory_v2 serve` (local `127.0.0.1:8790` unless `--port` / `FACTORY_V2_INTAKE_PORT`)
+2. Laboratory/Owner approval submits the canonical PCP to `POST /v1/pcp`
+3. Controller validates Gate 1, admits or returns the existing mission, and starts Engineering automatically (`Nous Hermes` → configured `EngineeringExecutor`)
+
+There is no Vault watcher, cron/polling loop, Notion/AWE/Dispatch runtime, Owner `Process your Queue.`, or second `tick` after a valid PCP event. Restart resumes incomplete admitted missions from the SQLite ledger; terminal `DISTRIBUTED` missions are not rerun.
+
+Diagnostic/recovery CLI remains available and is **not** the normal path:
+
+```sh
 python3 -m factory_v2 admit-pcp path/to/canonical-pcp-handoff.json
 python3 -m factory_v2 --simulated admit-pcp path/to/canonical-pcp-handoff.json
 python3 -m factory_v2 tick msn-<pcp-hash-prefix>

@@ -107,6 +107,13 @@ class Store:
             ).fetchone()
             return None if row is None else self._snapshot(conn, row)
 
+    def list_missions(self) -> tuple[MissionSnapshot, ...]:
+        with self.connect() as conn:
+            rows = conn.execute(
+                "SELECT * FROM missions ORDER BY created_at, mission_id"
+            ).fetchall()
+            return tuple(self._snapshot(conn, row) for row in rows)
+
     def insert_mission(
         self, mission_id: str, lineage_id: str, pcp_hash: str, pcp: dict[str, Any]
     ) -> MissionSnapshot:

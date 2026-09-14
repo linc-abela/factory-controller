@@ -52,33 +52,7 @@ def _controller(*, simulated: bool) -> Controller:
 
 
 def _print(snap) -> None:
-    print(
-        json.dumps(
-            {
-                "mission_id": snap.mission_id,
-                "lineage_id": snap.lineage_id,
-                "state": snap.state.value,
-                "pcp_hash": snap.pcp_hash,
-                "current": None if snap.current is None else snap.current.as_dict(),
-                "approved": None if snap.approved is None else snap.approved.as_dict(),
-                "owner_decision": snap.owner_decision,
-                "blocked_reason": snap.blocked_reason,
-                "attempt_number": snap.attempt_number,
-                "rework_sequence": snap.rework_sequence,
-                "hermes_session_id": snap.hermes_session_id,
-                "candidates": [
-                    {
-                        "candidate": c.identity.as_dict(),
-                        "review": c.review_verdict,
-                        "qa": c.qa_verdict,
-                        "status": c.status,
-                    }
-                    for c in snap.candidates
-                ],
-            },
-            indent=2,
-        )
-    )
+    print(json.dumps(snap.as_status_dict(), indent=2))
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -105,6 +79,16 @@ def main(argv: list[str] | None = None) -> int:
     p_reject.add_argument("--reason", default="")
     p_dist = sub.add_parser("distribute")
     p_dist.add_argument("mission_id")
+    p_serve = sub.add_parser(
+        "serve",
+        help="Local event-driven PCP intake (POST /v1/pcp). Normal V2 path.",
+    )
+    p_serve.add_argument("--host", default="127.0.0.1")
+    p_serve.add_argument(
+        "--port",
+        type=int,
+        default=int(os.environ.get("FACTORY_V2_INTAKE_PORT", "8790")),
+    )
     args = parser.parse_args(argv)
     ctl = _controller(simulated=args.simulated)
     try:
@@ -120,6 +104,14 @@ def main(argv: list[str] | None = None) -> int:
             _print(ctl.owner_decide(args.mission_id, "REJECT", args.reason))
         elif args.cmd == "distribute":
             _print(ctl.distribute(args.mission_id))
+        elif args.cmd == "serve":
+            from factory_v2.serve import serve_forever
+
+            try:
+                serve_forever(ctl, host=args.host, port=args.port)
+            except ValueError as exc:
+                print(f"error: {exc}", file=sys.stderr)
+                return 2
         else:
             parser.error(args.cmd)
     except (GateError, InvariantError, ContractError, KeyError) as exc:

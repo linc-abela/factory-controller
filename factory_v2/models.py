@@ -149,3 +149,27 @@ class MissionSnapshot:
     @property
     def approved_artifact_id(self) -> str | None:
         return None if self.approved is None else self.approved.candidate_id
+
+    def as_status_dict(self) -> dict[str, Any]:
+        return {
+            "mission_id": self.mission_id,
+            "lineage_id": self.lineage_id,
+            "state": self.state.value,
+            "pcp_hash": self.pcp_hash,
+            "current": None if self.current is None else self.current.as_dict(),
+            "approved": None if self.approved is None else self.approved.as_dict(),
+            "owner_decision": self.owner_decision,
+            "blocked_reason": self.blocked_reason,
+            "attempt_number": self.attempt_number,
+            "rework_sequence": self.rework_sequence,
+            "hermes_session_id": self.hermes_session_id,
+            "candidates": [
+                {
+                    "candidate": c.identity.as_dict(),
+                    "review": c.review_verdict,
+                    "qa": c.qa_verdict,
+                    "status": c.status,
+                }
+                for c in self.candidates
+            ],
+        }
