@@ -175,6 +175,107 @@ class CursorCLIExecutorTests(unittest.TestCase):
         self.assertEqual(len(result.candidate.key()), 4)
         self.assertEqual(result.grok_session_ref, "sess-live")
 
+    def test_official_envelope_inner_result_json_binds_candidate(self):
+        candidate = {
+            "candidate_id": "cand-envelope",
+            "source_revision": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "artifact_hash": "sha256:" + "d" * 64,
+            "artifact_uri": "sandbox://msn-cursor-test/hello.txt",
+        }
+        envelope = {
+            "type": "result",
+            "subtype": "success",
+            "is_error": False,
+            "result": json.dumps(candidate),
+            "session_id": "sess-inner",
+        }
+        stdout_path = self.root / "inner-envelope.json"
+        stdout_path.write_text(json.dumps(envelope), encoding="utf-8")
+        _script(
+            self.bin,
+            "agent",
+            "#!/bin/sh\n"
+            "if [ \"$1\" = status ]; then echo 'Logged in as test'; exit 0; fi\n"
+            "if [ \"$1\" = --version ]; then echo '2026.08.11-test'; exit 0; fi\n"
+            f"/bin/cat '{stdout_path}'\n"
+            "exit 0\n",
+        )
+        result = CursorCLIExecutor(env=self.env).implement(_ctx(self.workspace), WORK)
+        self.assertFalse(result.blocked, result.reason)
+        self.assertEqual(result.candidate.candidate_id, "cand-envelope")
+        self.assertEqual(result.candidate.artifact_uri, candidate["artifact_uri"])
+        self.assertEqual(result.grok_session_ref, "sess-inner")
+
+    def test_official_envelope_markdown_json_binds_candidate(self):
+        candidate = {
+            "candidate_id": "cand-markdown",
+            "source_revision": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "artifact_hash": "sha256:" + "e" * 64,
+            "artifact_uri": "sandbox://msn-cursor-test/hello.txt",
+        }
+        envelope = {
+            "type": "result",
+            "subtype": "success",
+            "is_error": False,
+            "result": "wrote hello.txt\n```json\n" + json.dumps(candidate) + "\n```",
+            "session_id": "sess-md",
+        }
+        stdout_path = self.root / "markdown-envelope.json"
+        stdout_path.write_text(json.dumps(envelope), encoding="utf-8")
+        _script(
+            self.bin,
+            "agent",
+            "#!/bin/sh\n"
+            "if [ \"$1\" = status ]; then echo 'Logged in as test'; exit 0; fi\n"
+            "if [ \"$1\" = --version ]; then echo '2026.08.11-test'; exit 0; fi\n"
+            f"/bin/cat '{stdout_path}'\n"
+            "exit 0\n",
+        )
+        result = CursorCLIExecutor(env=self.env).implement(_ctx(self.workspace), WORK)
+        self.assertFalse(result.blocked, result.reason)
+        self.assertEqual(result.candidate.candidate_id, "cand-markdown")
+        self.assertEqual(len(result.candidate.key()), 4)
+
+    def test_preexisting_artifact_success_envelope_binds_identity(self):
+        (self.workspace / "hello.txt").write_text("hello\n", encoding="utf-8")
+        envelope = {
+            "type": "result",
+            "subtype": "success",
+            "is_error": False,
+            "result": "hello.txt already satisfies the objective",
+            "session_id": "sess-preexisting",
+        }
+        _script(
+            self.bin,
+            "agent",
+            "#!/bin/sh\n"
+            "if [ \"$1\" = status ]; then echo 'Logged in as test'; exit 0; fi\n"
+            "if [ \"$1\" = --version ]; then echo '2026.08.11-test'; exit 0; fi\n"
+            f"echo '{json.dumps(envelope)}'\n"
+            "exit 0\n",
+        )
+        result = CursorCLIExecutor(env=self.env).implement(_ctx(self.workspace), WORK)
+        self.assertFalse(result.blocked, result.reason)
+        self.assertTrue(result.candidate.artifact_uri.endswith("hello.txt"))
+        self.assertEqual(len(result.candidate.key()), 4)
+        self.assertEqual(result.grok_session_ref, "sess-preexisting")
+        self.assertEqual((self.workspace / "hello.txt").read_text(encoding="utf-8"), "hello\n")
+
+    def test_malformed_result_with_stale_workspace_fails_closed(self):
+        (self.workspace / "hello.txt").write_text("hello\n", encoding="utf-8")
+        _script(
+            self.bin,
+            "agent",
+            "#!/bin/sh\n"
+            "if [ \"$1\" = status ]; then echo 'Logged in as test'; exit 0; fi\n"
+            "if [ \"$1\" = --version ]; then echo '2026.08.11-test'; exit 0; fi\n"
+            "echo not-json\n"
+            "exit 0\n",
+        )
+        result = CursorCLIExecutor(env=self.env).implement(_ctx(self.workspace), WORK)
+        self.assertTrue(result.blocked)
+        self.assertIn("no structured candidate", result.reason)
+
     def test_default_selection_is_cursor_and_grok_remains_selectable(self):
         env = dict(self.env)
         env.pop("FACTORY_V2_ENGINEERING_EXECUTOR", None)

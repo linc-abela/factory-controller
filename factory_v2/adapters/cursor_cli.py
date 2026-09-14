@@ -3,12 +3,16 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import re
 import shutil
 import subprocess
 from pathlib import Path
 
 from factory_v2.canonical import revision_for
 from factory_v2.models import CandidateIdentity, ExecutorResult, MissionContext, WorkItem
+
+_CANDIDATE_KEYS = ("candidate_id", "source_revision", "artifact_hash", "artifact_uri")
+_JSON_FENCE = re.compile(r"```(?:json)?\s*(.*?)\s*```", re.DOTALL)
 
 
 class CursorCLIExecutor:
@@ -104,9 +108,7 @@ class CursorCLIExecutor:
         parsed = _parse_candidate(proc.stdout)
         if parsed is None:
             after = _workspace_fingerprint(workspace)
-            if after == before:
-                return self._blocked("cursor cli returned no structured candidate result")
-            parsed = _identity_from_workspace(workspace, after)
+            parsed = _fallback_identity(workspace, before, after, envelope)
         if parsed is None:
             return self._blocked("cursor cli returned no structured candidate result")
         session_ref = ""
@@ -258,19 +260,96 @@ def _identity_from_workspace(workspace: Path, fingerprint: dict[str, str]) -> Ca
     )
 
 
-def _parse_candidate(stdout: str) -> CandidateIdentity | None:
-    data = _load_json_object(stdout)
-    if data is None:
+def _invocation_local_fingerprint(before: dict[str, str], after: dict[str, str]) -> dict[str, str]:
+    return {
+        name: digest
+        for name, digest in after.items()
+        if before.get(name) != digest
+    }
+
+
+def _fallback_identity(
+    workspace: Path,
+    before: dict[str, str],
+    after: dict[str, str],
+    envelope: dict | None,
+) -> CandidateIdentity | None:
+    if not after:
         return None
+    if _invocation_local_fingerprint(before, after):
+        return _identity_from_workspace(workspace, after)
+    if envelope is not None and envelope.get("is_error") is not True:
+        return _identity_from_workspace(workspace, after)
+    return None
+
+
+def _candidate_from_mapping(data: dict) -> CandidateIdentity | None:
     cand = data.get("candidate") if isinstance(data.get("candidate"), dict) else data
-    keys = ("candidate_id", "source_revision", "artifact_hash", "artifact_uri")
-    if all(isinstance(cand.get(k), str) and cand.get(k) for k in keys):
+    if not isinstance(cand, dict):
+        return None
+    if all(isinstance(cand.get(key), str) and cand.get(key).strip() for key in _CANDIDATE_KEYS):
         return CandidateIdentity(
             candidate_id=cand["candidate_id"],
             source_revision=cand["source_revision"],
             artifact_hash=cand["artifact_hash"],
             artifact_uri=cand["artifact_uri"],
         )
+    return None
+
+
+def _objects_from_text(text: str):
+    stripped = text.strip()
+    if not stripped:
+        return
+    loaded = _load_json_object(stripped)
+    if loaded is not None:
+        yield loaded
+    for match in _JSON_FENCE.finditer(stripped):
+        fenced = _load_json_object(match.group(1))
+        if fenced is not None:
+            yield fenced
+
+
+def _candidate_from_fields(text: str) -> CandidateIdentity | None:
+    values: dict[str, str] = {}
+    for key in _CANDIDATE_KEYS:
+        match = re.search(rf'"{key}"\s*:\s*"([^"]+)"', text)
+        if match is None:
+            return None
+        values[key] = match.group(1)
+    return CandidateIdentity(
+        candidate_id=values["candidate_id"],
+        source_revision=values["source_revision"],
+        artifact_hash=values["artifact_hash"],
+        artifact_uri=values["artifact_uri"],
+    )
+
+
+def _candidate_from_text(text: str) -> CandidateIdentity | None:
+    for obj in _objects_from_text(text):
+        found = _candidate_from_mapping(obj)
+        if found is not None:
+            return found
+    return _candidate_from_fields(text)
+
+
+def _parse_candidate(stdout: str) -> CandidateIdentity | None:
+    data = _load_json_object(stdout)
+    if data is None:
+        return _candidate_from_text(stdout)
+    found = _candidate_from_mapping(data)
+    if found is not None:
+        return found
+    inner = data.get("result")
+    if isinstance(inner, dict):
+        found = _candidate_from_mapping(inner)
+        if found is not None:
+            return found
+        nested = inner.get("result")
+        if isinstance(nested, str):
+            return _candidate_from_text(nested)
+    if isinstance(inner, str):
+        return _candidate_from_text(inner)
     return None
 
 
