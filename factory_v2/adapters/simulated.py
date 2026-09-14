@@ -67,30 +67,48 @@ class ScriptedHermes:
 
     def run_campaign(self, ctx: MissionContext) -> EngineeringResult:
         self.calls.append(ctx)
-        work = WorkItem(
-            objective=ctx.pcp.get("product", {}).get("objective") or "implement admitted PCP",
-            defects=ctx.defects,
-        )
-        executed = self.executor.implement(ctx, work)
+        from factory_v2.adapters.hermes import derive_campaign_plan
+
+        plan = derive_campaign_plan(ctx)
+        total = len(plan)
+        last_result = None
         session = ctx.hermes_session_id or f"hermes-{ctx.mission_id}"
-        if executed.blocked or executed.candidate is None:
-            return EngineeringResult(
-                blocked=True,
-                reason=executed.reason or "executor blocked",
-                harness_mode=executed.harness_mode,
-                manager_name=self.name,
-                executor_name=self.executor.name,
-                executor_called=True,
-                hermes_session_id=session,
+
+        for idx, item in enumerate(plan, 1):
+            item_with_idx = WorkItem(
+                objective=item.objective,
+                defects=item.defects,
+                item_id=item.item_id or f"item-{idx}",
+                index=idx,
+                total=total,
             )
+            if ctx.progress_callback is not None:
+                ctx.progress_callback(
+                    f"engineering:item_{idx}_of_{total}",
+                    item_with_idx.as_dict(),
+                )
+            executed = self.executor.implement(ctx, item_with_idx)
+            if executed.blocked or executed.candidate is None:
+                return EngineeringResult(
+                    blocked=True,
+                    reason=executed.reason or f"executor blocked on work item {idx}/{total}",
+                    harness_mode=executed.harness_mode,
+                    manager_name=self.name,
+                    executor_name=self.executor.name,
+                    executor_called=True,
+                    hermes_session_id=session,
+                )
+            last_result = executed
+
         return EngineeringResult(
-            candidate=executed.candidate,
+            candidate=last_result.candidate,
             hermes_session_id=session,
-            grok_session_ref=executed.grok_session_ref,
+            grok_session_ref=last_result.grok_session_ref,
             harness_mode="simulated",
             manager_name=self.name,
             executor_name=self.executor.name,
             executor_called=True,
+            engineering_tests=last_result.engineering_tests,
         )
 
 

@@ -116,6 +116,9 @@ class Controller:
             resumed.append(self.drive_until_pause(snap.mission_id))
         return tuple(resumed)
 
+    def list_missions(self) -> tuple[MissionSnapshot, ...]:
+        return self.store.list_missions()
+
     def get(self, mission_id: str) -> MissionSnapshot:
         snap = self.store.get(mission_id)
         if snap is None:
@@ -258,15 +261,32 @@ class Controller:
             hermes_session_id=snap.hermes_session_id,
             defects=tuple(defects),
             current=snap.current,
+            progress_callback=lambda stage, item: self.store.record_progress(
+                snap.mission_id, active_stage=stage, current_work_item=item
+            ),
         )
 
     def _engineer(self, snap: MissionSnapshot) -> MissionSnapshot:
+        # Crucial: record ENGINEERING state in durable ledger before launching Hermes/executor
+        if snap.state is not MissionState.ENGINEERING:
+            snap = self.store.apply_state(
+                snap.mission_id,
+                MissionState.ENGINEERING,
+                active_stage="engineering",
+                event_kind="engineering_started",
+                payload={
+                    "attempt_number": snap.attempt_number,
+                    "rework_sequence": snap.rework_sequence,
+                },
+            )
+            emit_engineering_mission(self._ws(snap), snap)
         ctx = self._context(snap)
         result = self.manager.run_campaign(ctx)
         if result.blocked or result.candidate is None:
-            return self.store.apply_state(
+            snap = self.store.apply_state(
                 snap.mission_id,
                 MissionState.BLOCKED,
+                active_stage="blocked",
                 blocked_reason=result.reason or "engineering blocked",
                 event_kind="engineering_blocked",
                 payload={
@@ -277,6 +297,8 @@ class Controller:
                     "executor_called": result.executor_called,
                 },
             )
+            emit_engineering_mission(self._ws(snap), snap)
+            return snap
         if not result.executor_called:
             raise InvariantError(
                 "Engineering Manager must delegate coding through the EngineeringExecutor"
@@ -357,6 +379,8 @@ class Controller:
         return self.store.apply_state(
             snap.mission_id,
             MissionState.ENGINEERING,
+            active_stage="engineering",
+            clear_work_item=True,
             event_kind=kind,
             payload={
                 "candidate": verdict.candidate.as_dict(),

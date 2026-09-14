@@ -23,8 +23,21 @@ class AntigravityVerifier:
     def qa(self, ctx: MissionContext, candidate: CandidateIdentity) -> Verdict:
         return self._run("qa", ctx, candidate)
 
+    def _find_binary(self) -> str | None:
+        explicit = self._env.get("FACTORY_V2_ANTIGRAVITY_BIN")
+        if explicit and os.path.isfile(explicit) and os.access(explicit, os.X_OK):
+            return explicit
+        found = shutil.which(self._binary, path=self._env.get("PATH"))
+        if found is not None:
+            return found
+        from pathlib import Path
+        repo_bin = Path(__file__).resolve().parents[2] / "bin" / self._binary
+        if repo_bin.is_file() and os.access(repo_bin, os.X_OK):
+            return str(repo_bin)
+        return None
+
     def _run(self, kind: str, ctx: MissionContext, candidate: CandidateIdentity) -> Verdict:
-        binary = shutil.which(self._binary, path=self._env.get("PATH"))
+        binary = self._find_binary()
         identity = "antigravity:reviewer-1" if kind == "review" else "antigravity:qa-1"
         if binary is None:
             return Verdict(
@@ -97,10 +110,23 @@ class AntigravityDistributor:
         self._env = env if env is not None else dict(os.environ)
         self._binary = binary
 
+    def _find_binary(self) -> str | None:
+        explicit = self._env.get("FACTORY_V2_ANTIGRAVITY_BIN")
+        if explicit and os.path.isfile(explicit) and os.access(explicit, os.X_OK):
+            return explicit
+        found = shutil.which(self._binary, path=self._env.get("PATH"))
+        if found is not None:
+            return found
+        from pathlib import Path
+        repo_bin = Path(__file__).resolve().parents[2] / "bin" / self._binary
+        if repo_bin.is_file() and os.access(repo_bin, os.X_OK):
+            return str(repo_bin)
+        return None
+
     def distribute(
         self, candidate: CandidateIdentity, mission_id: str
     ) -> DistributionResult:
-        binary = shutil.which(self._binary, path=self._env.get("PATH"))
+        binary = self._find_binary()
         if binary is None:
             raise RuntimeError("antigravity production binary unavailable")
         proc = subprocess.run(

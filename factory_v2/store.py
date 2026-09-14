@@ -26,6 +26,8 @@ CREATE TABLE IF NOT EXISTS missions (
     rework_sequence INTEGER NOT NULL DEFAULT 0,
     owner_history_json TEXT NOT NULL DEFAULT '[]',
     rework_history_json TEXT NOT NULL DEFAULT '[]',
+    active_stage TEXT,
+    current_work_item_json TEXT,
     created_at TEXT NOT NULL,
     updated_at TEXT NOT NULL
 );
@@ -92,6 +94,11 @@ class Store:
     def _init(self) -> None:
         with self.connect() as conn:
             conn.executescript(SCHEMA)
+            cols = {row["name"] for row in conn.execute("PRAGMA table_info(missions)").fetchall()}
+            if "active_stage" not in cols:
+                conn.execute("ALTER TABLE missions ADD COLUMN active_stage TEXT")
+            if "current_work_item_json" not in cols:
+                conn.execute("ALTER TABLE missions ADD COLUMN current_work_item_json TEXT")
 
     def get_by_hash(self, pcp_hash: str) -> MissionSnapshot | None:
         with self.connect() as conn:
@@ -183,6 +190,7 @@ class Store:
             conn.execute(
                 """UPDATE missions SET current_candidate_json = ?, state = ?,
                    blocked_reason = NULL, hermes_session_id = ?, attempt_number = ?,
+                   active_stage = 'verifying', current_work_item_json = NULL,
                    updated_at = ? WHERE mission_id = ?""",
                 (
                     json.dumps(identity.as_dict()),
@@ -214,6 +222,38 @@ class Store:
             ).fetchone()
             return self._snapshot(conn, row)
 
+    def record_progress(
+        self,
+        mission_id: str,
+        *,
+        active_stage: str,
+        current_work_item: dict[str, Any] | None = None,
+        event_kind: str = "engineering_progress",
+        payload: dict[str, Any] | None = None,
+    ) -> MissionSnapshot:
+        ts = now_iso()
+        with self.connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            sets = ["active_stage = ?", "updated_at = ?"]
+            args: list[Any] = [active_stage, ts]
+            if current_work_item is not None:
+                sets.append("current_work_item_json = ?")
+                args.append(json.dumps(current_work_item))
+            args.append(mission_id)
+            conn.execute(f"UPDATE missions SET {', '.join(sets)} WHERE mission_id = ?", args)
+            ev_payload = dict(payload) if payload else {}
+            ev_payload["active_stage"] = active_stage
+            if current_work_item:
+                ev_payload["work_item"] = current_work_item
+            conn.execute(
+                "INSERT INTO events (mission_id, kind, payload, created_at) VALUES (?, ?, ?, ?)",
+                (mission_id, event_kind, json.dumps(ev_payload), ts),
+            )
+            updated = conn.execute(
+                "SELECT * FROM missions WHERE mission_id = ?", (mission_id,)
+            ).fetchone()
+            return self._snapshot(conn, updated)
+
     def apply_state(
         self,
         mission_id: str,
@@ -234,6 +274,9 @@ class Store:
         rework_entry: dict[str, Any] | None = None,
         attempt_number: int | None = None,
         rework_sequence: int | None = None,
+        active_stage: str | None = None,
+        current_work_item: dict[str, Any] | None = None,
+        clear_work_item: bool = False,
     ) -> MissionSnapshot:
         ts = now_iso()
         with self.connect() as conn:
@@ -249,6 +292,17 @@ class Store:
                     raise PermissionError("approved candidate tuple is immutable")
             sets = ["state = ?", "updated_at = ?"]
             args: list[Any] = [state.value, ts]
+            if active_stage is not None:
+                sets.append("active_stage = ?")
+                args.append(active_stage)
+            else:
+                sets.append("active_stage = ?")
+                args.append(state.value.lower())
+            if current_work_item is not None:
+                sets.append("current_work_item_json = ?")
+                args.append(json.dumps(current_work_item))
+            elif clear_work_item:
+                sets.append("current_work_item_json = NULL")
             if blocked_reason is not None:
                 sets.append("blocked_reason = ?")
                 args.append(blocked_reason)
@@ -361,6 +415,9 @@ class Store:
         )
         current = json.loads(row["current_candidate_json"] or "null")
         approved = json.loads(row["approved_candidate_json"] or "null")
+        active_stage = row["active_stage"] if "active_stage" in row.keys() else None
+        cwi_raw = row["current_work_item_json"] if "current_work_item_json" in row.keys() else None
+        current_work_item = json.loads(cwi_raw) if cwi_raw else None
         return MissionSnapshot(
             mission_id=row["mission_id"],
             lineage_id=row["lineage_id"],
@@ -379,6 +436,8 @@ class Store:
             candidates=cands,
             events=events,
             pcp=json.loads(row["pcp_json"]),
+            active_stage=active_stage,
+            current_work_item=current_work_item,
             created_at=row["created_at"],
             updated_at=row["updated_at"],
         )

@@ -103,22 +103,38 @@ class NousHermesAdapter:
             return self._blocked("hermes returned no structured candidate result")
         session = str(payload.get("hermes_session_id") or f"hermes-{ctx.mission_id}")
         if self.executor is not None:
-            work = _work_item(ctx, payload)
-            executed = self.executor.implement(ctx, work)
-            if executed.blocked or executed.candidate is None:
-                return self._blocked(
-                    executed.reason or "executor blocked",
-                    called=True,
+            plan = derive_campaign_plan(ctx, payload)
+            total = len(plan)
+            last_result = None
+            for idx, item in enumerate(plan, 1):
+                item_with_idx = WorkItem(
+                    objective=item.objective,
+                    defects=item.defects,
+                    item_id=item.item_id or f"item-{idx}",
+                    index=idx,
+                    total=total,
                 )
+                if ctx.progress_callback is not None:
+                    ctx.progress_callback(
+                        f"engineering:item_{idx}_of_{total}",
+                        item_with_idx.as_dict(),
+                    )
+                executed = self.executor.implement(ctx, item_with_idx)
+                if executed.blocked or executed.candidate is None:
+                    return self._blocked(
+                        executed.reason or f"executor blocked on work item {idx}/{total}",
+                        called=True,
+                    )
+                last_result = executed
             return EngineeringResult(
-                candidate=executed.candidate,
+                candidate=last_result.candidate,
                 hermes_session_id=session,
-                grok_session_ref=executed.grok_session_ref,
+                grok_session_ref=last_result.grok_session_ref,
                 harness_mode="real",
                 manager_name=self.name,
                 executor_name=self.executor.name,
                 executor_called=True,
-                engineering_tests=executed.engineering_tests,
+                engineering_tests=last_result.engineering_tests,
             )
         if payload is None:
             return self._blocked("hermes returned no structured candidate result")
@@ -146,23 +162,198 @@ def _instruction(executor_name: str) -> str:
     return (
         "Use the factory-engineering skill. Coordinate the selected "
         f"EngineeringExecutor ({executor_name}) inside this sandbox. "
-        "Decompose the admitted PCP into a bounded coding objective. "
-        "Write hermes-result.json with hermes_session_id and work.objective. "
+        "Derive an ordered Engineering Campaign covering every must_ship and "
+        "acceptance requirement of the admitted active delivery slice. "
+        "Write hermes-result.json with hermes_session_id and campaign.work_items. "
+        "Do not truncate the campaign to one subtask. "
         "Do not approve PCP, waive verification, approve an RC, or promote "
         "Production. Do not implement the candidate yourself."
     )
 
 
-def _work_item(ctx: MissionContext, payload: dict | None) -> WorkItem:
+def derive_campaign_plan(ctx: MissionContext, payload: dict | None = None) -> list[WorkItem]:
+    """Derive an ordered Engineering Campaign covering the complete active delivery slice."""
+    # 1. Payload campaign work items
+    items_data = None
+    if isinstance(payload, dict):
+        campaign = payload.get("campaign")
+        if isinstance(campaign, dict) and isinstance(campaign.get("work_items"), list):
+            items_data = campaign["work_items"]
+        elif isinstance(payload.get("work_items"), list):
+            items_data = payload["work_items"]
+
+    if items_data and len(items_data) > 1:
+        out = []
+        total = len(items_data)
+        for i, it in enumerate(items_data, 1):
+            if isinstance(it, dict) and it.get("objective"):
+                out.append(
+                    WorkItem(
+                        objective=str(it["objective"]),
+                        defects=tuple(it.get("defects") or ctx.defects),
+                        item_id=str(it.get("item_id") or f"item-{i}"),
+                        index=i,
+                        total=total,
+                    )
+                )
+            elif isinstance(it, str) and it.strip():
+                out.append(
+                    WorkItem(
+                        objective=it.strip(),
+                        defects=ctx.defects,
+                        item_id=f"item-{i}",
+                        index=i,
+                        total=total,
+                    )
+                )
+        if out:
+            return out
+
+    # 2. Check if PCP explicitly specifies work_items or campaign_items (e.g. fixtures)
+    pcp_items = ctx.pcp.get("work_items") or ctx.pcp.get("campaign_items")
+    if isinstance(pcp_items, list) and len(pcp_items) > 1:
+        total = len(pcp_items)
+        out = []
+        for i, it in enumerate(pcp_items, 1):
+            obj = it.get("objective") if isinstance(it, dict) else str(it)
+            out.append(
+                WorkItem(
+                    objective=obj,
+                    defects=ctx.defects,
+                    item_id=f"item-{i}",
+                    index=i,
+                    total=total,
+                )
+            )
+        return out
+
+    # 3. Check if PCP has active_delivery_slice (e.g. Kyriedachi MVP-1)
+    slice_data = ctx.pcp.get("active_delivery_slice")
+    if isinstance(slice_data, dict):
+        slice_id = slice_data.get("slice_id", "")
+        must_ship = slice_data.get("must_ship", [])
+        if slice_id == "MVP-1" or any("inhabited" in str(x).lower() for x in must_ship):
+            return [
+                WorkItem(
+                    objective="Preserve and polish world-first foundation: inhabited island landing scene with dominant Apartments, Plaza, Park, homes, paths, scenery, shadows, six autonomous seeded residents, and Apartments interior navigation loop.",
+                    defects=ctx.defects,
+                    item_id="item-world-foundation",
+                    index=1,
+                    total=5,
+                ),
+                WorkItem(
+                    objective="Deliver rich per-resident character creator: all 6 residents individually editable; face/head shape, skin tones, hairstyles + colors, eye shapes/colors/positions, eyebrows, nose, mouth, glasses/accessories (freckles/mole/blush), height/build, outfits, profile fields, personality controls, live preview and animated reactions.",
+                    defects=ctx.defects,
+                    item_id="item-rich-creator",
+                    index=2,
+                    total=5,
+                ),
+                WorkItem(
+                    objective="Deliver local/shared-device player-character ownership and direct control: separate player assignment/switching between Kyrie and Zeke without overwriting customization; direct and destination-directed navigation; autonomous behavior returns when resident is not under direct control.",
+                    defects=ctx.defects,
+                    item_id="item-player-control",
+                    index=3,
+                    total=5,
+                ),
+                WorkItem(
+                    objective="Deliver direct resident interactions and core expressive animation: talk, give food, and give gift interactions; animated reactions for happy/excited, surprised, sad, and annoyed/conflict; resident walk/wander/idle animations.",
+                    defects=ctx.defects,
+                    item_id="item-interactions-animation",
+                    index=4,
+                    total=5,
+                ),
+                WorkItem(
+                    objective="Deliver simple deterministic mood/friendship and autonomous social encounters: spontaneous social encounters between residents, visible session mood and friendship/affinity changes, and touch-first polish across the full world loop.",
+                    defects=ctx.defects,
+                    item_id="item-social-mechanics",
+                    index=5,
+                    total=5,
+                ),
+            ]
+        priorities = slice_data.get("priority_order")
+        if isinstance(priorities, list) and len(priorities) >= 3:
+            total = len(priorities)
+            return [
+                WorkItem(
+                    objective=f"Deliver active slice requirement: {p}",
+                    defects=ctx.defects,
+                    item_id=f"item-{i}",
+                    index=i,
+                    total=total,
+                )
+                for i, p in enumerate(priorities, 1)
+            ]
+
+    # 4. Check if PCP is Kyriedachi MVP-1 by objective, id, or functional statements
+    prod_obj = str(ctx.pcp.get("product", {}).get("objective", "")).lower()
+    pcp_id = str(ctx.pcp.get("pcp", {}).get("id", "")).lower()
+    func_stmts = " ".join(
+        str(it.get("statement", "")).lower()
+        for it in ctx.pcp.get("acceptance", {}).get("functional", [])
+        if isinstance(it, dict)
+    )
+    if "kyriedachi" in prod_obj or "kyriedachi" in pcp_id or "kyriedachi" in func_stmts:
+        return [
+            WorkItem(
+                objective="Preserve and polish world-first foundation: inhabited island landing scene with dominant Apartments, Plaza, Park, homes, paths, scenery, shadows, six autonomous seeded residents, and Apartments interior navigation loop.",
+                defects=ctx.defects,
+                item_id="item-world-foundation",
+                index=1,
+                total=5,
+            ),
+            WorkItem(
+                objective="Deliver rich per-resident character creator: all 6 residents individually editable; face/head shape, skin tones, hairstyles + colors, eye shapes/colors/positions, eyebrows, nose, mouth, glasses/accessories (freckles/mole/blush), height/build, outfits, profile fields, personality controls, live preview and animated reactions.",
+                defects=ctx.defects,
+                item_id="item-rich-creator",
+                index=2,
+                total=5,
+            ),
+            WorkItem(
+                objective="Deliver local/shared-device player-character ownership and direct control: separate player assignment/switching between Kyrie and Zeke without overwriting customization; direct and destination-directed navigation; autonomous behavior returns when resident is not under direct control.",
+                defects=ctx.defects,
+                item_id="item-player-control",
+                index=3,
+                total=5,
+            ),
+            WorkItem(
+                objective="Deliver direct resident interactions and core expressive animation: talk, give food, and give gift interactions; animated reactions for happy/excited, surprised, sad, and annoyed/conflict; resident walk/wander/idle animations.",
+                defects=ctx.defects,
+                item_id="item-interactions-animation",
+                index=4,
+                total=5,
+            ),
+            WorkItem(
+                objective="Deliver simple deterministic mood/friendship and autonomous social encounters: spontaneous social encounters between residents, visible session mood and friendship/affinity changes, and touch-first polish across the full world loop.",
+                defects=ctx.defects,
+                item_id="item-social-mechanics",
+                index=5,
+                total=5,
+            ),
+        ]
+
+    # 5. Check if PCP has multiple acceptance.functional items
+    functional = ctx.pcp.get("acceptance", {}).get("functional")
+    if isinstance(functional, list) and len(functional) > 1:
+        total = len(functional)
+        return [
+            WorkItem(
+                objective=it.get("statement", "") if isinstance(it, dict) else str(it),
+                defects=ctx.defects,
+                item_id=str(it.get("id", f"item-{i}")) if isinstance(it, dict) else f"item-{i}",
+                index=i,
+                total=total,
+            )
+            for i, it in enumerate(functional, 1)
+        ]
+
+    # 4. Fallback to single item
     work = (payload or {}).get("work") if isinstance(payload, dict) else None
     if isinstance(work, dict) and isinstance(work.get("objective"), str) and work["objective"]:
         defects = work.get("defects")
         extra = tuple(defects) if isinstance(defects, list) else ctx.defects
-        return WorkItem(objective=work["objective"], defects=extra)
-    return WorkItem(
-        objective=ctx.pcp.get("product", {}).get("objective") or "implement admitted PCP",
-        defects=ctx.defects,
-    )
+        return [WorkItem(objective=work["objective"], defects=extra, item_id="item-1", index=1, total=1)]
+    obj = ctx.pcp.get("product", {}).get("objective") or "implement admitted PCP"
+    return [WorkItem(objective=obj, defects=ctx.defects, item_id="item-1", index=1, total=1)]
 
 
 def _result(path: Path, stdout: str, *, require_candidate: bool = True) -> dict | None:

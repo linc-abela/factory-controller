@@ -31,9 +31,23 @@ class IntakeHandler(BaseHTTPRequestHandler):
         del format, args
 
     def do_GET(self) -> None:
-        if self.path.rstrip("/") == "/health":
+        path = self.path.rstrip("/")
+        if path == "/health":
             self._json(200, {"ok": True})
             return
+        if path == "/v1/status":
+            missions = self.server.controller.list_missions()
+            self._json(200, {"missions": [m.as_status_dict() for m in missions]})
+            return
+        if path.startswith("/v1/status/"):
+            mission_id = path[len("/v1/status/"):]
+            try:
+                snap = self.server.controller.get(mission_id)
+                self._json(200, snap.as_status_dict())
+                return
+            except KeyError:
+                self._json(404, {"error": f"mission {mission_id!r} not found", "code": "MISSION_NOT_FOUND"})
+                return
         self._json(404, {"error": "not found"})
 
     def do_POST(self) -> None:
