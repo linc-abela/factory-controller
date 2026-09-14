@@ -173,7 +173,20 @@ class Store:
                 """INSERT INTO candidates (
                     candidate_id, mission_id, source_revision, artifact_hash, artifact_uri,
                     sequence, attempt_id, hermes_session_id, grok_session_ref, status, created_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'produced', ?)""",
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'produced', ?)
+                ON CONFLICT(candidate_id) DO UPDATE SET
+                    mission_id = excluded.mission_id,
+                    source_revision = excluded.source_revision,
+                    artifact_hash = excluded.artifact_hash,
+                    artifact_uri = excluded.artifact_uri,
+                    sequence = excluded.sequence,
+                    attempt_id = excluded.attempt_id,
+                    hermes_session_id = excluded.hermes_session_id,
+                    grok_session_ref = excluded.grok_session_ref,
+                    status = 'produced',
+                    review_verdict = 'none',
+                    qa_verdict = 'none',
+                    created_at = excluded.created_at""",
                 (
                     identity.candidate_id,
                     mission_id,
