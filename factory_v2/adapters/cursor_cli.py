@@ -86,6 +86,7 @@ class CursorCLIExecutor:
             "--workspace",
             str(workspace),
             "--trust",
+            "--force",
             "--sandbox",
             "enabled",
             "--model",

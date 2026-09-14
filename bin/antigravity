@@ -86,7 +86,7 @@ def check_kyriedachi_mvp1(workspace: Path) -> tuple[bool, list[str]]:
         "skin",
         "hair",
         "eye",
-        "eyebrow",
+        "brow",
         "mouth",
         "outfit",
         "personality",
