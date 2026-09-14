@@ -111,6 +111,10 @@ def main() -> int:
         )
         return 2
     pcp = json.loads(fixture_path("valid-approved-pcp.json").read_text(encoding="utf-8"))
+    pcp["product"]["objective"] = (
+        "Create hello.txt in the bounded workspace containing exactly the text hello."
+    )
+    pcp["product"]["user_outcome"] = "hello.txt exists and contains hello."
     port = _free_port()
     with tempfile.TemporaryDirectory(prefix="sfv2-006-pcp-intake-") as raw:
         home = Path(raw)
