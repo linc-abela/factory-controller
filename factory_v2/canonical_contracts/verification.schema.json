@@ -1,0 +1,75 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "factory-v2/contracts/verification.schema.json",
+  "title": "Factory v2 independent verification result",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "contract_type",
+    "contract_version",
+    "mission_id",
+    "candidate",
+    "code_review",
+    "qa_e2e",
+    "result",
+    "blocking_defects",
+    "evidence"
+  ],
+  "properties": {
+    "contract_type": { "const": "factory.v2.verification" },
+    "contract_version": { "const": "1.0.0" },
+    "mission_id": { "$ref": "#/$defs/identifier" },
+    "candidate": { "$ref": "#/$defs/candidate" },
+    "code_review": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["kind", "verdict", "candidate", "verifier", "evidence"],
+      "properties": {
+        "kind": { "const": "adversarial_code_security_invariant" },
+        "verdict": { "enum": ["PASS", "FAIL"] },
+        "candidate": { "$ref": "#/$defs/candidate" },
+        "verifier": { "$ref": "#/$defs/verifier" },
+        "evidence": {
+          "type": "array",
+          "minItems": 1,
+          "items": { "$ref": "#/$defs/evidence_ref" }
+        }
+      }
+    },
+    "qa_e2e": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["kind", "verdict", "candidate", "verifier", "evidence"],
+      "properties": {
+        "kind": { "const": "qa_regression_e2e" },
+        "verdict": { "enum": ["PASS", "FAIL"] },
+        "candidate": { "$ref": "#/$defs/candidate" },
+        "verifier": { "$ref": "#/$defs/verifier" },
+        "evidence": {
+          "type": "array",
+          "minItems": 1,
+          "items": { "$ref": "#/$defs/evidence_ref" }
+        }
+      }
+    },
+    "result": { "enum": ["PASS", "FAIL"] },
+    "blocking_defects": {
+      "type": "array",
+      "items": { "$ref": "#/$defs/defect" }
+    },
+    "evidence": {
+      "type": "array",
+      "minItems": 1,
+      "items": { "$ref": "#/$defs/evidence_ref" }
+    }
+  },
+  "$defs": {
+    "identifier": { "$ref": "common.schema.json#/$defs/identifier" },
+    "revision": { "$ref": "common.schema.json#/$defs/revision" },
+    "content_hash": { "$ref": "common.schema.json#/$defs/content_hash" },
+    "evidence_ref": { "$ref": "common.schema.json#/$defs/evidence_ref" },
+    "candidate": { "$ref": "common.schema.json#/$defs/candidate" },
+    "defect": { "$ref": "common.schema.json#/$defs/defect" },
+    "verifier": { "$ref": "common.schema.json#/$defs/verifier" }
+  }
+}

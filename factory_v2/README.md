@@ -1,0 +1,126 @@
+# Software Factory v2 Controller — runbook
+
+Status: **bootstrap spine, not production-ready.**
+
+This package is the deterministic Factory v2 Controller on branch `factory-v2`.
+Cursor remains a bootstrap tool, not a permanent architecture mandate.
+Long-term target may return to Grok Build. Temporary Factory v2 runtime:
+
+`Laboratory -> approved PCP event (POST /v1/pcp) -> Controller serve -> Nous Hermes -> Cursor CLI -> Antigravity review + QA -> Verified RC -> Owner Gate -> Antigravity Distribution`
+
+The `EngineeringExecutor` abstraction is unchanged. Grok Build stays present and
+selectable. Do not treat Cursor as permanently mandated.
+
+Canonical contracts consumed (not edited): SFV2-002
+`factory-vault` PR #75 head `727882072a382f3146654d3fdb2b9b18bea19825`, snapshotted at
+`factory_v2/canonical_contracts/`. Override with `FACTORY_V2_CONTRACTS_DIR`.
+
+Internal states stay `PCP_APPROVED` … `DISTRIBUTED`. Emitted contracts use the
+canonical names `ADMITTED`, `BUILDING`, `VERIFYING`, `REWORK_REQUIRED`,
+`OWNER_REVIEW`, `DISTRIBUTION_READY`, `CLOSED`. See `factory_v2/canonical.py`.
+
+## Run
+
+From this repository (Python 3.11+, stdlib only):
+
+```sh
+python3 -m unittest tests.test_factory_v2_lifecycle tests.test_factory_v2_contracts tests.test_factory_v2_conformance_protocol tests.test_factory_v2_pcp_intake
+python3 validation/conformance_controller.py --request request.json
+python3 -m factory_v2 serve
+python3 -m factory_v2 --simulated serve --port 8790
+```
+
+Normal Factory v2 path is event-driven intake:
+
+1. `python3 -m factory_v2 serve` (local `127.0.0.1:8790` unless `--port` / `FACTORY_V2_INTAKE_PORT`)
+2. Laboratory/Owner approval submits the canonical PCP to `POST /v1/pcp`
+3. Controller validates Gate 1, admits or returns the existing mission, and starts Engineering automatically (`Nous Hermes` → configured `EngineeringExecutor`)
+
+There is no Vault watcher, cron/polling loop, Notion/AWE/Dispatch runtime, Owner `Process your Queue.`, or second `tick` after a valid PCP event. Restart resumes incomplete admitted missions from the SQLite ledger; terminal `DISTRIBUTED` missions are not rerun.
+
+Diagnostic/recovery CLI remains available and is **not** the normal path:
+
+```sh
+python3 -m factory_v2 admit-pcp path/to/canonical-pcp-handoff.json
+python3 -m factory_v2 --simulated admit-pcp path/to/canonical-pcp-handoff.json
+python3 -m factory_v2 tick msn-<pcp-hash-prefix>
+python3 -m factory_v2 status msn-<pcp-hash-prefix>
+python3 -m factory_v2 approve msn-<pcp-hash-prefix>
+python3 -m factory_v2 reject msn-<pcp-hash-prefix> --reason "..."
+python3 -m factory_v2 distribute msn-<pcp-hash-prefix>
+```
+
+A PCP must validate `pcp-handoff.schema.json` with Owner `APPROVE` evidence.
+`{"title","intent"}` is not admitted.
+
+Ledger default: `$FACTORY_V2_HOME/ledger.sqlite` (falls back to `~/.factory-v2`).
+Sandboxes: `$FACTORY_V2_HOME/sandboxes/<mission_id>/`.
+
+`./dev v2 …` and `./dev v2-test` wrap the same commands without Docker.
+
+Default CLI adapters are **real** and fail closed. `--simulated` is a labeled test double, never silent success.
+
+## States
+
+`PCP_APPROVED -> ENGINEERING -> VERIFYING -> VERIFIED_RC -> OWNER_VALIDATION -> DISTRIBUTION_READY`
+
+Rework:
+
+- `VERIFYING` review or QA FAIL -> `ENGINEERING` (same mission/lineage, new candidate tuple, full re-verify)
+- `OWNER_VALIDATION` REJECT -> `ENGINEERING` (same mission/lineage, new candidate tuple, full re-verify)
+- Extra state `BLOCKED` is fail-closed (missing Hermes/executor/Antigravity runtime or credentials)
+- Extra state `DISTRIBUTED` is recorded after an immutable handoff
+
+Candidate identity is always `(candidate_id, source_revision, artifact_hash, artifact_uri)`.
+
+## Adapters (thin, replaceable)
+
+| Contract | Target | Official interface |
+|---|---|---|
+| `EngineeringManager` | NousResearch Hermes Agent | `hermes chat --oneshot` in the admitted sandbox with the SFV2-002 `factory-engineering` profile. Hermes decomposes the mission and delegates coding through the selected executor. Controller does not call the executor. |
+| `EngineeringExecutor` (temporary default) | Cursor CLI | Invoked **by Hermes**: `agent -p … --output-format json --workspace <sandbox> --trust --sandbox enabled --model <configurable, default auto>` |
+| `EngineeringExecutor` (selectable rollback) | Grok Build | `FACTORY_V2_ENGINEERING_EXECUTOR=grok` restores `grok --no-auto-update -p … --cwd <sandbox> --output-format json` |
+| `Verifier.review` / `Verifier.qa` | Antigravity (separate verdicts) | `antigravity review\|qa` bound to the candidate tuple |
+| `DistributionExecutor` | Antigravity Production | `antigravity distribute --profile production` bound to the approved tuple |
+
+Lifecycle code in `factory_v2/machine.py` does not contain vendor CLI strings.
+Hermes is not reimplemented (no session/memory/subagent/skills runtime here).
+
+Executor switch (temporary Cursor default, Grok remains installed):
+
+```sh
+export FACTORY_V2_ENGINEERING_EXECUTOR=cursor   # default
+export FACTORY_V2_CURSOR_MODEL=auto             # default; do not hardcode in Controller
+# rollback:
+export FACTORY_V2_ENGINEERING_EXECUTOR=grok
+```
+
+Cursor CLI auth (real): existing `agent login` session, or `CURSOR_API_KEY` /
+`CURSOR_AUTH_TOKEN` when explicitly configured. Headless shape is
+`agent -p "<prompt>" --output-format json --workspace <sandbox> --trust --sandbox enabled --model <id>`.
+Absence of CLI or auth is a truthful `BLOCKED` state. Never persist tokens.
+
+Grok auth (rollback): `XAI_API_KEY` or `GROK_DEPLOYMENT_KEY` or `~/.grok/auth.json`.
+Absence is a truthful `BLOCKED` state, not a simulated PASS.
+
+## Sandbox boundary
+
+OS/workspace containment: each mission gets `sandboxes/<mission_id>/`. Real Hermes is launched with `--in` that directory. Real Cursor CLI is launched with `--workspace` there. Real Grok (rollback) is launched with `--cwd` there. The Controller does not pass Hermes `--yolo`, Cursor `--force`/`--yolo`, or Grok `--always-approve`.
+
+Prompt-level allow/deny rules are **not** the security boundary. They are advisory. The actual bound is the per-mission workspace directory plus host OS permissions on that tree. The general Hermes process is not granted unrestricted host authority by this adapter.
+
+## Real vs simulated (this slice)
+
+| Harness | Used in deterministic tests |
+|---|---|
+| Controller / SQLite ledger / schema validator | **real** in-process code |
+| Nous Hermes CLI | **simulated** (`ScriptedHermes` campaign that still delegates to Grok), labeled `harness_mode=simulated`. Real `NousHermesAdapter` is fail-closed without a `hermes` binary and does not call Grok from Controller Python. |
+| Grok Build CLI | **simulated** except lifecycle test 124, which uses the **real** `GrokBuildAdapter` with credentials stripped and asserts fail-closed `BLOCKED` |
+| Antigravity review/QA/distribution | **simulated** (`ScriptedVerifier`, `ScriptedDistributor`) |
+| SFV2-002 schemas/fixtures | **real** consumed snapshot of PR #75 `72788207…` |
+
+No production-readiness claim. A real PCP → verified RC run still needs working Hermes, Grok credentials, and Antigravity review + E2E both green. SFV2-003/004 remain blocked until this head freezes.
+
+## Out of scope (do not add here)
+
+Watcher UI, Notion/AWE runtime, v1 cleanup, Kyriedachi, Profit Guard, benchmarking, rebuilding Hermes, editing Luna-owned `SOFTWARE-FACTORY-V2/*`.

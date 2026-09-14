@@ -1,0 +1,164 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "factory-v2/contracts/pcp-handoff.schema.json",
+  "title": "Factory v2 Product Contract Packet handoff",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "contract_type",
+    "contract_version",
+    "pcp",
+    "source",
+    "owner_approval",
+    "product",
+    "scope",
+    "acceptance",
+    "referenced_artifacts",
+    "runtime_constraints"
+  ],
+  "properties": {
+    "contract_type": { "const": "factory.v2.pcp_handoff" },
+    "contract_version": { "const": "1.0.0" },
+    "pcp": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["id", "version", "immutable_revision"],
+      "properties": {
+        "id": { "$ref": "#/$defs/identifier" },
+        "version": {
+          "type": "string",
+          "pattern": "^[0-9]+\\.[0-9]+\\.[0-9]+$"
+        },
+        "immutable_revision": { "$ref": "#/$defs/revision" }
+      }
+    },
+    "source": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["uri", "revision", "content_hash"],
+      "properties": {
+        "uri": { "type": "string", "minLength": 1 },
+        "revision": { "$ref": "#/$defs/revision" },
+        "content_hash": { "$ref": "#/$defs/content_hash" }
+      }
+    },
+    "owner_approval": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["decision", "owner_id", "approved_at", "evidence"],
+      "properties": {
+        "decision": { "const": "APPROVE" },
+        "owner_id": { "$ref": "#/$defs/identifier" },
+        "approved_at": { "$ref": "#/$defs/timestamp" },
+        "evidence": { "$ref": "#/$defs/evidence_ref" }
+      }
+    },
+    "product": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["objective", "user_outcome"],
+      "properties": {
+        "objective": { "type": "string", "minLength": 1 },
+        "user_outcome": { "type": "string", "minLength": 1 }
+      }
+    },
+    "scope": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["in_scope", "non_goals", "prohibitions"],
+      "properties": {
+        "in_scope": {
+          "type": "array",
+          "minItems": 1,
+          "items": { "type": "string", "minLength": 1 }
+        },
+        "non_goals": {
+          "type": "array",
+          "minItems": 1,
+          "items": { "type": "string", "minLength": 1 }
+        },
+        "prohibitions": {
+          "type": "array",
+          "minItems": 1,
+          "items": { "type": "string", "minLength": 1 }
+        }
+      }
+    },
+    "acceptance": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["functional", "ux_product"],
+      "properties": {
+        "functional": {
+          "type": "array",
+          "minItems": 1,
+          "items": { "$ref": "#/$defs/criterion" }
+        },
+        "ux_product": {
+          "type": "array",
+          "items": { "$ref": "#/$defs/criterion" }
+        }
+      }
+    },
+    "referenced_artifacts": {
+      "type": "array",
+      "items": { "$ref": "#/$defs/evidence_ref" }
+    },
+    "runtime_constraints": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["environments", "deployment", "data", "secrets"],
+      "properties": {
+        "environments": {
+          "type": "array",
+          "minItems": 1,
+          "items": { "type": "string", "minLength": 1 }
+        },
+        "deployment": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["targets", "artifact_policy"],
+          "properties": {
+            "targets": {
+              "type": "array",
+              "minItems": 1,
+              "items": { "type": "string", "minLength": 1 }
+            },
+            "artifact_policy": { "const": "immutable" }
+          }
+        },
+        "data": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["classification", "retention"],
+          "properties": {
+            "classification": {
+              "enum": ["PUBLIC", "INTERNAL", "CONFIDENTIAL"]
+            },
+            "retention": { "type": "string", "minLength": 1 }
+          }
+        },
+        "secrets": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["handling", "required_secrets"],
+          "properties": {
+            "handling": { "const": "external_runtime_only" },
+            "required_secrets": {
+              "type": "array",
+              "items": { "$ref": "#/$defs/identifier" }
+            }
+          }
+        }
+      }
+    }
+  },
+  "$defs": {
+    "identifier": { "$ref": "common.schema.json#/$defs/identifier" },
+    "revision": { "$ref": "common.schema.json#/$defs/revision" },
+    "content_hash": { "$ref": "common.schema.json#/$defs/content_hash" },
+    "timestamp": { "$ref": "common.schema.json#/$defs/timestamp" },
+    "evidence_ref": { "$ref": "common.schema.json#/$defs/evidence_ref" },
+    "criterion": { "$ref": "common.schema.json#/$defs/criterion" }
+  }
+}

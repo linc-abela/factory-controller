@@ -1,0 +1,59 @@
+{
+  "manifest_version": "1.0.0",
+  "fixtures": [
+    {
+      "fixture": "valid-approved-pcp.json",
+      "schema": "pcp-handoff.schema.json",
+      "expected": "valid",
+      "assertion": "Owner approval and PCP/source immutable revision are present."
+    },
+    {
+      "fixture": "pcp-without-owner-approval.invalid.json",
+      "schema": "pcp-handoff.schema.json",
+      "expected": "invalid",
+      "assertion": "Admission must reject a PCP without Owner approval."
+    },
+    {
+      "fixture": "verification-fail-with-defects.json",
+      "schema": "verification.schema.json",
+      "expected": "valid",
+      "assertion": "A failed verification is a valid recorded result when defects are explicit."
+    },
+    {
+      "fixture": "stale-verifier-pass-wrong-candidate.invalid.json",
+      "schema": "verification.schema.json",
+      "expected": "invalid",
+      "assertion": "A verifier result for a different candidate cannot pass identity checks."
+    },
+    {
+      "fixture": "both-verifiers-pass-same-candidate.json",
+      "schema": "verification.schema.json",
+      "expected": "valid",
+      "assertion": "Independent code review and QA/E2E pass the same candidate."
+    },
+    {
+      "fixture": "verified-rc-eligible.json",
+      "schema": "verified-rc.schema.json",
+      "expected": "valid",
+      "assertion": "Only matching deterministic tests and independent verifier passes create an RC eligible for Owner Gate."
+    },
+    {
+      "fixture": "owner-reject-same-lineage.json",
+      "schema": "engineering-mission.schema.json",
+      "expected": "valid",
+      "assertion": "Owner rejection creates bounded rework with the same mission and lineage."
+    },
+    {
+      "fixture": "owner-approve-distribution.json",
+      "schema": "distribution-handoff.schema.json",
+      "expected": "valid",
+      "assertion": "Distribution carries an Owner-approved RC and exact rollback identity."
+    },
+    {
+      "fixture": "distribution-artifact-substitution.invalid.json",
+      "schema": "distribution-handoff.schema.json",
+      "expected": "invalid",
+      "assertion": "Distribution rejects an artifact hash that differs from the approved RC."
+    }
+  ]
+}

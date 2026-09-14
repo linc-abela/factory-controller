@@ -1,0 +1,144 @@
+{
+  "contract_type": "factory.v2.engineering_mission",
+  "contract_version": "1.0.0",
+  "mission": {
+    "mission_id": "mission.demo",
+    "lineage_id": "lineage.demo",
+    "created_at": "2026-09-14T03:00:00Z",
+    "source_pcp_id": "pcp.demo"
+  },
+  "pcp": {
+    "pcp_id": "pcp.demo",
+    "pcp_version": "1.0.0",
+    "revision": "1111111111111111111111111111111111111111",
+    "content_hash": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+  },
+  "current_candidate": {
+    "candidate_id": "candidate-c",
+    "source_revision": "3333333333333333333333333333333333333333",
+    "artifact_hash": "sha256:eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+    "artifact_uri": "git+https://example.invalid/factory-v2@3333333"
+  },
+  "attempt": {
+    "attempt_id": "attempt-2",
+    "attempt_number": 2,
+    "rework_sequence": 1
+  },
+  "lifecycle": {
+    "state": "REWORK_REQUIRED",
+    "updated_at": "2026-09-14T04:00:00Z",
+    "reason": "Owner rejected candidate-b and requested bounded rework."
+  },
+  "hermes": {
+    "runtime": "NousResearch Hermes Agent",
+    "profile_id": "factory-engineering",
+    "session_id": "hermes-session-demo",
+    "coordination_ref": {
+      "kind": "mission-coordination",
+      "uri": "vault://evidence/mission-demo.json",
+      "revision": "3333333333333333333333333333333333333333",
+      "content_hash": "sha256:1111111111111111111111111111111111111111111111111111111111111111",
+      "immutable": true
+    }
+  },
+  "grok_build": {
+    "executor": "Grok Build",
+    "attempts": [
+      {
+        "attempt_id": "attempt-1",
+        "candidate": {
+          "candidate_id": "candidate-b",
+          "source_revision": "2222222222222222222222222222222222222222",
+          "artifact_hash": "sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+          "artifact_uri": "git+https://example.invalid/factory-v2@2222222"
+        },
+        "session_ref": "grok-session-1",
+        "status": "COMPLETED",
+        "started_at": "2026-09-14T03:10:00Z",
+        "completed_at": "2026-09-14T03:30:00Z",
+        "evidence": [
+          {
+            "kind": "grok-build",
+            "uri": "vault://evidence/grok-attempt-1.json",
+            "revision": "2222222222222222222222222222222222222222",
+            "content_hash": "sha256:2222222222222222222222222222222222222222222222222222222222222222",
+            "immutable": true
+          }
+        ]
+      },
+      {
+        "attempt_id": "attempt-2",
+        "candidate": {
+          "candidate_id": "candidate-c",
+          "source_revision": "3333333333333333333333333333333333333333",
+          "artifact_hash": "sha256:eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+          "artifact_uri": "git+https://example.invalid/factory-v2@3333333"
+        },
+        "session_ref": "grok-session-2",
+        "status": "COMPLETED",
+        "started_at": "2026-09-14T03:40:00Z",
+        "completed_at": "2026-09-14T03:55:00Z",
+        "evidence": [
+          {
+            "kind": "grok-build",
+            "uri": "vault://evidence/grok-attempt-2.json",
+            "revision": "3333333333333333333333333333333333333333",
+            "content_hash": "sha256:3333333333333333333333333333333333333333333333333333333333333333",
+            "immutable": true
+          }
+        ]
+      }
+    ]
+  },
+  "verification_requirements": {
+    "deterministic_tests": {
+      "required": true,
+      "evidence_minimum": 1,
+      "verifier_harness": "Controller test runner"
+    },
+    "code_review": {
+      "required": true,
+      "evidence_minimum": 1,
+      "verifier_harness": "Antigravity"
+    },
+    "qa_e2e": {
+      "required": true,
+      "evidence_minimum": 1,
+      "verifier_harness": "Antigravity"
+    }
+  },
+  "consolidated_defect_packet": {
+    "status": "NONE",
+    "defects": []
+  },
+  "owner_rc_verdict_history": [
+    {
+      "decision": "REJECT",
+      "candidate": {
+        "candidate_id": "candidate-b",
+        "source_revision": "2222222222222222222222222222222222222222",
+        "artifact_hash": "sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+        "artifact_uri": "git+https://example.invalid/factory-v2@2222222"
+      },
+      "decided_at": "2026-09-14T03:35:00Z",
+      "evidence": {
+        "kind": "owner-verdict",
+        "uri": "vault://evidence/owner-reject.json",
+        "revision": "2222222222222222222222222222222222222222",
+        "content_hash": "sha256:4444444444444444444444444444444444444444444444444444444444444444",
+        "immutable": true
+      },
+      "feedback": "Clarify the evidence boundary before resubmission."
+    }
+  ],
+  "rework_history": [
+    {
+      "from_attempt": 1,
+      "to_attempt": 2,
+      "trigger": "OWNER_REJECT",
+      "same_mission": true,
+      "same_lineage": true,
+      "feedback": "Clarify the evidence boundary before resubmission."
+    }
+  ]
+}

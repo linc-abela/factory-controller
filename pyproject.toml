@@ -7,6 +7,10 @@ dependencies = []
 
 [project.scripts]
 factory-controller = "factory_controller.cli:main"
+factory-v2 = "factory_v2.cli:main"
 
 [tool.setuptools.packages.find]
-include = ["factory_controller*", "awe_worker*"]
+include = ["factory_controller*", "awe_worker*", "factory_v2*"]
+
+[tool.setuptools.package-data]
+factory_v2 = ["canonical_contracts/**"]

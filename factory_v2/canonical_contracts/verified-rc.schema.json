@@ -1,0 +1,108 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "factory-v2/contracts/verified-rc.schema.json",
+  "title": "Factory v2 verified release candidate",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "contract_type",
+    "contract_version",
+    "mission_id",
+    "rc",
+    "candidate",
+    "engineering_tests",
+    "code_review",
+    "qa_e2e",
+    "eligibility",
+    "owner_gate"
+  ],
+  "properties": {
+    "contract_type": { "const": "factory.v2.verified_rc" },
+    "contract_version": { "const": "1.0.0" },
+    "mission_id": { "$ref": "#/$defs/identifier" },
+    "rc": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["rc_id", "version", "immutable_revision"],
+      "properties": {
+        "rc_id": { "$ref": "#/$defs/identifier" },
+        "version": {
+          "type": "string",
+          "pattern": "^[0-9]+\\.[0-9]+\\.[0-9]+$"
+        },
+        "immutable_revision": { "$ref": "#/$defs/revision" }
+      }
+    },
+    "candidate": { "$ref": "#/$defs/candidate" },
+    "engineering_tests": {
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["test_id", "command", "result", "run_at", "evidence"],
+        "properties": {
+          "test_id": { "$ref": "#/$defs/identifier" },
+          "command": { "type": "string", "minLength": 1 },
+          "result": { "const": "PASS" },
+          "run_at": { "$ref": "#/$defs/timestamp" },
+          "evidence": {
+            "type": "array",
+            "minItems": 1,
+            "items": { "$ref": "#/$defs/evidence_ref" }
+          }
+        }
+      }
+    },
+    "code_review": { "$ref": "#/$defs/passing_verification" },
+    "qa_e2e": { "$ref": "#/$defs/passing_verification" },
+    "eligibility": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["status", "eligible_for_owner_gate"],
+      "properties": {
+        "status": { "const": "VERIFIED_RC" },
+        "eligible_for_owner_gate": { "const": true }
+      }
+    },
+    "owner_gate": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["status", "decision"],
+      "properties": {
+        "status": { "const": "AWAITING_OWNER" },
+        "decision": { "const": "PENDING" }
+      }
+    }
+  },
+  "$defs": {
+    "identifier": { "$ref": "common.schema.json#/$defs/identifier" },
+    "revision": { "$ref": "common.schema.json#/$defs/revision" },
+    "content_hash": { "$ref": "common.schema.json#/$defs/content_hash" },
+    "timestamp": { "$ref": "common.schema.json#/$defs/timestamp" },
+    "evidence_ref": { "$ref": "common.schema.json#/$defs/evidence_ref" },
+    "candidate": { "$ref": "common.schema.json#/$defs/candidate" },
+    "verifier": { "$ref": "common.schema.json#/$defs/verifier" },
+    "passing_verification": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["kind", "verdict", "candidate", "verifier", "evidence"],
+      "properties": {
+        "kind": {
+          "enum": [
+            "adversarial_code_security_invariant",
+            "qa_regression_e2e"
+          ]
+        },
+        "verdict": { "const": "PASS" },
+        "candidate": { "$ref": "#/$defs/candidate" },
+        "verifier": { "$ref": "#/$defs/verifier" },
+        "evidence": {
+          "type": "array",
+          "minItems": 1,
+          "items": { "$ref": "#/$defs/evidence_ref" }
+        }
+      }
+    }
+  }
+}

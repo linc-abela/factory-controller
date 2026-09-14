@@ -1,0 +1,49 @@
+{
+  "contract_type": "factory.v2.pcp_handoff",
+  "contract_version": "1.0.0",
+  "pcp": {
+    "id": "pcp.missing-approval",
+    "version": "1.0.0",
+    "immutable_revision": "1111111111111111111111111111111111111111"
+  },
+  "source": {
+    "uri": "vault://PRODUCTS/prototypes/demo/pcp.json",
+    "revision": "1111111111111111111111111111111111111111",
+    "content_hash": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+  },
+  "product": {
+    "objective": "This packet must not be admitted.",
+    "user_outcome": "No execution may start without Owner approval."
+  },
+  "scope": {
+    "in_scope": ["Admission check"],
+    "non_goals": ["Build"],
+    "prohibitions": ["Execute without approval"]
+  },
+  "acceptance": {
+    "functional": [
+      {
+        "id": "fn-no-approval",
+        "statement": "Missing approval is rejected.",
+        "verification": "Require owner_approval."
+      }
+    ],
+    "ux_product": []
+  },
+  "referenced_artifacts": [],
+  "runtime_constraints": {
+    "environments": ["isolated-task-worktree"],
+    "deployment": {
+      "targets": ["none"],
+      "artifact_policy": "immutable"
+    },
+    "data": {
+      "classification": "INTERNAL",
+      "retention": "mission lifetime"
+    },
+    "secrets": {
+      "handling": "external_runtime_only",
+      "required_secrets": []
+    }
+  }
+}
