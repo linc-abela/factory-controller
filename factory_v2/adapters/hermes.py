@@ -87,6 +87,7 @@ class NousHermesAdapter:
                     "--query-file",
                     str(query_file),
                     "--pass-session-id",
+                    "--yolo",
                 ],
                 capture_output=True,
                 text=True,
