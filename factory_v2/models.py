@@ -36,6 +36,18 @@ class CandidateIdentity:
 class WorkItem:
     objective: str
     defects: tuple[str, ...] = ()
+    item_id: str = ""
+    index: int = 1
+    total: int = 1
+
+    def as_dict(self) -> dict[str, Any]:
+        return {
+            "objective": self.objective,
+            "defects": list(self.defects),
+            "item_id": self.item_id,
+            "index": self.index,
+            "total": self.total,
+        }
 
 
 @dataclass(frozen=True)
@@ -114,6 +126,7 @@ class MissionContext:
     hermes_session_id: str | None = None
     defects: tuple[str, ...] = ()
     current: CandidateIdentity | None = None
+    progress_callback: Any | None = None
 
 
 @dataclass(frozen=True)
@@ -135,6 +148,8 @@ class MissionSnapshot:
     candidates: tuple[Candidate, ...] = ()
     events: tuple[dict[str, Any], ...] = ()
     pcp: dict[str, Any] = field(default_factory=dict)
+    active_stage: str | None = None
+    current_work_item: dict[str, Any] | None = None
     created_at: str = ""
     updated_at: str = ""
 
@@ -155,6 +170,8 @@ class MissionSnapshot:
             "mission_id": self.mission_id,
             "lineage_id": self.lineage_id,
             "state": self.state.value,
+            "active_stage": self.active_stage or self.state.value.lower(),
+            "current_work_item": self.current_work_item,
             "pcp_hash": self.pcp_hash,
             "current": None if self.current is None else self.current.as_dict(),
             "approved": None if self.approved is None else self.approved.as_dict(),

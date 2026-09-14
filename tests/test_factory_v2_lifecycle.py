@@ -323,5 +323,34 @@ class FactoryV2LifecycleTests(unittest.TestCase):
         return mid
 
 
+    def test_record_candidate_upsert_on_same_candidate_id(self) -> None:
+        mid = self._admit().mission_id
+        identity1 = CandidateIdentity("cand-same", "rev-1", "hash-1", "uri-1")
+        identity2 = CandidateIdentity("cand-same", "rev-2", "hash-2", "uri-2")
+        self.world.store.record_candidate(
+            mid,
+            identity1,
+            1,
+            attempt_id="att-1",
+            hermes_session_id="h-1",
+            grok_session_ref="g-1",
+        )
+        snap = self.world.store.record_candidate(
+            mid,
+            identity2,
+            2,
+            attempt_id="att-2",
+            hermes_session_id="h-2",
+            grok_session_ref="g-2",
+        )
+        self.assertIsNotNone(snap.current)
+        self.assertEqual(snap.current.candidate_id, "cand-same")
+        self.assertEqual(snap.current.source_revision, "rev-2")
+        self.assertEqual(snap.current.artifact_hash, "hash-2")
+        cands = snap.candidates
+        self.assertEqual(len(cands), 1)
+        self.assertEqual(cands[0].identity.source_revision, "rev-2")
+
+
 if __name__ == "__main__":
     unittest.main()

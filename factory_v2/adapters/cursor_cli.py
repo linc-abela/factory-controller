@@ -5,7 +5,9 @@ import json
 import os
 import re
 import shutil
+import signal
 import subprocess
+import time
 from pathlib import Path
 
 from factory_v2.canonical import revision_for
@@ -84,28 +86,114 @@ class CursorCLIExecutor:
             "--workspace",
             str(workspace),
             "--trust",
+            "--force",
             "--sandbox",
             "enabled",
             "--model",
             self.requested_model,
         ]
+        no_progress_timeout = float(
+            self._env.get("FACTORY_V2_EXECUTOR_NO_PROGRESS_TIMEOUT", "180.0")
+        )
+        poll_interval = float(
+            self._env.get("FACTORY_V2_EXECUTOR_POLL_INTERVAL", "0.5")
+        )
+        heartbeat_file = workspace / "cursor-executor-heartbeat.json"
+
+        def _write_heartbeat(status: str, idle_s: float, elapsed_s: float, changes: int) -> None:
+            hb = {
+                "mission_id": ctx.mission_id,
+                "work_item": work.as_dict(),
+                "status": status,
+                "idle_seconds": round(idle_s, 2),
+                "elapsed_seconds": round(elapsed_s, 2),
+                "files_fingerprinted": changes,
+                "timestamp": str(time.time()),
+            }
+            try:
+                heartbeat_file.write_text(json.dumps(hb, indent=2), encoding="utf-8")
+            except OSError:
+                pass
+
         try:
-            proc = subprocess.run(
+            proc = subprocess.Popen(
                 command,
-                capture_output=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
                 text=True,
                 env=self._env,
-                timeout=3600,
-                check=False,
+                preexec_fn=os.setsid if hasattr(os, "setsid") else None,
             )
         except OSError as exc:
             return self._blocked(f"cursor cli launch failed: {exc}")
+
+        start_time = time.time()
+        last_activity_time = start_time
+        last_fp = before
+        timed_out = False
+
+        while True:
+            ret = proc.poll()
+            if ret is not None:
+                break
+
+            now = time.time()
+            elapsed = now - start_time
+            curr_fp = _workspace_fingerprint(workspace)
+
+            if curr_fp != last_fp:
+                last_activity_time = now
+                last_fp = curr_fp
+                _write_heartbeat("active", 0.0, elapsed, len(curr_fp))
+            else:
+                idle = now - last_activity_time
+                _write_heartbeat("running", idle, elapsed, len(curr_fp))
+                if idle >= no_progress_timeout:
+                    timed_out = True
+                    break
+
+            time.sleep(poll_interval)
+
+        if timed_out:
+            try:
+                if hasattr(os, "killpg"):
+                    os.killpg(os.getpgid(proc.pid), signal.SIGTERM)
+                else:
+                    proc.terminate()
+                proc.wait(timeout=1)
+            except Exception:
+                try:
+                    if hasattr(os, "killpg"):
+                        os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+                    else:
+                        proc.kill()
+                    proc.wait(timeout=1)
+                except Exception:
+                    pass
+
+            idle_duration = int(time.time() - last_activity_time)
+            _write_heartbeat("stalled", idle_duration, time.time() - start_time, len(last_fp))
+
+            stalled_provenance = {
+                "executor_type": self.executor_type,
+                "status": "stalled",
+                "reason": f"no progress detected after {idle_duration}s",
+                "work_item": work.as_dict(),
+                "mission_id": ctx.mission_id,
+                "resumable": True,
+            }
+            _write_provenance(workspace, stalled_provenance)
+            return self._blocked(
+                f"executor stalled: no file or progress activity in {idle_duration}s"
+            )
+
+        stdout, stderr = proc.communicate()
         if proc.returncode != 0:
-            return self._blocked(f"cursor cli failed: {proc.stderr[-500:]}")
-        envelope = _parse_envelope(proc.stdout)
+            return self._blocked(f"cursor cli failed: {stderr[-500:]}")
+        envelope = _parse_envelope(stdout)
         if envelope is not None and envelope.get("is_error") is True:
             return self._blocked("cursor cli reported an error result")
-        parsed = _parse_candidate(proc.stdout)
+        parsed = _parse_candidate(stdout)
         if parsed is None:
             after = _workspace_fingerprint(workspace)
             parsed = _fallback_identity(workspace, before, after, envelope)
@@ -121,11 +209,12 @@ class CursorCLIExecutor:
             "cli_version": version,
             "auth_mode": self.auth_mode(),
             "requested_model": self.requested_model,
-            "observed_model": _observed_model(proc.stdout) or self.requested_model,
+            "observed_model": _observed_model(stdout) or self.requested_model,
             "session_ref": session_ref,
             "simulated": False,
         }
         _write_provenance(workspace, self.last_provenance)
+        _write_heartbeat("completed", 0.0, time.time() - start_time, len(_workspace_fingerprint(workspace)))
         return ExecutorResult(
             candidate=parsed,
             grok_session_ref=session_ref,
@@ -239,7 +328,7 @@ def _workspace_fingerprint(workspace: Path) -> dict[str, str]:
 
 
 def _countable_workspace_file(path: Path) -> bool:
-    if path.name == "cursor-executor-provenance.json":
+    if path.name in {"cursor-executor-provenance.json", "cursor-executor-heartbeat.json"}:
         return False
     if path.suffix in {".pyc", ".pyo"}:
         return False

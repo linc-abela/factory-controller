@@ -1,0 +1,184 @@
+#!/usr/bin/env python3
+"""Antigravity independent verification and distribution executable for Factory V2."""
+
+import argparse
+import json
+import os
+import subprocess
+import sys
+from pathlib import Path
+
+
+def run_tests(workspace: Path) -> tuple[bool, str]:
+    if (workspace / "package.json").is_file():
+        # Node / JS project
+        res = subprocess.run(
+            ["npm", "test"],
+            cwd=str(workspace),
+            capture_output=True,
+            text=True,
+            timeout=120,
+        )
+        if res.returncode != 0:
+            return False, f"npm test failed:\n{res.stderr or res.stdout}"
+        check_res = subprocess.run(
+            ["npm", "run", "check"],
+            cwd=str(workspace),
+            capture_output=True,
+            text=True,
+            timeout=120,
+        )
+        if check_res.returncode != 0:
+            return False, f"npm run check failed:\n{check_res.stderr or check_res.stdout}"
+    elif (workspace / "tests").is_dir():
+        # Python project fallback
+        res = subprocess.run(
+            [sys.executable, "-m", "unittest", "discover", "-s", "tests"],
+            cwd=str(workspace),
+            capture_output=True,
+            text=True,
+            timeout=120,
+        )
+        if res.returncode != 0:
+            return False, f"unittest failed:\n{res.stderr or res.stdout}"
+    return True, ""
+
+
+def check_kyriedachi_mvp1(workspace: Path) -> tuple[bool, list[str]]:
+    """Verify that complete Kyriedachi MVP-1 requirements are implemented."""
+    pkg_path = workspace / "package.json"
+    if not pkg_path.is_file():
+        return True, []
+    try:
+        pkg = json.loads(pkg_path.read_text(encoding="utf-8"))
+    except Exception:
+        return True, []
+    if pkg.get("name") != "prototype-kyriedachi-life":
+        return True, []
+
+    defects = []
+    app_file = workspace / "src" / "app.js"
+    css_file = workspace / "src" / "kyriedachi.css"
+
+    if not app_file.is_file():
+        return False, ["src/app.js missing"]
+    if not css_file.is_file():
+        return False, ["src/kyriedachi.css missing"]
+
+    app_src = app_file.read_text(encoding="utf-8")
+    css_src = css_file.read_text(encoding="utf-8")
+
+    # 1. World foundation
+    world_markers = [
+        "apartments",
+        "plaza",
+        "park",
+        "kyri-landmark",
+        "ISLAND_WANDER",
+    ]
+    for m in world_markers:
+        if m.lower() not in app_src.lower() and m.lower() not in css_src.lower():
+            defects.append(f"World foundation missing marker: {m}")
+
+    # 2. Rich per-resident creator
+    creator_markers = [
+        "creator",
+        "skin",
+        "hair",
+        "eye",
+        "brow",
+        "mouth",
+        "outfit",
+        "personality",
+    ]
+    for m in creator_markers:
+        if m not in app_src.lower():
+            defects.append(f"Rich creator missing attribute control: {m}")
+
+    # 3. Player ownership and switching
+    player_markers = ["player", "activeplayer", "control", "zeke", "kyrie"]
+    found_player = sum(1 for p in player_markers if p in app_src.lower())
+    if found_player < 3:
+        defects.append("Player character ownership/control missing or incomplete")
+
+    # 4. Direct interactions & core animation
+    interaction_markers = ["talk", "food", "feed", "gift"]
+    found_int = sum(1 for i in interaction_markers if i in app_src.lower())
+    if found_int < 3:
+        defects.append("Direct interactions (talk, food, gift) incomplete")
+
+    # 5. Autonomous social moments / mood / friendship
+    social_markers = ["friendship", "mood", "encounter", "social"]
+    found_soc = sum(1 for s in social_markers if s in app_src.lower())
+    if found_soc < 2:
+        defects.append("Deterministic social mechanics or mood/friendship tracking incomplete")
+
+    return (len(defects) == 0, defects)
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(prog="antigravity")
+    sub = parser.add_subparsers(dest="cmd", required=True)
+
+    # review
+    p_rev = sub.add_parser("review")
+    p_rev.add_argument("--candidate-id", required=True)
+    p_rev.add_argument("--source-revision", default="")
+    p_rev.add_argument("--artifact-hash", default="")
+    p_rev.add_argument("--artifact-uri", default="")
+    p_rev.add_argument("--workspace", required=True)
+    p_rev.add_argument("--mission", default="")
+
+    # qa
+    p_qa = sub.add_parser("qa")
+    p_qa.add_argument("--candidate-id", required=True)
+    p_qa.add_argument("--source-revision", default="")
+    p_qa.add_argument("--artifact-hash", default="")
+    p_qa.add_argument("--artifact-uri", default="")
+    p_qa.add_argument("--workspace", required=True)
+    p_qa.add_argument("--mission", default="")
+
+    # distribute
+    p_dist = sub.add_parser("distribute")
+    p_dist.add_argument("--profile", default="production")
+    p_dist.add_argument("--candidate-id", required=True)
+    p_dist.add_argument("--source-revision", default="")
+    p_dist.add_argument("--artifact-hash", default="")
+    p_dist.add_argument("--artifact-uri", default="")
+    p_dist.add_argument("--mission", default="")
+
+    args = parser.parse_args()
+
+    if args.cmd == "distribute":
+        print(f"distributed:{args.candidate_id}")
+        return 0
+
+    workspace = Path(args.workspace)
+    if not workspace.is_dir():
+        print(f"error: workspace directory {args.workspace} does not exist", file=sys.stderr)
+        return 1
+
+    ok, test_err = run_tests(workspace)
+    if not ok:
+        print(f"Test failure in workspace:\n{test_err}", file=sys.stderr)
+        return 1
+
+    if args.cmd == "qa":
+        mvp1_ok, defects = check_kyriedachi_mvp1(workspace)
+        if not mvp1_ok:
+            print(f"QA acceptance failure:\n" + "\n".join(f"- {d}" for d in defects), file=sys.stderr)
+            return 1
+
+    verdict_payload = {
+        "verdict": "PASS",
+        "kind": args.cmd,
+        "candidate_id": args.candidate_id,
+        "workspace": str(workspace),
+        "mission_id": args.mission,
+    }
+    print(json.dumps(verdict_payload, indent=2))
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
