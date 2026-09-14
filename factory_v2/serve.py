@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import json
 import threading
-from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from http.server import BaseHTTPRequestHandler, HTTPServer
 from typing import Any
 
 from factory_v2.canonical import ContractError
@@ -15,8 +15,7 @@ DEFAULT_PORT = 8790
 LOOPBACK_HOSTS = frozenset({"127.0.0.1", "localhost", "::1"})
 
 
-class IntakeHTTPServer(ThreadingHTTPServer):
-    daemon_threads = True
+class IntakeHTTPServer(HTTPServer):
     allow_reuse_address = True
 
     def __init__(self, server_address, controller: Controller):
