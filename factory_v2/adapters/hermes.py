@@ -73,6 +73,35 @@ class NousHermesAdapter:
         query_file = workspace / "hermes-query.json"
         query_file.write_text(json.dumps(request, indent=2), encoding="utf-8")
         result_file = workspace / "hermes-result.json"
+        if result_file.exists():
+            try:
+                cached = json.loads(result_file.read_text(encoding="utf-8"))
+                if (
+                    cached.get("attempt_number") == ctx.attempt_number
+                    and cached.get("rework_sequence") == ctx.rework_sequence
+                    and cached.get("campaign", {}).get("status") == "completed"
+                    and cached.get("candidate") is not None
+                ):
+                    cand_data = cached["candidate"]
+                    cand_id = CandidateIdentity(
+                        candidate_id=cand_data["candidate_id"],
+                        source_revision=cand_data["source_revision"],
+                        artifact_hash=cand_data["artifact_hash"],
+                        artifact_uri=cand_data["artifact_uri"],
+                    )
+                    return EngineeringResult(
+                        candidate=cand_id,
+                        hermes_session_id=str(
+                            cached.get("hermes_session_id") or f"hermes-{ctx.mission_id}"
+                        ),
+                        grok_session_ref=ctx.mission_id,
+                        harness_mode="real",
+                        manager_name=self.name,
+                        executor_name=self._executor_name(),
+                        executor_called=True,
+                    )
+            except Exception:
+                pass
         try:
             proc = subprocess.run(
                 [
